@@ -39,6 +39,12 @@ class BaseClient:
                 return await fn()
         raise RuntimeError("unreachable")
 
+    @staticmethod
+    def _sanitize_headers(headers: dict[str, str] | None) -> dict[str, str]:
+        if not headers:
+            return {}
+        return {k: ("***" if "authorization" in k.lower() else v) for k, v in headers.items()}
+
     async def _get(
         self,
         path: str,
@@ -49,12 +55,23 @@ class BaseClient:
         url = f"{self.base_url}{path}"
         headers = self._headers_houses() if need_user_id else None
 
+        LOGGER.info(
+            "outgoing request method=GET url=%s params=%s headers=%s",
+            url,
+            params if params is not None else "<none>",
+            self._sanitize_headers(headers),
+        )
+
         async def request() -> httpx.Response:
-            return await self.http_client.get(url, params=params, headers=headers)
+            kwargs: dict[str, Any] = {"headers": headers}
+            if params is not None:
+                kwargs["params"] = params
+            return await self.http_client.get(url, **kwargs)
 
         try:
             response = await self._retry_get(request)
             response.raise_for_status()
+            LOGGER.info("outgoing response method=GET url=%s status=%s", url, response.status_code)
             return self._unwrap(response.json())
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
             LOGGER.warning("GET %s failed: %s", url, exc)
@@ -70,10 +87,28 @@ class BaseClient:
     ) -> Any:
         url = f"{self.base_url}{path}"
         headers = self._headers_houses() if need_user_id else None
+        LOGGER.info(
+            "outgoing request method=POST url=%s params=%s json=%s headers=%s",
+            url,
+            params if params is not None else "<none>",
+            json if json is not None else "<none>",
+            self._sanitize_headers(headers),
+        )
         try:
-            response = await self.http_client.post(url, params=params, json=json, headers=headers)
+            kwargs: dict[str, Any] = {"headers": headers}
+            if params is not None:
+                kwargs["params"] = params
+            if json is not None:
+                kwargs["json"] = json
+            response = await self.http_client.post(url, **kwargs)
             response.raise_for_status()
-            return self._unwrap(response.json())
+            LOGGER.info("outgoing response method=POST url=%s status=%s", url, response.status_code)
+            try:
+                return self._unwrap(response.json())
+            except ValueError:
+                # Some endpoints may return empty/plain-text success bodies.
+                text_body = response.text.strip() if isinstance(response.text, str) else ""
+                return {"raw": text_body} if text_body else {}
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
             LOGGER.warning("POST %s failed: %s", url, exc)
             raise DataSourceError(f"POST failed: {url}") from exc

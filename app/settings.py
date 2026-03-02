@@ -43,7 +43,7 @@ class AgentSettings:
     api_base_url: str = "http://127.0.0.1:8080"
     default_user_id: str = "demo-user"
     app_host: str = "0.0.0.0"
-    app_port: int = 9000
+    app_port: int = 8191
     request_deadline_ms: int = 4500
     enrich_listing_top_n: int = 20
     enrich_amenities_top_n: int = 5
@@ -64,7 +64,7 @@ def load_settings() -> AgentSettings:
         api_base_url=os.getenv("API_BASE_URL", "http://127.0.0.1:8080"),
         default_user_id=os.getenv("DEFAULT_USER_ID", "demo-user"),
         app_host=os.getenv("APP_HOST", "0.0.0.0"),
-        app_port=int(os.getenv("APP_PORT", "9000")),
+        app_port=int(os.getenv("APP_PORT", "8191")),
         request_deadline_ms=int(os.getenv("REQUEST_DEADLINE_MS", "4500")),
         enrich_listing_top_n=int(os.getenv("ENRICH_LISTING_TOP_N", "20")),
         enrich_amenities_top_n=int(os.getenv("ENRICH_AMENITIES_TOP_N", "5")),
