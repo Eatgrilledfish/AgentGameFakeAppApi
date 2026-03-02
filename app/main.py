@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import json
+import logging
 import time
 
 import httpx
-from fastapi import Body, FastAPI, Header, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException, Request
 
 from app.agent.service import AgentService
 from app.agent.state import StateStore
