@@ -3,6 +3,8 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+from collections import defaultdict, deque
+from threading import Lock
 from typing import Any
 
 _CTX_TRACE_ID: contextvars.ContextVar[str] = contextvars.ContextVar("trace_id", default="-")
@@ -10,6 +12,10 @@ _CTX_SESSION_ID: contextvars.ContextVar[str] = contextvars.ContextVar("session_i
 _CTX_CASE_TYPE: contextvars.ContextVar[str] = contextvars.ContextVar("case_type", default="-")
 _CTX_USER_ID: contextvars.ContextVar[str] = contextvars.ContextVar("user_id", default="-")
 _CTX_SEQ: contextvars.ContextVar[int] = contextvars.ContextVar("log_seq", default=0)
+
+_TRACE_LIMIT = 300
+_TRACE_STORE: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=_TRACE_LIMIT))
+_TRACE_LOCK = Lock()
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -78,4 +84,28 @@ def log_event(logger: logging.Logger, event: str, **fields: Any) -> None:
         "event": event,
     }
     payload.update(fields)
+    _append_trace_event(payload)
     logger.info("%s", preview_payload(payload, limit=4000))
+
+
+def _append_trace_event(payload: dict[str, Any]) -> None:
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id or session_id == "-":
+        return
+    with _TRACE_LOCK:
+        _TRACE_STORE[session_id].append(payload.copy())
+
+
+def get_trace_events(session_id: str) -> list[dict[str, Any]]:
+    with _TRACE_LOCK:
+        return list(_TRACE_STORE.get(session_id, []))
+
+
+def clear_trace_events(session_id: str) -> int:
+    with _TRACE_LOCK:
+        existing = _TRACE_STORE.get(session_id)
+        if not existing:
+            return 0
+        count = len(existing)
+        existing.clear()
+        return count
