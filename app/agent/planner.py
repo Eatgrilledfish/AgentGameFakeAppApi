@@ -37,6 +37,9 @@ class Planner:
 
     async def build_plan(self, query: StructuredQuery) -> RetrievalPlan:
         hard = query.hard
+        if hard.landmark_id:
+            log_event(LOGGER, "planner.landmark.direct_id", landmark_id=hard.landmark_id)
+            return RetrievalPlan(plan_type="nearby_landmark", landmark_id=hard.landmark_id)
         if hard.landmark_name:
             landmark = None
             if self.cache is not None:
@@ -123,8 +126,10 @@ class Planner:
                 area=query.hard.area,
                 min_price=query.hard.budget_min,
                 max_price=query.hard.budget_max,
+                bedrooms=_layout_to_bedrooms(query.hard.layout),
                 min_area=int(query.hard.area_min) if query.hard.area_min is not None else None,
                 commute_to_xierqi_max=query.hard.max_commute_min,
+                utilities_type=query.hard.utilities_type,
                 max_subway_dist=query.hard.max_subway_dist,
                 rental_type=query.hard.rent_type,
                 available_from_before=query.hard.move_in_date,
@@ -135,3 +140,13 @@ class Planner:
             if not resp["items"]:
                 break
         return list(merged.values())
+
+
+def _layout_to_bedrooms(layout: str | None) -> str | None:
+    if not layout:
+        return None
+    normalized = layout.translate(str.maketrans({"一": "1", "二": "2", "两": "2", "三": "3", "四": "4", "五": "5"}))
+    for ch in normalized:
+        if ch.isdigit():
+            return ch
+    return None

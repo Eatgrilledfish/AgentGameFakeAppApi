@@ -14,11 +14,12 @@ _PLATFORMS = {
 _RENT_TYPE_KEYWORDS = {"合租": "合租", "单间": "合租", "整租": "整租"}
 _LAYOUT_PATTERN = re.compile(r"([一二两三四五六七八九1-9](?:居|室))(?:([0-9一二三四])厅)?(?:([0-9一二三四])卫)?")
 _DATE_PATTERN = re.compile(r"(20\d{2}-\d{1,2}-\d{1,2})")
-_HOUSE_ID_PATTERN = re.compile(r"([A-Z]{2,4}_?\d{3,8})")
+_HOUSE_ID_PATTERN = re.compile(r"([A-Z]{2,4}_?\d{1,8})", re.IGNORECASE)
 
 
 class RuleBasedNLU:
     def parse(self, text: str, state: SessionState, case_type: CaseType) -> StructuredQuery:
+        text = _normalize_typos(text)
         hard = HardConstraints()
         soft = SoftPreferences()
 
@@ -33,6 +34,7 @@ class RuleBasedNLU:
         self._extract_area(text, hard)
         self._extract_subway(text, lowered, hard, soft)
         self._extract_commute(text, hard)
+        self._extract_utilities(text, hard)
         self._extract_move_in_date(text, hard)
         self._extract_landmark_or_community(text, hard)
         self._extract_soft_preferences(text, soft)
@@ -67,12 +69,33 @@ class RuleBasedNLU:
         )
 
     def _detect_intent(self, text: str, lowered: str) -> IntentType:
-        if any(word in text for word in ["退租", "恢复可租"]):
+        house_ref = bool(_HOUSE_ID_PATTERN.search(text)) or any(
+            word in text
+            for word in ["这套", "这一套", "这个房", "它", "第一套", "第二套", "第三套", "最开始", "最初", "上一套", "刚才那套"]
+        )
+        if any(word in text for word in ["退租", "恢复可租", "退掉", "取消租", "不租了"]):
             return IntentType.terminate
         if "下架" in text:
             return IntentType.offline
-        if any(word in text for word in ["租这个", "租这套", "帮我租", "我要租", "租房"]):
+        if any(word in text for word in ["租这个", "租这套", "租这一套", "帮我租", "我要租", "我想租", "办理租房"]):
             return IntentType.rent
+        if "租房" in text and any(word in text for word in ["帮我", "办理", "我要", "我想"]):
+            return IntentType.rent
+        if (
+            "租" in text
+            and house_ref
+            and not any(word in text for word in ["可租吗", "可以租吗", "能租吗", "能不能租", "租金", "多少钱", "价格"])
+        ):
+            return IntentType.rent
+        has_platform = any(word in text for word in ["安居客", "链家", "58同城", "58"])
+        if (house_ref or has_platform) and any(word in text for word in ["多少钱", "价格", "报价", "挂牌"]) and (
+            has_platform or "分别" in text or "各平台" in text
+        ):
+            return IntentType.listings
+        if house_ref and any(
+            word in text for word in ["详情", "详细", "离地铁", "地铁多远", "多远", "可租吗", "可以租吗", "能租吗", "详细情况"]
+        ):
+            return IntentType.house_detail
         if any(word in text for word in ["商场", "商超", "公园", "配套"]) and any(
             word in text for word in ["附近", "周边", "有没有"]
         ):
@@ -88,7 +111,7 @@ class RuleBasedNLU:
     def _extract_house_and_platform(self, text: str, hard: HardConstraints) -> None:
         m = _HOUSE_ID_PATTERN.search(text)
         if m:
-            hard.house_id = m.group(1)
+            hard.house_id = m.group(1).upper()
         for key, platform in _PLATFORMS.items():
             if key in text:
                 hard.listing_platform = platform
@@ -162,6 +185,14 @@ class RuleBasedNLU:
             if any(k in context for k in ["通勤", "西二旗", "到公司", "上班"]):
                 hard.max_commute_min = int(m.group(1))
                 return
+
+    def _extract_utilities(self, text: str, hard: HardConstraints) -> None:
+        if "商水商电" in text:
+            hard.utilities_type = "商水商电"
+            return
+        if "民水民电" in text:
+            hard.utilities_type = "民水民电"
+            return
 
     def _extract_move_in_date(self, text: str, hard: HardConstraints) -> None:
         m = _DATE_PATTERN.search(text)
@@ -298,3 +329,12 @@ def _cn_to_num(text: str) -> int:
     if len(text) == 3 and text[1] == "十":
         return table.get(text[0], 0) * 10 + table.get(text[2], 0)
     return table.get(text, 0)
+
+
+def _normalize_typos(text: str) -> str:
+    normalized = text
+    normalized = normalized.replace("两局", "两居")
+    normalized = normalized.replace("一局", "一居")
+    normalized = normalized.replace("三局", "三居")
+    normalized = normalized.replace("四局", "四居")
+    return normalized

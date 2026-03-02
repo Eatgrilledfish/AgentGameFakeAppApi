@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import json
 from fastapi.testclient import TestClient
 
 import httpx
@@ -59,6 +60,156 @@ def test_chat_route_returns_houses_json_when_candidates_exist() -> None:
         assert body["session_id"] == "sess-1"
         assert "HF_2101" in body["response"]
         assert body["status"] == "success"
+
+
+def test_chat_route_returns_json_string_for_search_without_candidates() -> None:
+    app = create_app()
+
+    class StubService:
+        async def handle(self, request):
+            return InvokeResponse(
+                text="当前条件无结果",
+                candidates=[],
+                debug={"response_kind": "search"},
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-2", "message": "帮我找房"},
+        )
+
+        assert resp.status_code == 200
+        payload = json.loads(resp.json()["response"])
+        assert payload == {"message": "当前条件无结果", "houses": []}
+
+
+def test_chat_route_keeps_natural_text_for_non_search_reply() -> None:
+    app = create_app()
+
+    class StubService:
+        async def handle(self, request):
+            return InvokeResponse(
+                text="HF_4 各平台挂牌：安居客 3800 元（可租）；链家 3900 元（可租）。",
+                candidates=[],
+                debug={"response_kind": "detail"},
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-3", "message": "HF_4多少钱"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["response"].startswith("HF_4 各平台挂牌")
+
+
+def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
+    app = create_app()
+    captured: dict = {}
+
+    class StubState:
+        conversation_summary = "上轮推荐 HF_1001"
+
+    class StubStateStore:
+        def get(self, session_id):
+            assert session_id == "sess-llm-nlu"
+            return StubState()
+
+    class StubService:
+        state_store = StubStateStore()
+
+        def rough_token_estimate(self, text: str) -> int:
+            return 10
+
+        def allow_llm_fallback(self, session_id: str, estimated_prompt_tokens: int) -> bool:
+            return True
+
+        def record_llm_fallback_usage(self, session_id: str, consumed_tokens: int) -> None:
+            captured["consumed_tokens"] = consumed_tokens
+
+        async def handle(self, request):
+            captured["meta"] = request.meta
+            return InvokeResponse(text="已执行", candidates=[], debug={"response_kind": "action"})
+
+    class StubResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            assert url == "http://127.0.0.1:8888/v1/chat/completions"
+            assert headers["Session-ID"] == "sess-llm-nlu"
+            assert "意图解析器" in json["messages"][0]["content"]
+            assert "operationId" in json["messages"][0]["content"]
+            return StubResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"intent":"rent","tool_plan":{"operationId":"rent_house","arguments":'
+                                    '{"house_id":"HF_1001","listing_platform":"安居客"}},"confidence":0.92}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-llm-nlu", "message": "帮我把第一套租掉"},
+        )
+
+        assert resp.status_code == 200
+        assert captured["meta"]["model_ip"] == "127.0.0.1"
+        assert captured["meta"]["llm_parse"]["intent"] == "rent"
+        assert captured["meta"]["llm_parse"]["tool_plan"]["arguments"]["house_id"] == "HF_1001"
+
+
+def test_chat_route_skips_llm_nlu_when_service_policy_disallows() -> None:
+    app = create_app()
+    captured: dict = {"http_called": False}
+
+    class StubService:
+        def should_use_llm_nlu(self, session_id: str, user_message: str):
+            return False, "rule_high_conf_search"
+
+        async def handle(self, request):
+            captured["meta"] = request.meta
+            return InvokeResponse(text="已执行", candidates=[], debug={"response_kind": "action"})
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            captured["http_called"] = True
+            raise AssertionError("LLM NLU should be skipped in this test")
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-skip", "message": "海淀两居预算8000"},
+        )
+
+        assert resp.status_code == 200
+        assert captured["http_called"] is False
+        assert captured["meta"]["model_ip"] == "127.0.0.1"
+        assert "llm_parse" not in captured["meta"]
 
 
 def test_proxy_chat_completions_route() -> None:
@@ -132,6 +283,48 @@ def test_proxy_chat_completions_requires_model_ip() -> None:
         )
 
         assert resp.status_code == 400
+
+
+def test_proxy_chat_completions_requires_session_id_for_v1() -> None:
+    app = create_app()
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/chat/completions",
+            headers={"Model-IP": "127.0.0.1"},
+            json={"model": "", "messages": [{"role": "user", "content": "你好"}], "stream": False},
+        )
+
+        assert resp.status_code == 400
+
+
+def test_proxy_chat_completions_v2_without_session_header() -> None:
+    app = create_app()
+
+    class StubResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"id": "v2-ok"}
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            assert url == "http://127.0.0.1:8888/v1/chat/completions"
+            assert headers == {}
+            assert json["messages"][0]["content"] == "你好"
+            return StubResponse()
+
+    with TestClient(app) as client:
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/v2/chat/completions",
+            headers={"Model-IP": "127.0.0.1"},
+            json={"model": "", "messages": [{"role": "user", "content": "你好"}], "stream": False},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["id"] == "v2-ok"
 
 
 def test_http_request_logging(caplog) -> None:

@@ -48,3 +48,37 @@ def test_do_not_parse_distance_as_budget() -> None:
     assert q.hard.landmark_name == "车公庄"
     assert q.hard.max_subway_dist == 500
     assert q.hard.budget_max is None
+
+
+def test_detect_listing_query_intent() -> None:
+    nlu = RuleBasedNLU()
+    q = nlu.parse("HF_4这套在安居客、链家、58同城上分别多少钱？", _state(), CaseType.single)
+
+    assert q.intent.value == "listings"
+    assert q.hard.house_id == "HF_4"
+
+
+def test_detect_house_detail_intent_without_triggering_rent() -> None:
+    nlu = RuleBasedNLU()
+    q = nlu.parse("这套可以租吗", _state(), CaseType.single)
+
+    assert q.intent.value == "house_detail"
+
+
+def test_extract_utilities_and_typo_layout() -> None:
+    nlu = RuleBasedNLU()
+    q = nlu.parse("通州两局商水商电房源有没有？", _state(), CaseType.single)
+
+    assert q.intent.value == "search"
+    assert q.hard.district == "通州"
+    assert q.hard.layout == "两居"
+    assert q.hard.utilities_type == "商水商电"
+
+
+def test_detect_rent_and_terminate_from_short_phrases() -> None:
+    nlu = RuleBasedNLU()
+    q1 = nlu.parse("就租第一套吧。", _state(), CaseType.single)
+    q2 = nlu.parse("算了不租了，帮我退掉吧。", _state(), CaseType.single)
+
+    assert q1.intent.value == "rent"
+    assert q2.intent.value == "terminate"

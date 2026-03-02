@@ -18,6 +18,8 @@ class IntentType(str, Enum):
     search = "search"
     compare = "compare"
     amenities = "amenities"
+    house_detail = "house_detail"
+    listings = "listings"
     rent = "rent"
     terminate = "terminate"
     offline = "offline"
@@ -33,6 +35,7 @@ class HardConstraints(BaseModel):
     district: str | None = None
     area: str | None = None
     community: str | None = None
+    landmark_id: str | None = None
     landmark_name: str | None = None
     landmark_category: str | None = None
     budget_min: int | None = None
@@ -42,6 +45,7 @@ class HardConstraints(BaseModel):
     area_min: float | None = None
     max_subway_dist: int | None = None
     max_commute_min: int | None = None
+    utilities_type: str | None = None
     move_in_date: str | None = None
     listing_platform: Platform | None = None
     house_id: str | None = None
@@ -143,6 +147,23 @@ class HouseViewModel(BaseModel):
     score: float | None = None
 
 
+class SearchSnapshot(BaseModel):
+    query_text: str
+    district: str | None = None
+    area: str | None = None
+    community: str | None = None
+    landmark_name: str | None = None
+    house_ids: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class TurnSummary(BaseModel):
+    user: str
+    assistant: str
+    intent: IntentType | None = None
+    house_ids: list[str] = Field(default_factory=list)
+
+
 class SessionState(BaseModel):
     session_id: str
     user_id: str
@@ -154,6 +175,11 @@ class SessionState(BaseModel):
     last_query_hash: str | None = None
     last_candidates: list[HouseLite] = Field(default_factory=list)
     last_top5: list[HouseViewModel] = Field(default_factory=list)
+    search_history: list[SearchSnapshot] = Field(default_factory=list)
+    focus_house_id: str | None = None
+    focus_listing_platform: Platform | None = None
+    recent_turns: list[TurnSummary] = Field(default_factory=list)
+    conversation_summary: str = ""
     excluded_reasons: dict[str, str] = Field(default_factory=dict)
     budget: BudgetState = Field(default_factory=BudgetState)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

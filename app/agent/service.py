@@ -15,6 +15,7 @@ from app.clients.landmarks import LandmarksClient
 from app.infra.cache import CacheManager
 from app.infra.logging import log_event
 from app.schemas import InvokeRequest, InvokeResponse
+from app.schemas import IntentType
 from app.settings import AgentSettings
 
 LOGGER = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ class AgentService:
         self.houses_client = houses_client
         self.cache = cache
         self.budget = BudgetManager()
+        self.nlu_for_gate = RuleBasedNLU()
 
         self.dialogue = DialogueManager(
             state_store=state_store,
@@ -103,6 +105,48 @@ class AgentService:
             return
         self.budget.record_llm_usage(state.budget, consumed_tokens)
         self.state_store.upsert(state)
+
+    def build_llm_fallback_messages(self, session_id: str, user_message: str) -> list[dict[str, str]]:
+        state = self.state_store.get(session_id)
+        if state is None:
+            return [{"role": "user", "content": user_message}]
+
+        messages: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": "你是租房助手，必须参考会话摘要回答，不能忽略已有上下文。",
+            }
+        ]
+        if state.conversation_summary:
+            messages.append({"role": "system", "content": f"会话摘要：{state.conversation_summary}"})
+        messages.append({"role": "user", "content": user_message})
+        return messages
+
+    def should_use_llm_nlu(self, session_id: str, user_message: str) -> tuple[bool, str]:
+        state = self.state_store.get(session_id)
+        if state is None:
+            return True, "no_session_state"
+
+        # Reference resolution and colloquial commands benefit most from model parsing.
+        if any(word in user_message for word in ["这套", "第一套", "第二套", "最开始", "最初", "上一套", "这个房", "它"]):
+            return True, "reference_or_contextual"
+
+        parsed = self.nlu_for_gate.parse(user_message, state, state.case_type)
+        if parsed.intent == IntentType.chat:
+            return False, "rule_chat_intent"
+
+        if parsed.confidence >= 0.8 and parsed.intent in {
+            IntentType.search,
+            IntentType.rent,
+            IntentType.terminate,
+            IntentType.offline,
+            IntentType.house_detail,
+            IntentType.listings,
+            IntentType.amenities,
+            IntentType.compare,
+        }:
+            return False, f"rule_high_conf_{parsed.intent.value}"
+        return True, "rule_low_conf_or_complex"
 
     @staticmethod
     def rough_token_estimate(text: str) -> int:
