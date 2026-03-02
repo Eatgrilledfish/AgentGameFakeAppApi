@@ -56,6 +56,42 @@ async def _forward_chat_completion(
     return msg.get("content")
 
 
+def _build_model_base_url(model_ip: str) -> str:
+    if model_ip.startswith(("http://", "https://")):
+        return model_ip
+    return f"http://{model_ip}:8888"
+
+
+async def _forward_chat_completion(
+    http_client: httpx.AsyncClient,
+    *,
+    model_ip: str,
+    message: str,
+    session_id: str | None = None,
+) -> str | None:
+    headers: dict[str, str] = {}
+    if session_id:
+        headers["Session-ID"] = session_id
+
+    payload = {
+        "model": "",
+        "messages": [{"role": "user", "content": message}],
+        "stream": False,
+    }
+    resp = await http_client.post(
+        f"{_build_model_base_url(model_ip)}/v1/chat/completions",
+        json=payload,
+        headers=headers,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    choices = data.get("choices", [])
+    if not choices:
+        return None
+    msg = choices[0].get("message", {})
+    return msg.get("content")
+
+
 def create_app(settings: AgentSettings | None = None) -> FastAPI:
     cfg = settings or load_settings()
     setup_logging()
