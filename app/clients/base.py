@@ -11,6 +11,7 @@ from app.clients.exceptions import DataSourceError
 from app.infra.logging import log_event, preview_payload
 
 LOGGER = logging.getLogger(__name__)
+STEP_UPSTREAM_API = "STEP-03-UPSTREAM-API"
 
 
 class BaseClient:
@@ -59,6 +60,7 @@ class BaseClient:
         log_event(
             LOGGER,
             "upstream.request",
+            step=STEP_UPSTREAM_API,
             method="GET",
             url=url,
             params=params if params is not None else {},
@@ -78,6 +80,7 @@ class BaseClient:
             log_event(
                 LOGGER,
                 "upstream.response",
+                step=STEP_UPSTREAM_API,
                 method="GET",
                 url=url,
                 status_code=response.status_code,
@@ -85,7 +88,7 @@ class BaseClient:
             )
             return payload
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
-            log_event(LOGGER, "upstream.error", method="GET", url=url, error=str(exc))
+            log_event(LOGGER, "upstream.error", step=STEP_UPSTREAM_API, method="GET", url=url, error=str(exc))
             LOGGER.warning("GET %s failed: %s", url, exc)
             raise DataSourceError(f"GET failed: {url}") from exc
 
@@ -102,6 +105,7 @@ class BaseClient:
         log_event(
             LOGGER,
             "upstream.request",
+            step=STEP_UPSTREAM_API,
             method="POST",
             url=url,
             params=params if params is not None else {},
@@ -126,6 +130,7 @@ class BaseClient:
             log_event(
                 LOGGER,
                 "upstream.response",
+                step=STEP_UPSTREAM_API,
                 method="POST",
                 url=url,
                 status_code=response.status_code,
@@ -133,6 +138,6 @@ class BaseClient:
             )
             return payload
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
-            log_event(LOGGER, "upstream.error", method="POST", url=url, error=str(exc))
+            log_event(LOGGER, "upstream.error", step=STEP_UPSTREAM_API, method="POST", url=url, error=str(exc))
             LOGGER.warning("POST %s failed: %s", url, exc)
             raise DataSourceError(f"POST failed: {url}") from exc
