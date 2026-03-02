@@ -231,7 +231,7 @@ def test_debug_trace_viewer_endpoints() -> None:
         app.state.agent_service = StubService()
         page = client.get("/debug/chat-view")
         assert page.status_code == 200
-        assert "对话处理链路可视化" in page.text
+        assert "实时交互可视化面板" in page.text
 
         chat_resp = client.post(
             "/api/v1/chat",
@@ -244,6 +244,12 @@ def test_debug_trace_viewer_endpoints() -> None:
         events = trace_resp.json()["events"]
         assert any(item.get("event") == "chat.received" for item in events)
         assert any(item.get("event") == "chat.completed" for item in events)
+
+
+        trace_delta_resp = client.get("/debug/traces/sess-debug?since_seq=1")
+        assert trace_delta_resp.status_code == 200
+        delta_events = trace_delta_resp.json()["events"]
+        assert all(int(item.get("seq", 0)) > 1 for item in delta_events)
 
         clear_resp = client.delete("/debug/traces/sess-debug")
         assert clear_resp.status_code == 200

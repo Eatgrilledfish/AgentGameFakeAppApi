@@ -7,7 +7,7 @@ import time
 from uuid import uuid4
 
 import httpx
-from fastapi import Body, FastAPI, Header, HTTPException, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
 from app.agent.service import AgentService
@@ -43,78 +43,162 @@ DEBUG_CHAT_PAGE = """<!doctype html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Chat Trace Viewer</title>
+  <title>实时链路监控面板</title>
   <style>
-    body{font-family:Arial,sans-serif;margin:0;background:#f5f7fb;}
-    .wrap{max-width:1100px;margin:24px auto;padding:0 16px;}
+    body{font-family:Arial,sans-serif;margin:0;background:#f5f7fb;color:#223;}
+    .wrap{max-width:1200px;margin:24px auto;padding:0 16px;}
     .card{background:#fff;border-radius:10px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,.08);margin-bottom:16px;}
-    .row{display:flex;gap:8px;flex-wrap:wrap;}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
     input,textarea,button{padding:10px;border:1px solid #cfd7e6;border-radius:8px;font-size:14px;}
-    input,textarea{flex:1;}
+    input,textarea{flex:1;min-width:240px;}
     button{background:#2f6feb;color:#fff;border:none;cursor:pointer;}
-    .event{border-left:4px solid #2f6feb;background:#f8faff;padding:10px 12px;margin:8px 0;border-radius:6px;}
+    button.secondary{background:#54627a;}
+    .timeline{display:grid;grid-template-columns:1fr;gap:10px;}
+    .event{border-left:4px solid #2f6feb;background:#f8faff;padding:10px 12px;border-radius:6px;}
+    .event.upstream{border-left-color:#9c27b0;background:#fbf6ff;}
+    .event.llm{border-left-color:#ff9800;background:#fffaf1;}
+    .event.final{border-left-color:#2e7d32;background:#f3fff3;}
     .meta{font-size:12px;color:#556;}
+    .cols{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+    @media (max-width:900px){.cols{grid-template-columns:1fr;}}
     pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;font-size:12px;}
+    .tip{font-size:13px;color:#445;}
   </style>
 </head>
 <body>
 <div class="wrap">
   <div class="card">
-    <h2>对话处理链路可视化</h2>
+    <h2>8080 实时交互可视化面板</h2>
+    <p class="tip">用途：监听 session 的真实处理过程。建议把本服务运行在 <b>8080</b>，然后打开 <code>http://127.0.0.1:8080/debug/chat-view</code>。</p>
     <div class="row">
-      <input id="modelIp" placeholder="model_ip，例如 127.0.0.1"/>
-      <input id="sessionId" placeholder="session_id"/>
+      <input id="apiBase" placeholder="监听地址，例如 http://127.0.0.1:8080" value=""/>
+      <input id="modelIp" placeholder="model_ip（发送消息时需要）"/>
+      <input id="sessionId" placeholder="session_id（监听必填）"/>
     </div>
     <div class="row" style="margin-top:8px;">
-      <textarea id="message" rows="3" placeholder="输入用户问题"></textarea>
+      <textarea id="message" rows="3" placeholder="可选：在此发送消息并观察全链路"></textarea>
     </div>
     <div class="row" style="margin-top:8px;">
-      <button onclick="send()">发送并查看处理步骤</button>
-      <button onclick="refreshTrace()">刷新步骤</button>
-      <button onclick="clearTrace()">清空步骤</button>
+      <button onclick="send()">发送测试消息</button>
+      <button class="secondary" onclick="startWatch()">开始监听</button>
+      <button class="secondary" onclick="stopWatch()">停止监听</button>
+      <button class="secondary" onclick="clearTrace()">清空当前会话轨迹</button>
     </div>
     <p id="resp"></p>
   </div>
 
-  <div class="card">
-    <h3>处理步骤</h3>
-    <div id="events"></div>
+  <div class="cols">
+    <div class="card">
+      <h3>关键输入输出</h3>
+      <div id="summary"></div>
+    </div>
+    <div class="card">
+      <h3>完整事件时间线</h3>
+      <div id="events" class="timeline"></div>
+    </div>
   </div>
 </div>
 <script>
+let timer = null;
+let rendered = new Set();
+let lastSeq = 0;
+
+function baseUrl(){
+  const val = document.getElementById('apiBase').value.trim();
+  return val || window.location.origin;
+}
+function sessionId(){
+  return document.getElementById('sessionId').value.trim();
+}
+function cls(ev){
+  const name = String(ev.event||'');
+  if(name.startsWith('upstream.')) return 'event upstream';
+  if(name.includes('llm')) return 'event llm';
+  if(name.includes('completed') || name.includes('invoke.completed')) return 'event final';
+  return 'event';
+}
+function esc(s){ return String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function renderSummary(events){
+  const pick = (name) => events.filter(e => e.event === name).at(-1);
+  const recv = pick('chat.received');
+  const invokeDone = pick('chat.agent.invoke.done');
+  const llm = pick('chat.llm_fallback.applied') || pick('chat.llm.forward.response');
+  const final = pick('chat.completed') || pick('invoke.completed');
+  const rows = [
+    ['用户输入', recv?.message || '-'],
+    ['Agent输出', invokeDone?.invoke_text || final?.invoke_output || '-'],
+    ['大模型输出', llm?.llm_output || llm?.body_preview || '-'],
+    ['最终返回用户', final?.response || '-'],
+  ];
+  document.getElementById('summary').innerHTML = rows.map(r => `<div class="event"><b>${esc(r[0])}</b><pre>${esc(r[1])}</pre></div>`).join('');
+}
+
+function appendEvents(events){
+  const el = document.getElementById('events');
+  for(const ev of events){
+    const key = `${ev.trace_id}-${ev.seq}-${ev.event}`;
+    if(rendered.has(key)) continue;
+    rendered.add(key);
+    lastSeq = Math.max(lastSeq, Number(ev.seq||0));
+    const item = document.createElement('div');
+    item.className = cls(ev);
+    item.innerHTML = `<div><b>${esc(ev.step||'-')}</b> · <span>${esc(ev.event||'-')}</span></div><div class="meta">seq=${esc(ev.seq)} trace_id=${esc(ev.trace_id)}</div><pre>${esc(JSON.stringify(ev,null,2))}</pre>`;
+    el.appendChild(item);
+  }
+}
+
+async function refreshTrace(){
+  const sid = sessionId();
+  if(!sid){ return; }
+  const url = `${baseUrl()}/debug/traces/${encodeURIComponent(sid)}?since_seq=${lastSeq}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  const events = data.events || [];
+  appendEvents(events);
+
+  const full = await fetch(`${baseUrl()}/debug/traces/${encodeURIComponent(sid)}`);
+  const fullData = await full.json();
+  renderSummary(fullData.events || []);
+}
+
 async function send(){
   const model_ip=document.getElementById('modelIp').value.trim();
-  const session_id=document.getElementById('sessionId').value.trim();
+  const sid=sessionId();
   const message=document.getElementById('message').value.trim();
-  if(!model_ip||!session_id||!message){alert('请填写 model_ip/session_id/message');return;}
-  const res=await fetch('/api/v1/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model_ip,session_id,message})});
+  if(!model_ip||!sid||!message){alert('请填写 model_ip/session_id/message');return;}
+  const res=await fetch(`${baseUrl()}/api/v1/chat`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model_ip,session_id:sid,message})});
   const data=await res.json();
   document.getElementById('resp').innerText='最终返回：'+(data.response||JSON.stringify(data));
   await refreshTrace();
 }
-async function refreshTrace(){
-  const session_id=document.getElementById('sessionId').value.trim();
-  if(!session_id){alert('先输入 session_id');return;}
-  const res=await fetch('/debug/traces/'+encodeURIComponent(session_id));
-  const data=await res.json();
-  const el=document.getElementById('events');
-  el.innerHTML='';
-  (data.events||[]).forEach(ev=>{
-    const item=document.createElement('div');item.className='event';
-    item.innerHTML=`<div><b>${ev.step||'-'}</b> · <span>${ev.event||'-'}</span></div><div class="meta">seq=${ev.seq} trace_id=${ev.trace_id}</div><pre>${JSON.stringify(ev,null,2)}</pre>`;
-    el.appendChild(item);
-  });
+
+function startWatch(){
+  if(timer) clearInterval(timer);
+  timer = setInterval(refreshTrace, 1200);
+  refreshTrace();
 }
+function stopWatch(){
+  if(timer) clearInterval(timer);
+  timer = null;
+}
+
 async function clearTrace(){
-  const session_id=document.getElementById('sessionId').value.trim();
-  if(!session_id){alert('先输入 session_id');return;}
-  await fetch('/debug/traces/'+encodeURIComponent(session_id),{method:'DELETE'});
-  await refreshTrace();
+  const sid=sessionId();
+  if(!sid){alert('先输入 session_id');return;}
+  await fetch(`${baseUrl()}/debug/traces/${encodeURIComponent(sid)}`,{method:'DELETE'});
+  rendered = new Set();
+  lastSeq = 0;
+  document.getElementById('events').innerHTML='';
+  document.getElementById('summary').innerHTML='';
 }
+
+document.getElementById('apiBase').value = window.location.origin;
 </script>
 </body>
 </html>
 """
+
 
 def _build_model_base_url(model_ip: str) -> str:
     if model_ip.startswith(("http://", "https://")):
@@ -252,8 +336,11 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         return HTMLResponse(content=DEBUG_CHAT_PAGE)
 
     @app.get("/debug/traces/{session_id}")
-    async def debug_get_trace(session_id: str) -> dict:
-        return {"session_id": session_id, "events": get_trace_events(session_id)}
+    async def debug_get_trace(session_id: str, since_seq: int = Query(default=0, ge=0)) -> dict:
+        events = get_trace_events(session_id)
+        if since_seq > 0:
+            events = [event for event in events if int(event.get("seq", 0)) > since_seq]
+        return {"session_id": session_id, "events": events}
 
     @app.delete("/debug/traces/{session_id}")
     async def debug_clear_trace(session_id: str) -> dict:
