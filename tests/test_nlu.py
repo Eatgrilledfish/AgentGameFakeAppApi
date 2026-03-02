@@ -39,3 +39,12 @@ def test_extract_subway_distance_without_priority_keyword() -> None:
 
     assert q.hard.max_subway_dist == 500
     assert q.soft.prioritize_subway_distance is False
+
+
+def test_do_not_parse_distance_as_budget() -> None:
+    nlu = RuleBasedNLU()
+    q = nlu.parse("车公庄站 500 米内的两居", _state(), CaseType.single)
+
+    assert q.hard.landmark_name == "车公庄"
+    assert q.hard.max_subway_dist == 500
+    assert q.hard.budget_max is None
