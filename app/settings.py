@@ -41,9 +41,11 @@ class RankingWeights:
 @dataclass(slots=True)
 class AgentSettings:
     api_base_url: str = "http://127.0.0.1:8080"
-    default_user_id: str = "demo-user"
+    # Replace with your real employee ID for X-User-ID header on /api/houses/* calls.
+    default_user_id: str = "YOUR_EMPLOYEE_ID"
     app_host: str = "0.0.0.0"
     app_port: int = 8191
+    log_level: str = "INFO"
     request_deadline_ms: int = 4500
     enrich_listing_top_n: int = 20
     enrich_amenities_top_n: int = 5
@@ -62,9 +64,10 @@ class AgentSettings:
 def load_settings() -> AgentSettings:
     return AgentSettings(
         api_base_url=os.getenv("API_BASE_URL", "http://127.0.0.1:8080"),
-        default_user_id=os.getenv("DEFAULT_USER_ID", "demo-user"),
+        default_user_id=os.getenv("DEFAULT_USER_ID", "YOUR_EMPLOYEE_ID"),
         app_host=os.getenv("APP_HOST", "0.0.0.0"),
         app_port=int(os.getenv("APP_PORT", "8191")),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
         request_deadline_ms=int(os.getenv("REQUEST_DEADLINE_MS", "4500")),
         enrich_listing_top_n=int(os.getenv("ENRICH_LISTING_TOP_N", "20")),
         enrich_amenities_top_n=int(os.getenv("ENRICH_AMENITIES_TOP_N", "5")),

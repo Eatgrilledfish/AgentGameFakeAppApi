@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from statistics import pstdev
 
 from app.clients.houses import HousesClient
+from app.infra.cache import CacheManager
 from app.schemas import HouseLite, HouseViewModel, Listing, NearbyLandmark, StructuredQuery
 from app.settings import RankingWeights
 
@@ -18,10 +19,22 @@ class RankedHouse:
 
 
 class Ranker:
-    def __init__(self, houses_client: HousesClient, weights: RankingWeights, enrich_concurrency: int = 8) -> None:
+    def __init__(
+        self,
+        houses_client: HousesClient,
+        weights: RankingWeights,
+        enrich_concurrency: int = 8,
+        *,
+        cache: CacheManager | None = None,
+        listing_top_n: int = 20,
+        amenities_top_n: int = 5,
+    ) -> None:
         self.houses_client = houses_client
         self.weights = weights
         self.enrich_concurrency = enrich_concurrency
+        self.cache = cache
+        self.listing_top_n = listing_top_n
+        self.amenities_top_n = amenities_top_n
 
     def hard_filter(self, house: HouseLite, query: StructuredQuery) -> bool:
         h = query.hard
@@ -66,38 +79,59 @@ class Ranker:
 
     async def rank_two_stage(self, candidates: list[HouseLite], query: StructuredQuery, max_output: int = 5) -> list[HouseViewModel]:
         filtered = [house for house in candidates if self.hard_filter(house, query)]
-        relaxed = False
+        relax_notes: list[str] = []
         if not filtered and query.hard.max_subway_dist == 800:
-            relaxed = True
             original = query.hard.max_subway_dist
             query.hard.max_subway_dist = 1000
             filtered = [house for house in candidates if self.hard_filter(house, query)]
             query.hard.max_subway_dist = original
+            if filtered:
+                relax_notes.append("为避免无结果，已放宽近地铁条件到 1000 米")
+
+        if not filtered and query.hard.budget_max is not None:
+            original_budget = query.hard.budget_max
+            query.hard.budget_max = int(original_budget * 1.1)
+            filtered = [house for house in candidates if self.hard_filter(house, query)]
+            query.hard.budget_max = original_budget
+            if filtered:
+                relax_notes.append("为避免无结果，已放宽预算上限 10%")
 
         if not filtered:
             return []
 
         coarse_sorted = sorted(filtered, key=lambda h: self._coarse_score(h, query), reverse=True)
-        top_n = coarse_sorted[:20]
+        top_n = coarse_sorted[: self.listing_top_n]
         enriched = await self._enrich_listings(top_n)
 
         top_fine = sorted(
             enriched,
-            key=lambda item: self._fine_score(item.house, item.listings, query),
+            key=lambda item: self._fine_score(item.house, item.listings, query, amenities={}),
             reverse=True,
         )[:max_output]
 
-        top_fine = await self._enrich_amenities(top_fine)
-        views = [self._to_view_model(item, query, relaxed=relaxed) for item in top_fine]
+        top_amenities = top_fine[: self.amenities_top_n]
+        enriched_top = await self._enrich_amenities(top_amenities)
+        combined = enriched_top + top_fine[self.amenities_top_n :]
+        combined = sorted(
+            combined,
+            key=lambda item: self._fine_score(item.house, item.listings, query, amenities=item.amenities),
+            reverse=True,
+        )[:max_output]
+        views = [self._to_view_model(item, query, relax_notes=relax_notes) for item in combined]
         return views
 
     async def _enrich_listings(self, houses: list[HouseLite]) -> list[RankedHouse]:
         sem = asyncio.Semaphore(self.enrich_concurrency)
 
         async def worker(house: HouseLite) -> RankedHouse:
+            if self.cache is not None and house.house_id in self.cache.house_listings:
+                listings = self.cache.house_listings[house.house_id]
+                return RankedHouse(house=house, score=0.0, listings=listings, amenities={})
             async with sem:
                 listings_page = await self.houses_client.get_listings(house.house_id)
                 listings = listings_page.get("items", [])
+                if self.cache is not None:
+                    self.cache.house_listings[house.house_id] = listings
                 return RankedHouse(house=house, score=0.0, listings=listings, amenities={})
 
         return await asyncio.gather(*[worker(house) for house in houses])
@@ -109,25 +143,37 @@ class Ranker:
             community = item.house.community
             if not community:
                 return item
+            if self.cache is not None and community in self.cache.community_amenities:
+                item.amenities = self.cache.community_amenities[community]
+                return item
             async with sem:
                 shops = await self.houses_client.nearby_landmarks(community=community, category="shopping", max_distance_m=3000)
                 parks = await self.houses_client.nearby_landmarks(community=community, category="park", max_distance_m=3000)
-            item.amenities = {"shopping": shops, "park": parks}
+            amenities = {"shopping": shops, "park": parks}
+            item.amenities = amenities
+            if self.cache is not None:
+                self.cache.community_amenities[community] = amenities
             return item
 
         return await asyncio.gather(*[load_one(item) for item in ranked_houses])
 
-    def _fine_score(self, house: HouseLite, listings: list[Listing], query: StructuredQuery) -> float:
+    def _fine_score(
+        self,
+        house: HouseLite,
+        listings: list[Listing],
+        query: StructuredQuery,
+        amenities: dict[str, list[NearbyLandmark]],
+    ) -> float:
         base = self._coarse_score(house, query)
         listing_consistency = _listing_consistency_score(listings)
-        amenities_score = 0.0
+        amenities_score = _amenities_score(amenities, query)
         return base + self.weights.listing_consistency * listing_consistency + self.weights.amenities * amenities_score
 
-    def _to_view_model(self, ranked: RankedHouse, query: StructuredQuery, relaxed: bool) -> HouseViewModel:
+    def _to_view_model(self, ranked: RankedHouse, query: StructuredQuery, relax_notes: list[str]) -> HouseViewModel:
         house = ranked.house
         listings = ranked.listings
         selected_platform = _choose_best_platform(house, listings)
-        score = self._fine_score(house, listings, query)
+        score = self._fine_score(house, listings, query, amenities=ranked.amenities)
 
         pros: list[str] = []
         cons: list[str] = []
@@ -147,8 +193,8 @@ class Ranker:
             if len(rents) >= 2 and max(rents) - min(rents) >= 1500:
                 cons.append("跨平台价格差异较大，建议核对房源状态")
 
-        if relaxed:
-            cons.append("为避免无结果，已放宽近地铁条件到 1000 米")
+        for note in relax_notes:
+            cons.append(note)
 
         return HouseViewModel(
             house_id=house.house_id,
@@ -235,3 +281,23 @@ def _choose_best_platform(house: HouseLite, listings: list[Listing]) -> str | No
         if sorted_pool and sorted_pool[0].listing_platform:
             return sorted_pool[0].listing_platform
     return house.listing_platform or "安居客"
+
+
+def _amenities_score(amenities: dict[str, list[NearbyLandmark]], query: StructuredQuery) -> float:
+    if not amenities:
+        return 0.0
+
+    preferred = set(query.soft.amenities)
+    if not preferred:
+        return 0.5
+
+    shopping_count = len(amenities.get("shopping", []))
+    park_count = len(amenities.get("park", []))
+    score = 0.0
+    if "商超" in preferred:
+        score += min(shopping_count, 3) / 3
+    if "公园" in preferred:
+        score += min(park_count, 3) / 3
+    if len(preferred) == 1:
+        return min(1.0, score)
+    return min(1.0, score / 2)

@@ -31,6 +31,7 @@ class Platform(str, Enum):
 
 class HardConstraints(BaseModel):
     district: str | None = None
+    area: str | None = None
     community: str | None = None
     landmark_name: str | None = None
     landmark_category: str | None = None
@@ -84,6 +85,7 @@ class HouseLite(BaseModel):
     rent: int | None = None
     layout: str | None = None
     area: float | None = None
+    business_area: str | None = None
     district: str | None = None
     community: str | None = None
     subway_distance: int | None = None

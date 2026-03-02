@@ -164,6 +164,10 @@ class RuleBasedNLU:
             hard.move_in_date = m.group(1)
 
     def _extract_landmark_or_community(self, text: str, hard: HardConstraints) -> None:
+        m_business_area = re.search(r"([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,20})(?:商圈|片区)", text)
+        if m_business_area:
+            hard.area = m_business_area.group(1)
+
         named_anchors = ["西二旗", "国贸", "望京", "上地", "中关村", "三里屯", "车公庄"]
         for name in named_anchors:
             if name in text:

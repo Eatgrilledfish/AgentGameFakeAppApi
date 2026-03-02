@@ -10,6 +10,7 @@ from app.agent.state import StateStore
 from app.clients.exceptions import DataSourceError
 from app.clients.houses import HousesClient
 from app.infra.cache import CacheManager
+from app.infra.logging import log_event, preview_text
 from app.schemas import (
     HardConstraints,
     IntentType,
@@ -47,13 +48,29 @@ class DialogueManager:
         self.max_output_candidates = max_output_candidates
 
     async def handle_turn(self, request: InvokeRequest, state: SessionState, is_new_session: bool) -> InvokeResponse:
+        log_event(
+            LOGGER,
+            "dialogue.turn.start",
+            is_new_session=is_new_session,
+            phase=state.phase.value,
+            message=preview_text(request.message, limit=200),
+        )
         if is_new_session:
             await self._init_session_data(state)
 
         query = self.nlu.parse(request.message, state, request.case_type)
         merged = self._merge_query_with_state(query, state)
+        log_event(
+            LOGGER,
+            "dialogue.nlu.done",
+            intent=merged.intent.value,
+            hard=merged.hard.model_dump(exclude_none=True),
+            soft=merged.soft.model_dump(exclude_none=True),
+            clarify_count=len(merged.clarify_questions),
+        )
 
         if merged.intent in {IntentType.rent, IntentType.terminate, IntentType.offline}:
+            log_event(LOGGER, "dialogue.action.detected", intent=merged.intent.value)
             resp = await self._handle_action(merged, state)
             self.state_store.upsert(state)
             return resp
@@ -62,6 +79,7 @@ class DialogueManager:
             SessionPhase.chatting,
             SessionPhase.slot_filling,
         }:
+            log_event(LOGGER, "dialogue.clarify", questions=merged.clarify_questions)
             state.phase = SessionPhase.slot_filling
             self.state_store.upsert(state)
             return self.formatter.render(
@@ -72,6 +90,7 @@ class DialogueManager:
             )
 
         if merged.intent == IntentType.chat:
+            log_event(LOGGER, "dialogue.chat")
             state.phase = SessionPhase.chatting
             self.state_store.upsert(state)
             return InvokeResponse(text="你好，我可以按预算、地铁距离、通勤和小区等条件帮你找房。")
@@ -79,8 +98,11 @@ class DialogueManager:
         try:
             state.phase = SessionPhase.searching
             plan = await self.planner.build_plan(merged)
+            log_event(LOGGER, "dialogue.plan.built", plan_type=plan.plan_type, landmark_id=plan.landmark_id)
             candidates = await self.planner.execute_plan(plan, merged, request.case_type)
+            log_event(LOGGER, "dialogue.plan.executed", candidate_count=len(candidates))
             top = await self.ranker.rank_two_stage(candidates, merged, max_output=self.max_output_candidates)
+            log_event(LOGGER, "dialogue.rank.done", top_count=len(top))
 
             state.phase = SessionPhase.presenting
             state.confirmed_constraints = merged.hard
@@ -95,15 +117,19 @@ class DialogueManager:
                 debug={"plan": plan.plan_type, "candidate_count": len(candidates)},
             )
         except DataSourceError as exc:
+            log_event(LOGGER, "dialogue.error", error=str(exc))
             LOGGER.exception("Data source error")
             return InvokeResponse(text=f"检索接口调用失败：{exc}，请稍后重试。", candidates=[])
 
     async def _init_session_data(self, state: SessionState) -> None:
         try:
+            log_event(LOGGER, "dialogue.session.init.start")
             await self.houses_client.init_houses()
             self.cache.invalidate_all_houses()
+            log_event(LOGGER, "dialogue.session.init.done")
         except DataSourceError:
             LOGGER.warning("init houses failed for session=%s", state.session_id)
+            log_event(LOGGER, "dialogue.session.init.failed")
 
     async def _handle_action(self, query: StructuredQuery, state: SessionState) -> InvokeResponse:
         if not query.hard.house_id or not query.hard.listing_platform:
@@ -122,6 +148,13 @@ class DialogueManager:
         state.phase = SessionPhase.executing
         house_id = query.hard.house_id
         platform = query.hard.listing_platform.value
+        log_event(
+            LOGGER,
+            "dialogue.action.start",
+            intent=query.intent.value,
+            house_id=house_id,
+            listing_platform=platform,
+        )
 
         if query.intent == IntentType.rent:
             result = await self.houses_client.rent(house_id, platform)
@@ -136,6 +169,7 @@ class DialogueManager:
         self.cache.invalidate_house(house_id)
         self.cache.invalidate_query_cache()
         state.phase = SessionPhase.presenting
+        log_event(LOGGER, "dialogue.action.done", action=action, result=result)
         return self.formatter.render_action_result(action, result)
 
     def _merge_query_with_state(self, query: StructuredQuery, state: SessionState) -> StructuredQuery:

@@ -182,6 +182,7 @@ def test_init_houses_post_does_not_send_empty_json_or_params() -> None:
     assert captured["url"] == "http://fake-host:8080/api/houses/init"
     assert "json" not in captured["kwargs"]
     assert "params" not in captured["kwargs"]
+    assert captured["kwargs"]["headers"]["X-User-ID"] == "user-1"
 
 
 def test_init_houses_accepts_non_json_success_response() -> None:

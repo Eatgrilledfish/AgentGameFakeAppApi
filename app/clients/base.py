@@ -8,6 +8,7 @@ import httpx
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_random
 
 from app.clients.exceptions import DataSourceError
+from app.infra.logging import log_event, preview_payload
 
 LOGGER = logging.getLogger(__name__)
 
@@ -55,11 +56,13 @@ class BaseClient:
         url = f"{self.base_url}{path}"
         headers = self._headers_houses() if need_user_id else None
 
-        LOGGER.info(
-            "outgoing request method=GET url=%s params=%s headers=%s",
-            url,
-            params if params is not None else "<none>",
-            self._sanitize_headers(headers),
+        log_event(
+            LOGGER,
+            "upstream.request",
+            method="GET",
+            url=url,
+            params=params if params is not None else {},
+            headers=self._sanitize_headers(headers),
         )
 
         async def request() -> httpx.Response:
@@ -71,9 +74,18 @@ class BaseClient:
         try:
             response = await self._retry_get(request)
             response.raise_for_status()
-            LOGGER.info("outgoing response method=GET url=%s status=%s", url, response.status_code)
-            return self._unwrap(response.json())
+            payload = self._unwrap(response.json())
+            log_event(
+                LOGGER,
+                "upstream.response",
+                method="GET",
+                url=url,
+                status_code=response.status_code,
+                body=preview_payload(payload),
+            )
+            return payload
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
+            log_event(LOGGER, "upstream.error", method="GET", url=url, error=str(exc))
             LOGGER.warning("GET %s failed: %s", url, exc)
             raise DataSourceError(f"GET failed: {url}") from exc
 
@@ -87,12 +99,14 @@ class BaseClient:
     ) -> Any:
         url = f"{self.base_url}{path}"
         headers = self._headers_houses() if need_user_id else None
-        LOGGER.info(
-            "outgoing request method=POST url=%s params=%s json=%s headers=%s",
-            url,
-            params if params is not None else "<none>",
-            json if json is not None else "<none>",
-            self._sanitize_headers(headers),
+        log_event(
+            LOGGER,
+            "upstream.request",
+            method="POST",
+            url=url,
+            params=params if params is not None else {},
+            json=json if json is not None else None,
+            headers=self._sanitize_headers(headers),
         )
         try:
             kwargs: dict[str, Any] = {"headers": headers}
@@ -102,13 +116,23 @@ class BaseClient:
                 kwargs["json"] = json
             response = await self.http_client.post(url, **kwargs)
             response.raise_for_status()
-            LOGGER.info("outgoing response method=POST url=%s status=%s", url, response.status_code)
+            payload: Any
             try:
-                return self._unwrap(response.json())
+                payload = self._unwrap(response.json())
             except ValueError:
                 # Some endpoints may return empty/plain-text success bodies.
                 text_body = response.text.strip() if isinstance(response.text, str) else ""
-                return {"raw": text_body} if text_body else {}
+                payload = {"raw": text_body} if text_body else {}
+            log_event(
+                LOGGER,
+                "upstream.response",
+                method="POST",
+                url=url,
+                status_code=response.status_code,
+                body=preview_payload(payload),
+            )
+            return payload
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
+            log_event(LOGGER, "upstream.error", method="POST", url=url, error=str(exc))
             LOGGER.warning("POST %s failed: %s", url, exc)
             raise DataSourceError(f"POST failed: {url}") from exc

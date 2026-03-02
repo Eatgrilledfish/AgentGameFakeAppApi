@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import httpx
@@ -48,14 +49,12 @@ class HousesClient(BaseClient):
         listing_platform: str | None = None,
         page: int = 1,
         page_size: int = 10,
-        **filters: Any,
     ) -> dict[str, Any]:
         params = {
             "community": community,
             "listing_platform": listing_platform,
             "page": page,
             "page_size": page_size,
-            **filters,
         }
         data = await self._get("/api/houses/by_community", params=_clean_params(params), need_user_id=True)
         normalized = _build_page(data)
@@ -65,15 +64,53 @@ class HousesClient(BaseClient):
     async def by_platform(
         self,
         listing_platform: str | None = None,
+        district: str | None = None,
+        area: str | None = None,
+        min_price: int | None = None,
+        max_price: int | None = None,
+        bedrooms: str | None = None,
+        rental_type: str | None = None,
+        decoration: str | None = None,
+        orientation: str | None = None,
+        elevator: str | None = None,
+        min_area: int | None = None,
+        max_area: int | None = None,
+        property_type: str | None = None,
+        subway_line: str | None = None,
+        max_subway_dist: int | None = None,
+        subway_station: str | None = None,
+        utilities_type: str | None = None,
+        available_from_before: str | None = None,
+        commute_to_xierqi_max: int | None = None,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
         page: int = 1,
         page_size: int = 10,
-        **filters: Any,
     ) -> dict[str, Any]:
         params = {
             "listing_platform": listing_platform,
+            "district": district,
+            "area": area,
+            "min_price": min_price,
+            "max_price": max_price,
+            "bedrooms": bedrooms,
+            "rental_type": rental_type,
+            "decoration": decoration,
+            "orientation": orientation,
+            "elevator": elevator,
+            "min_area": min_area,
+            "max_area": max_area,
+            "property_type": property_type,
+            "subway_line": subway_line,
+            "max_subway_dist": max_subway_dist,
+            "subway_station": subway_station,
+            "utilities_type": utilities_type,
+            "available_from_before": available_from_before,
+            "commute_to_xierqi_max": commute_to_xierqi_max,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
             "page": page,
             "page_size": page_size,
-            **filters,
         }
         data = await self._get("/api/houses/by_platform", params=_clean_params(params), need_user_id=True)
         normalized = _build_page(data)
@@ -83,11 +120,10 @@ class HousesClient(BaseClient):
     async def nearby(
         self,
         landmark_id: str,
-        max_distance: int = 2000,
+        max_distance: float | int = 2000,
         listing_platform: str | None = None,
         page: int = 1,
         page_size: int = 10,
-        **filters: Any,
     ) -> dict[str, Any]:
         params = {
             "landmark_id": landmark_id,
@@ -95,7 +131,6 @@ class HousesClient(BaseClient):
             "listing_platform": listing_platform,
             "page": page,
             "page_size": page_size,
-            **filters,
         }
         data = await self._get("/api/houses/nearby", params=_clean_params(params), need_user_id=True)
         normalized = _build_page(data)
@@ -106,7 +141,7 @@ class HousesClient(BaseClient):
         self,
         community: str,
         category: str,
-        max_distance_m: int = 3000,
+        max_distance_m: float | int = 3000,
     ) -> list[NearbyLandmark]:
         params = {"community": community, "type": category, "max_distance_m": max_distance_m}
         data = await self._get("/api/houses/nearby_landmarks", params=params, need_user_id=True)
@@ -170,4 +205,51 @@ def _normalize_house(raw: dict[str, Any]) -> dict[str, Any]:
     if "status" not in normalized and "house_status" in normalized:
         normalized["status"] = normalized.get("house_status")
 
+    _normalize_area_fields(normalized)
     return normalized
+
+
+def _normalize_area_fields(normalized: dict[str, Any]) -> None:
+    if "business_area" in normalized and isinstance(normalized["business_area"], str):
+        return
+
+    for key in ("biz_area", "area_name", "trade_area"):
+        value = normalized.get(key)
+        if isinstance(value, str) and value.strip():
+            normalized["business_area"] = value.strip()
+            break
+
+    area_value = normalized.get("area")
+    parsed_area = _coerce_area_to_float(area_value)
+    if parsed_area is not None:
+        normalized["area"] = parsed_area
+        return
+
+    if isinstance(area_value, str) and area_value.strip():
+        normalized["business_area"] = area_value.strip()
+        normalized["area"] = None
+
+    for key in ("house_area", "size", "usable_area", "building_area"):
+        parsed = _coerce_area_to_float(normalized.get(key))
+        if parsed is not None:
+            normalized["area"] = parsed
+            return
+
+
+def _coerce_area_to_float(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+
+    stripped = value.strip()
+    if not stripped:
+        return None
+
+    if re.fullmatch(r"\d+(?:\.\d+)?", stripped):
+        return float(stripped)
+
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:平米|平方米|㎡|m2|M2)", stripped)
+    if m:
+        return float(m.group(1))
+    return None

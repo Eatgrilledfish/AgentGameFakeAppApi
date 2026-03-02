@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 import json
 import logging
 import time
+from uuid import uuid4
 
 import httpx
 from fastapi import Body, FastAPI, Header, HTTPException, Request
@@ -13,7 +14,7 @@ from app.agent.state import StateStore
 from app.clients.houses import HousesClient
 from app.clients.landmarks import LandmarksClient
 from app.infra.cache import CacheManager
-from app.infra.logging import setup_logging
+from app.infra.logging import bind_log_context, log_event, preview_text, reset_log_context, setup_logging
 from app.schemas import CaseType, ChatRequest, ChatResponse, HealthResponse, InvokeRequest, InvokeResponse
 from app.settings import AgentSettings, load_settings
 
@@ -58,7 +59,7 @@ async def _forward_chat_completion(
 
 def create_app(settings: AgentSettings | None = None) -> FastAPI:
     cfg = settings or load_settings()
-    setup_logging()
+    setup_logging(cfg.log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -137,54 +138,132 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
 
     @app.post("/invoke", response_model=InvokeResponse)
     async def invoke(req: InvokeRequest) -> InvokeResponse:
-        service: AgentService = app.state.agent_service
-        return await service.handle(req)
+        started = time.perf_counter()
+        trace_id = uuid4().hex[:12]
+        user_id = req.user_id or cfg.default_user_id
+        tokens = bind_log_context(
+            trace_id=trace_id,
+            session_id=req.session_id,
+            case_type=req.case_type.value,
+            user_id=user_id,
+        )
+        try:
+            log_event(
+                LOGGER,
+                "invoke.received",
+                message=preview_text(req.message, limit=300),
+                history_len=len(req.history),
+                meta_keys=sorted(req.meta.keys()),
+            )
+            service: AgentService = app.state.agent_service
+            resp = await service.handle(req)
+            log_event(
+                LOGGER,
+                "invoke.completed",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                candidate_count=len(resp.candidates),
+                clarify_count=len(resp.clarify_questions),
+                response=preview_text(resp.text, limit=300),
+            )
+            return resp
+        except Exception as exc:
+            log_event(
+                LOGGER,
+                "invoke.failed",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                error=str(exc),
+            )
+            raise
+        finally:
+            reset_log_context(tokens)
 
     @app.post("/api/v1/chat", response_model=ChatResponse)
     async def chat(req: ChatRequest) -> ChatResponse:
         started_ms = int(time.time() * 1000)
-        service: AgentService = app.state.agent_service
-        app.state.session_model_ip[req.session_id] = req.model_ip
-        invoke_resp = await service.handle(
-            InvokeRequest(
-                session_id=req.session_id,
-                case_type=CaseType.single,
-                message=req.message,
-            )
-        )
-
-        output = invoke_resp.text
-        if invoke_resp.candidates:
-            output = json.dumps(
-                {
-                    "message": invoke_resp.text,
-                    "houses": [item.house_id for item in invoke_resp.candidates],
-                },
-                ensure_ascii=False,
-            )
-        else:
-            try:
-                http_client: httpx.AsyncClient = app.state.http_client
-                llm_text = await _forward_chat_completion(
-                    http_client,
-                    model_ip=req.model_ip,
-                    message=req.message,
-                    session_id=req.session_id,
-                )
-                if llm_text:
-                    output = llm_text
-            except httpx.HTTPError:
-                pass
-
-        now_ms = int(time.time() * 1000)
-        return ChatResponse(
+        trace_id = uuid4().hex[:12]
+        tokens = bind_log_context(
+            trace_id=trace_id,
             session_id=req.session_id,
-            response=output,
-            status="success",
-            tool_results=[invoke_resp.debug] if invoke_resp.debug else [],
-            timestamp=now_ms,
-            duration_ms=now_ms - started_ms,
+            case_type=CaseType.single.value,
+            user_id=cfg.default_user_id,
         )
+        service: AgentService = app.state.agent_service
+        try:
+            log_event(
+                LOGGER,
+                "chat.received",
+                model_ip=req.model_ip,
+                message=preview_text(req.message, limit=300),
+            )
+            app.state.session_model_ip[req.session_id] = req.model_ip
+            invoke_resp = await service.handle(
+                InvokeRequest(
+                    session_id=req.session_id,
+                    case_type=CaseType.single,
+                    message=req.message,
+                )
+            )
+
+            output = invoke_resp.text
+            if invoke_resp.candidates:
+                output = json.dumps(
+                    {
+                        "message": invoke_resp.text,
+                        "houses": [item.house_id for item in invoke_resp.candidates],
+                    },
+                    ensure_ascii=False,
+                )
+            else:
+                try:
+                    prompt_tokens = (
+                        service.rough_token_estimate(req.message)
+                        if hasattr(service, "rough_token_estimate")
+                        else max(1, int(len(req.message) / 2))
+                    )
+                    allow_llm = (
+                        service.allow_llm_fallback(req.session_id, prompt_tokens)
+                        if hasattr(service, "allow_llm_fallback")
+                        else True
+                    )
+                    if allow_llm:
+                        http_client: httpx.AsyncClient = app.state.http_client
+                        llm_text = await _forward_chat_completion(
+                            http_client,
+                            model_ip=req.model_ip,
+                            message=req.message,
+                            session_id=req.session_id,
+                        )
+                        if llm_text:
+                            output = llm_text
+                            completion_tokens = (
+                                service.rough_token_estimate(llm_text)
+                                if hasattr(service, "rough_token_estimate")
+                                else max(1, int(len(llm_text) / 2))
+                            )
+                            if hasattr(service, "record_llm_fallback_usage"):
+                                service.record_llm_fallback_usage(req.session_id, prompt_tokens + completion_tokens)
+                    else:
+                        log_event(LOGGER, "chat.llm_fallback_skipped", reason="budget_exceeded")
+                except httpx.HTTPError as exc:
+                    log_event(LOGGER, "chat.llm_fallback_failed", error=str(exc))
+
+            now_ms = int(time.time() * 1000)
+            log_event(
+                LOGGER,
+                "chat.completed",
+                duration_ms=now_ms - started_ms,
+                response=preview_text(output, limit=300),
+            )
+            return ChatResponse(
+                session_id=req.session_id,
+                response=output,
+                status="success",
+                tool_results=[invoke_resp.debug] if invoke_resp.debug else [],
+                timestamp=now_ms,
+                duration_ms=now_ms - started_ms,
+            )
+        finally:
+            reset_log_context(tokens)
 
     @app.post("/vi/chat/completions")
     @app.post("/v1/chat/completions")
