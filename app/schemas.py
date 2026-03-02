@@ -173,6 +173,21 @@ class InvokeResponse(BaseModel):
     debug: dict[str, Any] = Field(default_factory=dict)
 
 
+class ChatRequest(BaseModel):
+    model_ip: str
+    session_id: str
+    message: str
+
+
+class ChatResponse(BaseModel):
+    session_id: str
+    response: str
+    status: str = "success"
+    tool_results: list[dict[str, Any]] = Field(default_factory=list)
+    timestamp: int
+    duration_ms: int
+
+
 class HealthResponse(BaseModel):
     ok: bool = True
     service: str = "smart-rental-agent"
