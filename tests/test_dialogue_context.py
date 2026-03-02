@@ -367,3 +367,34 @@ async def test_dialogue_prefers_llm_tool_plan_for_search_arguments() -> None:
     assert planner.executed_queries[-1].hard.budget_max == 4000
     assert planner.executed_queries[-1].hard.layout == "2居"
     assert planner.executed_queries[-1].hard.utilities_type == "商水商电"
+
+
+@pytest.mark.asyncio
+async def test_dialogue_treats_this_one_as_focus_not_first_rank() -> None:
+    planner = DummyPlanner()
+    houses = DummyHousesClient()
+    dialogue, state, _, houses = _build_dialogue(planner=planner, houses_client=houses)
+
+    await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-ctx", case_type=CaseType.single, message="我想在望京租一套两居室，预算8000以内，有电梯"),
+        state,
+        is_new_session=True,
+    )
+    await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-ctx", case_type=CaseType.single, message="换大兴区的看看吧，两居室，预算4000以内"),
+        state,
+        is_new_session=False,
+    )
+    await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-ctx", case_type=CaseType.single, message="还是最开始望京那套比较好，它的详细情况怎么样？"),
+        state,
+        is_new_session=False,
+    )
+    resp = await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-ctx", case_type=CaseType.single, message="这套可以租吗？我想租这一套"),
+        state,
+        is_new_session=False,
+    )
+
+    assert "已提交租房操作" in resp.text
+    assert houses.rent_calls[-1][0] == "HF_WJ"

@@ -1,0 +1,799 @@
+{
+  "version": "2026-03-02",
+  "description": "Compact API tool catalog for LLM routing and argument extraction. This schema is the only source for tool prompt context.",
+  "enums": {
+    "listing_platform": [
+      "链家",
+      "安居客",
+      "58同城"
+    ],
+    "rental_type": [
+      "整租",
+      "合租"
+    ],
+    "landmark_category": [
+      "subway",
+      "company",
+      "landmark"
+    ],
+    "nearby_type": [
+      "shopping",
+      "park"
+    ],
+    "sort_by": [
+      "price",
+      "area",
+      "subway"
+    ],
+    "sort_order": [
+      "asc",
+      "desc"
+    ]
+  },
+  "operations": [
+    {
+      "operationId": "get_landmarks",
+      "method": "GET",
+      "path": "/api/landmarks",
+      "intent": "search",
+      "required": [],
+      "params": [
+        "category",
+        "district"
+      ],
+      "param_defs": [
+        {
+          "name": "category",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "地标类别：subway(地铁)/company(公司)/landmark(商圈等)，不传则不过滤"
+        },
+        {
+          "name": "district",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "行政区，如 海淀、朝阳"
+        }
+      ],
+      "output_tags": [
+        "id",
+        "name",
+        "category",
+        "district",
+        "latitude",
+        "longitude"
+      ],
+      "hints": "列出地标，可按类别和行政区过滤。"
+    },
+    {
+      "operationId": "get_landmark_by_name",
+      "method": "GET",
+      "path": "/api/landmarks/name/{name}",
+      "intent": "search",
+      "required": [
+        "name"
+      ],
+      "params": [
+        "name"
+      ],
+      "param_defs": [
+        {
+          "name": "name",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "地标名称，如 西二旗站、国贸"
+        }
+      ],
+      "output_tags": [
+        "id",
+        "name",
+        "category",
+        "district",
+        "latitude",
+        "longitude"
+      ],
+      "hints": "按地标名称精确查询，适合 nearby 前置解析。"
+    },
+    {
+      "operationId": "search_landmarks",
+      "method": "GET",
+      "path": "/api/landmarks/search",
+      "intent": "search",
+      "required": [
+        "q"
+      ],
+      "params": [
+        "q",
+        "category",
+        "district"
+      ],
+      "param_defs": [
+        {
+          "name": "q",
+          "in": "query",
+          "type": "string",
+          "required": true,
+          "description": "搜索关键词，必填"
+        },
+        {
+          "name": "category",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "可选，限定类别：subway/company/landmark"
+        },
+        {
+          "name": "district",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "可选，限定行政区，如 海淀、朝阳"
+        }
+      ],
+      "output_tags": [
+        "id",
+        "name",
+        "category",
+        "district",
+        "latitude",
+        "longitude"
+      ],
+      "hints": "地标模糊搜索。"
+    },
+    {
+      "operationId": "get_landmark_by_id",
+      "method": "GET",
+      "path": "/api/landmarks/{id}",
+      "intent": "search",
+      "required": [
+        "id"
+      ],
+      "params": [
+        "id"
+      ],
+      "param_defs": [
+        {
+          "name": "id",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "地标 ID，如 SS_001、LM_002"
+        }
+      ],
+      "output_tags": [
+        "id",
+        "name",
+        "category",
+        "district",
+        "latitude",
+        "longitude"
+      ],
+      "hints": "按地标 ID 查询详情。"
+    },
+    {
+      "operationId": "get_landmark_stats",
+      "method": "GET",
+      "path": "/api/landmarks/stats",
+      "intent": "search",
+      "required": [],
+      "params": [],
+      "param_defs": [],
+      "output_tags": [
+        "total",
+        "by_category",
+        "by_district"
+      ],
+      "hints": "地标统计，不用于具体找房。"
+    },
+    {
+      "operationId": "get_house_by_id",
+      "method": "GET",
+      "path": "/api/houses/{house_id}",
+      "intent": "house_detail",
+      "required": [
+        "house_id"
+      ],
+      "params": [
+        "house_id"
+      ],
+      "param_defs": [
+        {
+          "name": "house_id",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "房源 ID，如 HF_2001"
+        }
+      ],
+      "output_tags": [
+        "house_id",
+        "listing_platform",
+        "rent",
+        "layout",
+        "area",
+        "district",
+        "community",
+        "subway_distance",
+        "commute_to_xierqi_min",
+        "status",
+        "tags",
+        "decoration",
+        "elevator",
+        "orientation",
+        "available_date"
+      ],
+      "hints": "单套房源详情。"
+    },
+    {
+      "operationId": "get_house_listings",
+      "method": "GET",
+      "path": "/api/houses/listings/{house_id}",
+      "intent": "listings",
+      "required": [
+        "house_id"
+      ],
+      "params": [
+        "house_id"
+      ],
+      "param_defs": [
+        {
+          "name": "house_id",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "房源 ID，如 HF_2001"
+        }
+      ],
+      "output_tags": [
+        "total",
+        "page_size",
+        "items[].listing_platform",
+        "items[].rent",
+        "items[].status",
+        "items[].url"
+      ],
+      "hints": "同一房源在多平台挂牌价格/状态查询。"
+    },
+    {
+      "operationId": "get_houses_by_community",
+      "method": "GET",
+      "path": "/api/houses/by_community",
+      "intent": "search",
+      "required": [
+        "community"
+      ],
+      "params": [
+        "community",
+        "listing_platform",
+        "page",
+        "page_size"
+      ],
+      "param_defs": [
+        {
+          "name": "community",
+          "in": "query",
+          "type": "string",
+          "required": true,
+          "description": "小区名，与数据一致，如 建清园(南区)、保利锦上(二期)"
+        },
+        {
+          "name": "listing_platform",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "挂牌平台，不传则默认安居客",
+          "enum": [
+            "链家",
+            "安居客",
+            "58同城"
+          ]
+        },
+        {
+          "name": "page",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "页码，默认 1"
+        },
+        {
+          "name": "page_size",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "每页条数，默认 10，最大 10000"
+        }
+      ],
+      "output_tags": [
+        "total",
+        "page_size",
+        "items[].house_id",
+        "items[].listing_platform",
+        "items[].rent",
+        "items[].layout",
+        "items[].district",
+        "items[].community",
+        "items[].subway_distance",
+        "items[].status"
+      ],
+      "hints": "给定小区名时优先。"
+    },
+    {
+      "operationId": "get_houses_by_platform",
+      "method": "GET",
+      "path": "/api/houses/by_platform",
+      "intent": "search",
+      "required": [],
+      "params": [
+        "listing_platform",
+        "district",
+        "area",
+        "min_price",
+        "max_price",
+        "bedrooms",
+        "rental_type",
+        "decoration",
+        "orientation",
+        "elevator",
+        "min_area",
+        "max_area",
+        "property_type",
+        "subway_line",
+        "max_subway_dist",
+        "subway_station",
+        "utilities_type",
+        "available_from_before",
+        "commute_to_xierqi_max",
+        "sort_by",
+        "sort_order",
+        "page",
+        "page_size"
+      ],
+      "param_defs": [
+        {
+          "name": "listing_platform",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "挂牌平台，可选。不传则默认安居客；传则仅返回该平台",
+          "enum": [
+            "链家",
+            "安居客",
+            "58同城"
+          ]
+        },
+        {
+          "name": "district",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "行政区，逗号分隔，如 海淀,朝阳"
+        },
+        {
+          "name": "area",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "商圈，逗号分隔，如 西二旗,上地"
+        },
+        {
+          "name": "min_price",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "最低月租金（元）"
+        },
+        {
+          "name": "max_price",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "最高月租金（元）"
+        },
+        {
+          "name": "bedrooms",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "卧室数，逗号分隔，如 1,2"
+        },
+        {
+          "name": "rental_type",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "整租 或 合租"
+        },
+        {
+          "name": "decoration",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "精装/简装 等"
+        },
+        {
+          "name": "orientation",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "朝向，如 朝南、南北"
+        },
+        {
+          "name": "elevator",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "是否有电梯：true/false"
+        },
+        {
+          "name": "min_area",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "最小面积（平米）"
+        },
+        {
+          "name": "max_area",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "最大面积（平米）"
+        },
+        {
+          "name": "property_type",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "物业类型，如 住宅"
+        },
+        {
+          "name": "subway_line",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "地铁线路，如 13号线"
+        },
+        {
+          "name": "max_subway_dist",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "最大地铁距离（米），近地铁建议 800"
+        },
+        {
+          "name": "subway_station",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "地铁站名，如 车公庄站"
+        },
+        {
+          "name": "utilities_type",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "水电类型，如 民水民电"
+        },
+        {
+          "name": "available_from_before",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "可入住日期上限，YYYY-MM-DD（如 2026-03-10）"
+        },
+        {
+          "name": "commute_to_xierqi_max",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "到西二旗通勤时间上限（分钟）"
+        },
+        {
+          "name": "sort_by",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "排序字段：price/area/subway"
+        },
+        {
+          "name": "sort_order",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "asc 或 desc"
+        },
+        {
+          "name": "page",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "页码，默认 1"
+        },
+        {
+          "name": "page_size",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "每页条数，默认 10，最大 10000"
+        }
+      ],
+      "output_tags": [
+        "total",
+        "page_size",
+        "items[].house_id",
+        "items[].listing_platform",
+        "items[].rent",
+        "items[].layout",
+        "items[].area",
+        "items[].district",
+        "items[].community",
+        "items[].subway_distance",
+        "items[].commute_to_xierqi_min",
+        "items[].status",
+        "items[].utilities_type"
+      ],
+      "hints": "泛化找房主入口；默认安居客。"
+    },
+    {
+      "operationId": "get_nearby_landmarks",
+      "method": "GET",
+      "path": "/api/houses/nearby_landmarks",
+      "intent": "amenities",
+      "required": [
+        "community"
+      ],
+      "params": [
+        "community",
+        "type",
+        "max_distance_m"
+      ],
+      "param_defs": [
+        {
+          "name": "community",
+          "in": "query",
+          "type": "string",
+          "required": true,
+          "description": "小区名，用于定位基准点"
+        },
+        {
+          "name": "type",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "地标类型：shopping(商超) 或 park(公园)，不传则不过滤"
+        },
+        {
+          "name": "max_distance_m",
+          "in": "query",
+          "type": "number",
+          "required": false,
+          "description": "最大距离（米），默认 3000"
+        }
+      ],
+      "output_tags": [
+        "items[].name",
+        "items[].category",
+        "items[].distance_m"
+      ],
+      "hints": "查询小区周边商超/公园。"
+    },
+    {
+      "operationId": "get_houses_nearby",
+      "method": "GET",
+      "path": "/api/houses/nearby",
+      "intent": "search",
+      "required": [
+        "landmark_id"
+      ],
+      "params": [
+        "landmark_id",
+        "max_distance",
+        "listing_platform",
+        "page",
+        "page_size"
+      ],
+      "param_defs": [
+        {
+          "name": "landmark_id",
+          "in": "query",
+          "type": "string",
+          "required": true,
+          "description": "地标 ID 或地标名称（支持按名称查找）"
+        },
+        {
+          "name": "max_distance",
+          "in": "query",
+          "type": "number",
+          "required": false,
+          "description": "最大直线距离（米），默认 2000"
+        },
+        {
+          "name": "listing_platform",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "description": "挂牌平台，不传则默认安居客",
+          "enum": [
+            "链家",
+            "安居客",
+            "58同城"
+          ]
+        },
+        {
+          "name": "page",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "页码，默认 1"
+        },
+        {
+          "name": "page_size",
+          "in": "query",
+          "type": "integer",
+          "required": false,
+          "description": "每页条数，默认 10，最大 10000"
+        }
+      ],
+      "output_tags": [
+        "total",
+        "page_size",
+        "items[].house_id",
+        "items[].listing_platform",
+        "items[].rent",
+        "items[].layout",
+        "items[].district",
+        "items[].community",
+        "items[].distance_to_landmark",
+        "items[].walking_distance",
+        "items[].walking_duration",
+        "items[].status"
+      ],
+      "hints": "按地标半径找房。"
+    },
+    {
+      "operationId": "get_house_stats",
+      "method": "GET",
+      "path": "/api/houses/stats",
+      "intent": "search",
+      "required": [],
+      "params": [],
+      "param_defs": [],
+      "output_tags": [
+        "total",
+        "by_status",
+        "by_district",
+        "by_layout",
+        "price_ranges"
+      ],
+      "hints": "房源统计，不用于具体单房操作。"
+    },
+    {
+      "operationId": "rent_house",
+      "method": "POST",
+      "path": "/api/houses/{house_id}/rent",
+      "intent": "rent",
+      "required": [
+        "house_id",
+        "listing_platform"
+      ],
+      "params": [
+        "house_id",
+        "listing_platform"
+      ],
+      "param_defs": [
+        {
+          "name": "house_id",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "房源 ID，如 HF_2001"
+        },
+        {
+          "name": "listing_platform",
+          "in": "query",
+          "type": "string",
+          "required": true,
+          "description": "必填。明确租赁哪个平台；三平台状态都会更新，返回该条",
+          "enum": [
+            "链家",
+            "安居客",
+            "58同城"
+          ]
+        }
+      ],
+      "output_tags": [
+        "house_id",
+        "listing_platform",
+        "status",
+        "message"
+      ],
+      "hints": "办理租房，必须指定平台。"
+    },
+    {
+      "operationId": "terminate_rental",
+      "method": "POST",
+      "path": "/api/houses/{house_id}/terminate",
+      "intent": "terminate",
+      "required": [
+        "house_id",
+        "listing_platform"
+      ],
+      "params": [
+        "house_id",
+        "listing_platform"
+      ],
+      "param_defs": [
+        {
+          "name": "house_id",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "房源 ID，如 HF_2001"
+        },
+        {
+          "name": "listing_platform",
+          "in": "query",
+          "type": "string",
+          "required": true,
+          "description": "必填。明确操作哪个平台；三平台状态都会更新，返回该条",
+          "enum": [
+            "链家",
+            "安居客",
+            "58同城"
+          ]
+        }
+      ],
+      "output_tags": [
+        "house_id",
+        "listing_platform",
+        "status",
+        "message"
+      ],
+      "hints": "办理退租，必须指定平台。"
+    },
+    {
+      "operationId": "take_offline",
+      "method": "POST",
+      "path": "/api/houses/{house_id}/offline",
+      "intent": "offline",
+      "required": [
+        "house_id",
+        "listing_platform"
+      ],
+      "params": [
+        "house_id",
+        "listing_platform"
+      ],
+      "param_defs": [
+        {
+          "name": "house_id",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "房源 ID，如 HF_2001"
+        },
+        {
+          "name": "listing_platform",
+          "in": "query",
+          "type": "string",
+          "required": true,
+          "description": "必填。明确操作哪个平台；三平台状态都会更新，返回该条",
+          "enum": [
+            "链家",
+            "安居客",
+            "58同城"
+          ]
+        }
+      ],
+      "output_tags": [
+        "house_id",
+        "listing_platform",
+        "status",
+        "message"
+      ],
+      "hints": "办理下架，必须指定平台。"
+    }
+  ]
+}

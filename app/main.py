@@ -30,21 +30,6 @@ STEP_LLM_NLU = "STEP-02A-LLM-NLU"
 STEP_FINAL_RESPONSE = "STEP-04-FINAL-RESPONSE"
 STEP_HTTP = "STEP-00-HTTP"
 
-_TOOL_ROUTING_OPERATION_IDS = {
-    "get_houses_by_platform",
-    "get_houses_by_community",
-    "get_houses_nearby",
-    "get_house_by_id",
-    "get_house_listings",
-    "rent_house",
-    "terminate_rental",
-    "take_offline",
-    "get_nearby_landmarks",
-    "get_landmark_by_name",
-    "search_landmarks",
-}
-
-
 def _build_model_base_url(model_ip: str) -> str:
     if model_ip.startswith(("http://", "https://")):
         return model_ip
@@ -121,45 +106,319 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
 
 
 @lru_cache(maxsize=1)
-def _load_tool_schema_summary() -> str:
-    schema_path = Path(__file__).resolve().parents[1] / "fake_app_agent_tools.json"
+def _load_compact_tool_schema_payload() -> dict[str, Any]:
+    compact_schema_path = Path(__file__).resolve().parents[1] / "llm_tool_schema.json"
     try:
-        payload = json.loads(schema_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        compact_payload = json.loads(compact_schema_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RuntimeError(f"llm_tool_schema.json not found: {compact_schema_path}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"llm_tool_schema.json is invalid JSON: {compact_schema_path}") from exc
+    if not isinstance(compact_payload, dict):
+        raise RuntimeError(f"llm_tool_schema.json must be a JSON object: {compact_schema_path}")
+    return compact_payload
+
+
+@lru_cache(maxsize=1)
+def _load_tool_schema_summary() -> str:
+    compact_payload = _load_compact_tool_schema_payload()
+    compact_summary = _summarize_compact_tool_schema(compact_payload)
+    if not compact_summary:
+        compact_schema_path = Path(__file__).resolve().parents[1] / "llm_tool_schema.json"
+        raise RuntimeError(f"llm_tool_schema.json has no valid operations: {compact_schema_path}")
+    return compact_summary
+
+
+@lru_cache(maxsize=1)
+def _load_tool_argument_specs() -> dict[str, dict[str, dict[str, Any]]]:
+    payload = _load_compact_tool_schema_payload()
+    operations = payload.get("operations")
+    if not isinstance(operations, list):
+        return {}
+
+    spec_map: dict[str, dict[str, dict[str, Any]]] = {}
+    for item in operations:
+        if not isinstance(item, dict):
+            continue
+        operation_id = item.get("operationId")
+        if not isinstance(operation_id, str) or not operation_id:
+            continue
+        param_defs = _collect_param_defs(item)
+        if not param_defs:
+            continue
+        op_specs: dict[str, dict[str, Any]] = {}
+        for spec in param_defs:
+            name = spec.get("name")
+            if isinstance(name, str) and name:
+                op_specs[name] = spec
+        if op_specs:
+            spec_map[operation_id] = op_specs
+    return spec_map
+
+
+def _summarize_compact_tool_schema(payload: Any) -> str:
+    if not isinstance(payload, dict):
         return ""
 
-    paths = payload.get("paths")
-    if not isinstance(paths, dict):
+    operations = payload.get("operations")
+    if not isinstance(operations, list):
         return ""
 
     lines: list[str] = []
-    for route, methods in paths.items():
-        if not isinstance(methods, dict):
+    for item in operations:
+        if not isinstance(item, dict):
             continue
-        for method, config in methods.items():
-            if not isinstance(config, dict):
-                continue
-            operation_id = config.get("operationId")
-            if operation_id not in _TOOL_ROUTING_OPERATION_IDS:
-                continue
-            parameters = config.get("parameters", [])
-            required_names: list[str] = []
-            all_names: list[str] = []
-            if isinstance(parameters, list):
-                for item in parameters:
-                    if not isinstance(item, dict):
-                        continue
-                    name = item.get("name")
-                    if not isinstance(name, str):
-                        continue
-                    all_names.append(name)
-                    if item.get("required") is True:
-                        required_names.append(name)
-            required_text = ",".join(required_names) if required_names else "-"
-            all_text = ",".join(all_names) if all_names else "-"
-            lines.append(f"{operation_id}|{method.upper()} {route}|required={required_text}|params={all_text}")
+        operation_id = item.get("operationId")
+        if not isinstance(operation_id, str) or not operation_id:
+            continue
 
-    return "\n".join(lines[:30])
+        method = item.get("method")
+        path = item.get("path")
+        intent = item.get("intent")
+        param_defs = _collect_param_defs(item)
+        output_tags = item.get("output_tags")
+        hints = item.get("hints")
+
+        required = [spec["name"] for spec in param_defs if spec.get("required") is True]
+        params = [spec["name"] for spec in param_defs]
+        method_text = method.upper() if isinstance(method, str) and method else "GET"
+        path_text = path if isinstance(path, str) and path else "-"
+        required_text = ",".join(required) if required else "-"
+        params_text = ",".join(params) if params else "-"
+        argdefs_text = _format_param_defs_for_prompt(param_defs)
+        outputs_text = ",".join(output_tags) if isinstance(output_tags, list) and output_tags else "-"
+        intent_text = intent if isinstance(intent, str) and intent else "search"
+        hint_text = hints if isinstance(hints, str) and hints else "-"
+        lines.append(
+            f"{operation_id}|{method_text} {path_text}|intent={intent_text}|required={required_text}|params={params_text}|argdefs={argdefs_text}|outputs={outputs_text}|hints={hint_text}"
+        )
+
+    enums = payload.get("enums")
+    if isinstance(enums, dict):
+        enum_chunks: list[str] = []
+        for key, value in enums.items():
+            if isinstance(value, list) and value:
+                enum_chunks.append(f"{key}={','.join(str(v) for v in value)}")
+        if enum_chunks:
+            lines.append("enums|" + ";".join(enum_chunks))
+
+    return "\n".join(lines[:40])
+
+
+def _collect_param_defs(item: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_defs = item.get("param_defs")
+    normalized_defs: list[dict[str, Any]] = []
+    if isinstance(raw_defs, list):
+        for raw in raw_defs:
+            if not isinstance(raw, dict):
+                continue
+            name = raw.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            param_type = raw.get("type")
+            if not isinstance(param_type, str) or not param_type:
+                param_type = "string"
+            location = raw.get("in")
+            if not isinstance(location, str) or not location:
+                location = "query"
+            required = raw.get("required") is True
+            enum_values = raw.get("enum")
+            if not isinstance(enum_values, list):
+                enum_values = None
+            description = raw.get("description")
+            if not isinstance(description, str):
+                description = ""
+            normalized_defs.append(
+                {
+                    "name": name,
+                    "type": param_type,
+                    "in": location,
+                    "required": required,
+                    "enum": enum_values,
+                    "description": description.strip(),
+                }
+            )
+    if normalized_defs:
+        return normalized_defs
+
+    # Backward compatibility: synthesize from params + required if param_defs are absent.
+    raw_params = item.get("params")
+    raw_required = item.get("required")
+    params = [name for name in raw_params if isinstance(name, str) and name] if isinstance(raw_params, list) else []
+    required_set = set(name for name in raw_required if isinstance(name, str) and name) if isinstance(raw_required, list) else set()
+    return [
+        {
+            "name": name,
+            "type": "string",
+            "in": "query",
+            "required": name in required_set,
+            "enum": None,
+            "description": "",
+        }
+        for name in params
+    ]
+
+
+def _format_param_defs_for_prompt(param_defs: list[dict[str, Any]]) -> str:
+    if not param_defs:
+        return "-"
+
+    chunks: list[str] = []
+    for spec in param_defs:
+        name = spec.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        param_type = spec.get("type")
+        if not isinstance(param_type, str) or not param_type:
+            param_type = "string"
+        required_suffix = "!" if spec.get("required") is True else ""
+        location = spec.get("in")
+        location_text = f"@{location}" if isinstance(location, str) and location else ""
+
+        enum_text = ""
+        enum_values = spec.get("enum")
+        if isinstance(enum_values, list) and enum_values:
+            enum_joined = "/".join(str(v) for v in enum_values[:4])
+            if len(enum_values) > 4:
+                enum_joined += "/..."
+            enum_text = f"={enum_joined}"
+
+        description_text = ""
+        description = spec.get("description")
+        if spec.get("required") is True and isinstance(description, str) and description:
+            cleaned = description.replace("\n", " ").replace("|", "/").strip()
+            if len(cleaned) > 14:
+                cleaned = cleaned[:14] + "..."
+            description_text = f"({cleaned})"
+
+        chunks.append(f"{name}:{param_type}{required_suffix}{location_text}{enum_text}{description_text}")
+    return ";".join(chunks) if chunks else "-"
+
+
+def _sanitize_llm_parse(parsed: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(parsed)
+    tool_plan = normalized.get("tool_plan")
+    if not isinstance(tool_plan, dict):
+        return normalized
+
+    operation_id = tool_plan.get("operationId")
+    arguments = tool_plan.get("arguments")
+    if not isinstance(operation_id, str) or not operation_id:
+        return normalized
+
+    sanitized_arguments: dict[str, Any] = {}
+    op_specs = _load_tool_argument_specs().get(operation_id, {})
+    if isinstance(arguments, dict):
+        if op_specs:
+            for key, value in arguments.items():
+                if not isinstance(key, str):
+                    continue
+                spec = op_specs.get(key)
+                if spec is None:
+                    continue
+                coerced = _coerce_argument_value(value, spec)
+                if coerced is not None:
+                    sanitized_arguments[key] = coerced
+        else:
+            sanitized_arguments = {k: v for k, v in arguments.items() if isinstance(k, str)}
+
+    normalized["tool_plan"] = {
+        "operationId": operation_id,
+        "arguments": sanitized_arguments,
+    }
+    return normalized
+
+
+def _coerce_argument_value(value: Any, spec: dict[str, Any]) -> Any:
+    type_name = str(spec.get("type", "string")).lower()
+    if type_name == "integer":
+        coerced = _coerce_int(value)
+    elif type_name == "number":
+        coerced = _coerce_float(value)
+    elif type_name == "boolean":
+        coerced = _coerce_bool(value)
+    elif type_name == "string":
+        if value is None:
+            return None
+        coerced = str(value).strip()
+        if not coerced:
+            return None
+    else:
+        # Unknown schema types are kept as-is to avoid accidental data loss.
+        coerced = value
+
+    enum_values = spec.get("enum")
+    if isinstance(enum_values, list) and enum_values:
+        coerced = _normalize_enum_value(coerced, enum_values, spec.get("name"))
+        if coerced not in enum_values:
+            return None
+    return coerced
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return int(float(stripped))
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return float(stripped)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "是"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "否"}:
+            return False
+    return None
+
+
+def _normalize_enum_value(value: Any, enum_values: list[Any], param_name: Any) -> Any:
+    if value in enum_values:
+        return value
+    if not isinstance(value, str):
+        return value
+
+    normalized = value.strip()
+    if normalized in enum_values:
+        return normalized
+
+    if isinstance(param_name, str) and param_name == "listing_platform":
+        if "58" in normalized and "58同城" in enum_values:
+            return "58同城"
+        if normalized in {"lianjia", "链家网"} and "链家" in enum_values:
+            return "链家"
+        if normalized.lower() == "anjuke" and "安居客" in enum_values:
+            return "安居客"
+    return value
 
 
 def _build_llm_nlu_messages(message: str, summary: str) -> list[dict[str, str]]:
@@ -176,6 +435,7 @@ def _build_llm_nlu_messages(message: str, summary: str) -> list[dict[str, str]]:
         "layout,area_min,max_subway_dist,max_commute_min,utilities_type,move_in_date,listing_platform,house_id。\n"
         "soft可含字段：decoration,elevator,orientation,noise_preference,amenities,value_for_money,prioritize_subway_distance。\n"
         "tool_plan.arguments请使用API参数名（如 max_price/rental_type/listing_platform/house_id）。\n"
+        "tool_plan.arguments必须遵守argdefs中的参数类型(type)和必填(required)，不要返回未定义参数。\n"
         "未提及字段不要猜测，可以不返回或设为null。\n"
         f"工具目录:\n{tool_summary}"
     )
@@ -205,12 +465,17 @@ async def _analyze_intent_with_llm(
     )
     if not llm_text:
         return None
-    return _extract_json_object(llm_text)
+    parsed = _extract_json_object(llm_text)
+    if not parsed:
+        return None
+    return _sanitize_llm_parse(parsed)
 
 
 def create_app(settings: AgentSettings | None = None) -> FastAPI:
     cfg = settings or load_settings()
     setup_logging(cfg.log_level)
+    # Fail fast at startup if compact LLM tool schema is unavailable.
+    _load_tool_schema_summary()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

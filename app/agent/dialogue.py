@@ -31,7 +31,8 @@ from app.schemas import (
 
 LOGGER = logging.getLogger(__name__)
 
-_RANK_INDEX_PATTERN = re.compile(r"第?\s*([一二两三四五六七八九123456789])\s*套")
+# Explicit ordinal only (e.g., 第一套/第2套). Do not match “这一套”.
+_RANK_INDEX_PATTERN = re.compile(r"第\s*([一二两三四五六七八九123456789])\s*套")
 _CH_NUM_TO_INT = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 _REPLACE_SIGNALS = ("换", "改成", "换成", "重新", "重来")
 _HOUSE_REF_WORDS = ("这套", "这一套", "这间", "这个房", "它", "上一套", "刚才那套", "最开始", "最初")
@@ -90,8 +91,7 @@ class DialogueManager:
         if is_new_session:
             await self._init_session_data(state)
 
-        query = self.nlu.parse(request.message, state, request.case_type)
-        query = self._apply_llm_parse(query, request.meta.get("llm_parse"))
+        query = self._build_query(request, state)
         merged = self._merge_query_with_state(query, state, request.message)
         if merged.intent in {IntentType.house_detail, IntentType.listings, IntentType.rent, IntentType.terminate, IntentType.offline}:
             resolved_house_id = self._resolve_house_id(request.message, merged, state)
@@ -144,6 +144,29 @@ class DialogueManager:
         self._remember_turn(state, request.message, resp, merged.intent)
         self.state_store.upsert(state)
         return resp
+
+    def _build_query(self, request: InvokeRequest, state: SessionState) -> StructuredQuery:
+        llm_parse = request.meta.get("llm_parse")
+        if isinstance(llm_parse, dict) and self._llm_parse_has_signal(llm_parse):
+            llm_query = StructuredQuery()
+            llm_query = self._apply_llm_parse(llm_query, llm_parse)
+            if self._query_is_actionable(llm_query):
+                return llm_query
+        # Fallback only when model parse is missing/invalid/low-confidence.
+        return self.nlu.parse(request.message, state, request.case_type)
+
+    @staticmethod
+    def _llm_parse_has_signal(llm_parse: dict[str, Any]) -> bool:
+        for key in ("intent", "tool_plan", "hard", "soft"):
+            if key in llm_parse:
+                return True
+        return False
+
+    @staticmethod
+    def _query_is_actionable(query: StructuredQuery) -> bool:
+        has_hard = any(value is not None for value in query.hard.model_dump().values())
+        has_soft = any(_has_meaningful_soft_value(value) for value in query.soft.model_dump().values())
+        return query.confidence >= 0.45 or query.intent != IntentType.search or has_hard or has_soft
 
     async def _handle_search(self, query: StructuredQuery, request: InvokeRequest, state: SessionState) -> InvokeResponse:
         state.phase = SessionPhase.searching
@@ -706,6 +729,14 @@ def _map_tool_operation_to_intent(value: Any) -> IntentType | None:
     if not isinstance(value, str):
         return None
     return _TOOL_OPERATION_TO_INTENT.get(value.strip())
+
+
+def _has_meaningful_soft_value(value: Any) -> bool:
+    if isinstance(value, list):
+        return bool(value)
+    if isinstance(value, bool):
+        return value
+    return value is not None
 
 
 def _to_int(value: Any) -> int | None:
