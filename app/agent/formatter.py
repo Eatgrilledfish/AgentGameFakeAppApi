@@ -23,21 +23,14 @@ class OutputFormatter:
             text = "当前条件下没有检索到合适房源。建议放宽预算、地铁距离或区域限制后再试。"
             return InvokeResponse(text=text, candidates=[], debug=debug or {})
 
-        lines = [f"为你筛选到 {len(top_houses)} 套候选房源（最多展示 5 套）："]
-        for idx, house in enumerate(top_houses, start=1):
-            lines.append(
-                f"{idx}. {house.house_id} | {house.district or '-'}·{house.community or '-'} | "
-                f"{house.layout or '-'} | {house.area or '-'}㎡ | {house.rent or '-'} 元/月"
-            )
-            if house.pros:
-                lines.append(f"   优点：{'；'.join(house.pros[:2])}")
-            if house.cons:
-                lines.append(f"   注意：{'；'.join(house.cons[:1])}")
+        conditions = self._build_conditions(query)
+        condition_text = "/".join(conditions) if conditions else "当前条件"
+        text = f"查找到以下符合您要求的房源（查询条件：{condition_text}）"
 
         if case_type == CaseType.multi:
-            lines.append("如果你要我进一步缩小到 1-2 套，我可以按你最看重的条件继续重排。")
+            text += "。如需进一步缩小到 1-2 套，可继续告诉我你的优先级。"
 
-        return InvokeResponse(text="\n".join(lines), candidates=top_houses, debug=debug or {})
+        return InvokeResponse(text=text, candidates=top_houses, debug=debug or {})
 
     def render_action_result(self, action: str, result: dict) -> InvokeResponse:
         messages = {
@@ -46,3 +39,23 @@ class OutputFormatter:
             "offline": "已提交下架操作。",
         }
         return InvokeResponse(text=messages.get(action, "操作已提交。"), candidates=[], debug={"action_result": result})
+
+    def _build_conditions(self, query: StructuredQuery) -> list[str]:
+        conditions: list[str] = []
+
+        if query.hard.district:
+            district = query.hard.district
+            conditions.append(district if district.endswith("区") else f"{district}区")
+
+        if query.hard.layout:
+            layout = query.hard.layout
+            if "居" in layout and not layout.endswith("室"):
+                layout = f"{layout}室"
+            conditions.append(layout)
+
+        if query.soft.prioritize_subway_distance:
+            conditions.append("地铁距离")
+        elif query.hard.max_subway_dist is not None:
+            conditions.append(f"地铁{query.hard.max_subway_dist}米内")
+
+        return conditions
