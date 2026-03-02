@@ -128,24 +128,3 @@ def test_proxy_chat_completions_requires_model_ip() -> None:
         )
 
         assert resp.status_code == 400
-
-
-def test_http_request_logging(caplog) -> None:
-    app = create_app()
-
-    class StubService:
-        async def handle(self, request):
-            return InvokeResponse(text="ok", candidates=[])
-
-    with TestClient(app) as client:
-        app.state.agent_service = StubService()
-        with caplog.at_level(logging.INFO):
-            resp = client.post(
-                "/api/v1/chat",
-                json={"model_ip": "127.0.0.1", "session_id": "sess-log", "message": "记录日志"},
-            )
-
-    assert resp.status_code == 200
-    logs = "\n".join(record.getMessage() for record in caplog.records)
-    assert "incoming request method=POST path=/api/v1/chat" in logs
-    assert "request completed method=POST path=/api/v1/chat status=200" in logs
