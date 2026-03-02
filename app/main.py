@@ -8,13 +8,23 @@ from uuid import uuid4
 
 import httpx
 from fastapi import Body, FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse
 
 from app.agent.service import AgentService
 from app.agent.state import StateStore
 from app.clients.houses import HousesClient
 from app.clients.landmarks import LandmarksClient
 from app.infra.cache import CacheManager
-from app.infra.logging import bind_log_context, log_event, preview_payload, preview_text, reset_log_context, setup_logging
+from app.infra.logging import (
+    bind_log_context,
+    clear_trace_events,
+    get_trace_events,
+    log_event,
+    preview_payload,
+    preview_text,
+    reset_log_context,
+    setup_logging,
+)
 from app.schemas import CaseType, ChatRequest, ChatResponse, HealthResponse, InvokeRequest, InvokeResponse
 from app.settings import AgentSettings, load_settings
 
@@ -26,6 +36,85 @@ STEP_LLM_FALLBACK = "STEP-03-LLM-FALLBACK"
 STEP_FINAL_RESPONSE = "STEP-04-FINAL-RESPONSE"
 STEP_HTTP = "STEP-00-HTTP"
 
+
+
+DEBUG_CHAT_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chat Trace Viewer</title>
+  <style>
+    body{font-family:Arial,sans-serif;margin:0;background:#f5f7fb;}
+    .wrap{max-width:1100px;margin:24px auto;padding:0 16px;}
+    .card{background:#fff;border-radius:10px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,.08);margin-bottom:16px;}
+    .row{display:flex;gap:8px;flex-wrap:wrap;}
+    input,textarea,button{padding:10px;border:1px solid #cfd7e6;border-radius:8px;font-size:14px;}
+    input,textarea{flex:1;}
+    button{background:#2f6feb;color:#fff;border:none;cursor:pointer;}
+    .event{border-left:4px solid #2f6feb;background:#f8faff;padding:10px 12px;margin:8px 0;border-radius:6px;}
+    .meta{font-size:12px;color:#556;}
+    pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;font-size:12px;}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h2>对话处理链路可视化</h2>
+    <div class="row">
+      <input id="modelIp" placeholder="model_ip，例如 127.0.0.1"/>
+      <input id="sessionId" placeholder="session_id"/>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <textarea id="message" rows="3" placeholder="输入用户问题"></textarea>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <button onclick="send()">发送并查看处理步骤</button>
+      <button onclick="refreshTrace()">刷新步骤</button>
+      <button onclick="clearTrace()">清空步骤</button>
+    </div>
+    <p id="resp"></p>
+  </div>
+
+  <div class="card">
+    <h3>处理步骤</h3>
+    <div id="events"></div>
+  </div>
+</div>
+<script>
+async function send(){
+  const model_ip=document.getElementById('modelIp').value.trim();
+  const session_id=document.getElementById('sessionId').value.trim();
+  const message=document.getElementById('message').value.trim();
+  if(!model_ip||!session_id||!message){alert('请填写 model_ip/session_id/message');return;}
+  const res=await fetch('/api/v1/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model_ip,session_id,message})});
+  const data=await res.json();
+  document.getElementById('resp').innerText='最终返回：'+(data.response||JSON.stringify(data));
+  await refreshTrace();
+}
+async function refreshTrace(){
+  const session_id=document.getElementById('sessionId').value.trim();
+  if(!session_id){alert('先输入 session_id');return;}
+  const res=await fetch('/debug/traces/'+encodeURIComponent(session_id));
+  const data=await res.json();
+  const el=document.getElementById('events');
+  el.innerHTML='';
+  (data.events||[]).forEach(ev=>{
+    const item=document.createElement('div');item.className='event';
+    item.innerHTML=`<div><b>${ev.step||'-'}</b> · <span>${ev.event||'-'}</span></div><div class="meta">seq=${ev.seq} trace_id=${ev.trace_id}</div><pre>${JSON.stringify(ev,null,2)}</pre>`;
+    el.appendChild(item);
+  });
+}
+async function clearTrace(){
+  const session_id=document.getElementById('sessionId').value.trim();
+  if(!session_id){alert('先输入 session_id');return;}
+  await fetch('/debug/traces/'+encodeURIComponent(session_id),{method:'DELETE'});
+  await refreshTrace();
+}
+</script>
+</body>
+</html>
+"""
 
 def _build_model_base_url(model_ip: str) -> str:
     if model_ip.startswith(("http://", "https://")):
@@ -156,6 +245,20 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             duration_ms=duration_ms,
         )
         return response
+
+
+    @app.get("/debug/chat-view", response_class=HTMLResponse)
+    async def debug_chat_view() -> HTMLResponse:
+        return HTMLResponse(content=DEBUG_CHAT_PAGE)
+
+    @app.get("/debug/traces/{session_id}")
+    async def debug_get_trace(session_id: str) -> dict:
+        return {"session_id": session_id, "events": get_trace_events(session_id)}
+
+    @app.delete("/debug/traces/{session_id}")
+    async def debug_clear_trace(session_id: str) -> dict:
+        removed = clear_trace_events(session_id)
+        return {"session_id": session_id, "cleared": removed}
 
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:

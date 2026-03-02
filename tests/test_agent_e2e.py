@@ -212,3 +212,39 @@ def test_init_houses_accepts_non_json_success_response() -> None:
     result = asyncio.run(run())
     assert captured["url"] == "http://fake-host:8080/api/houses/init"
     assert result == {"raw": "ok"}
+
+
+def test_debug_trace_viewer_endpoints() -> None:
+    app = create_app()
+
+    class StubService:
+        async def handle(self, request):
+            return InvokeResponse(text="ok", candidates=[])
+
+        def rough_token_estimate(self, text: str) -> int:
+            return 1
+
+        def allow_llm_fallback(self, session_id: str, estimated_prompt_tokens: int) -> bool:
+            return False
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        page = client.get("/debug/chat-view")
+        assert page.status_code == 200
+        assert "对话处理链路可视化" in page.text
+
+        chat_resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-debug", "message": "看日志"},
+        )
+        assert chat_resp.status_code == 200
+
+        trace_resp = client.get("/debug/traces/sess-debug")
+        assert trace_resp.status_code == 200
+        events = trace_resp.json()["events"]
+        assert any(item.get("event") == "chat.received" for item in events)
+        assert any(item.get("event") == "chat.completed" for item in events)
+
+        clear_resp = client.delete("/debug/traces/sess-debug")
+        assert clear_resp.status_code == 200
+        assert clear_resp.json()["cleared"] >= 1
