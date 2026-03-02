@@ -98,6 +98,10 @@ class RuleBasedNLU:
         values = _extract_money_values(text)
         if not values:
             return
+        if not _has_budget_intent(text):
+            values = [value for value in values if not _is_distance_like_number(text, value)]
+        if not values:
+            return
         if len(values) >= 2 and any(token in text for token in ["到", "-", "~", "至"]):
             hard.budget_min = min(values)
             hard.budget_max = max(values)
@@ -254,6 +258,19 @@ def _extract_money_values(text: str) -> list[int]:
         return [major + minor]
 
     return []
+
+
+def _has_budget_intent(text: str) -> bool:
+    signals = ["预算", "租金", "月租", "价格", "价位", "元", "块", "w", "万", "k", "千"]
+    return any(token in text for token in signals)
+
+
+def _is_distance_like_number(text: str, value: int) -> bool:
+    for m in re.finditer(rf"(?<!\d){value}(?!\d)", text):
+        context = text[max(0, m.start() - 4) : m.end() + 4]
+        if any(unit in context for unit in ["米", "分钟", "分", "步行"]):
+            return True
+    return False
 
 
 def _cn_to_num(text: str) -> int:

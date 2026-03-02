@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 
+from app.clients.exceptions import DataSourceError
 from app.clients.houses import HousesClient
 from app.clients.landmarks import LandmarksClient
 from app.infra.cache import CacheManager
@@ -41,7 +42,10 @@ class Planner:
             if self.cache is not None:
                 landmark = self.cache.landmark_by_name.get(hard.landmark_name)
             if landmark is None:
-                landmark = await self.landmarks_client.get_by_name(hard.landmark_name)
+                try:
+                    landmark = await self.landmarks_client.get_by_name(hard.landmark_name)
+                except DataSourceError:
+                    log_event(LOGGER, "planner.landmark.lookup_failed", landmark_name=hard.landmark_name)
             if landmark is None:
                 cands = await self.landmarks_client.search(hard.landmark_name, category=hard.landmark_category)
                 if cands:
