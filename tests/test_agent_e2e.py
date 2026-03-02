@@ -182,3 +182,31 @@ def test_init_houses_post_does_not_send_empty_json_or_params() -> None:
     assert captured["url"] == "http://fake-host:8080/api/houses/init"
     assert "json" not in captured["kwargs"]
     assert "params" not in captured["kwargs"]
+
+
+def test_init_houses_accepts_non_json_success_response() -> None:
+    captured: dict = {}
+
+    class StubResponse:
+        status_code = 200
+        text = "ok"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            raise ValueError("not json")
+
+    class StubAsyncClient:
+        async def post(self, url, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return StubResponse()
+
+    async def run():
+        client = HousesClient("http://fake-host:8080", "user-1", StubAsyncClient())
+        return await client.init_houses()
+
+    result = asyncio.run(run())
+    assert captured["url"] == "http://fake-host:8080/api/houses/init"
+    assert result == {"raw": "ok"}

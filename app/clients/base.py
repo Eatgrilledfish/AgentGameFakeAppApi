@@ -103,7 +103,12 @@ class BaseClient:
             response = await self.http_client.post(url, **kwargs)
             response.raise_for_status()
             LOGGER.info("outgoing response method=POST url=%s status=%s", url, response.status_code)
-            return self._unwrap(response.json())
+            try:
+                return self._unwrap(response.json())
+            except ValueError:
+                # Some endpoints may return empty/plain-text success bodies.
+                text_body = response.text.strip() if isinstance(response.text, str) else ""
+                return {"raw": text_body} if text_body else {}
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
             LOGGER.warning("POST %s failed: %s", url, exc)
             raise DataSourceError(f"POST failed: {url}") from exc
