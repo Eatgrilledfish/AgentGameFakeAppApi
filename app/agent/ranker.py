@@ -38,7 +38,7 @@ class Ranker:
 
     def hard_filter(self, house: HouseLite, query: StructuredQuery) -> bool:
         h = query.hard
-        if house.status and house.status != "可租":
+        if house.status and not _is_rentable_status(house.status):
             return False
         if h.budget_max is not None and house.rent is not None and house.rent > h.budget_max:
             return False
@@ -59,6 +59,8 @@ class Ranker:
                 return False
             if h.rent_type == "整租" and any(k in house.layout for k in ["单间", "合租"]):
                 return False
+        if h.layout and house.layout and not _layout_matches(h.layout, house.layout):
+            return False
         return True
 
     def _coarse_score(self, house: HouseLite, query: StructuredQuery) -> float:
@@ -99,7 +101,17 @@ class Ranker:
         if not filtered:
             return []
 
-        coarse_sorted = sorted(filtered, key=lambda h: self._coarse_score(h, query), reverse=True)
+        if query.soft.prioritize_subway_distance:
+            coarse_sorted = sorted(
+                filtered,
+                key=lambda h: (
+                    h.subway_distance if h.subway_distance is not None else 10**9,
+                    -(self._coarse_score(h, query)),
+                    h.rent if h.rent is not None else 10**9,
+                ),
+            )
+        else:
+            coarse_sorted = sorted(filtered, key=lambda h: self._coarse_score(h, query), reverse=True)
         top_n = coarse_sorted[: self.listing_top_n]
         enriched = await self._enrich_listings(top_n)
 
@@ -117,6 +129,15 @@ class Ranker:
             key=lambda item: self._fine_score(item.house, item.listings, query, amenities=item.amenities),
             reverse=True,
         )[:max_output]
+        if query.soft.prioritize_subway_distance:
+            combined = sorted(
+                combined,
+                key=lambda item: (
+                    item.house.subway_distance if item.house.subway_distance is not None else 10**9,
+                    -(self._fine_score(item.house, item.listings, query, amenities=item.amenities)),
+                    item.house.rent if item.house.rent is not None else 10**9,
+                ),
+            )
         views = [self._to_view_model(item, query, relax_notes=relax_notes) for item in combined]
         return views
 
@@ -239,7 +260,7 @@ def _rent_score(rent: int | None, query: StructuredQuery) -> float:
 def _layout_area_score(house: HouseLite, query: StructuredQuery) -> float:
     score = 0.6
     if query.hard.layout and house.layout:
-        score += 0.2 if query.hard.layout[:1] in house.layout else -0.15
+        score += 0.2 if _layout_matches(query.hard.layout, house.layout) else -0.15
     if query.hard.area_min is not None and house.area is not None:
         score += 0.2 if house.area >= query.hard.area_min else -0.2
     return max(0.0, min(1.0, score))
@@ -275,13 +296,30 @@ def _listing_consistency_score(listings: list[Listing]) -> float:
 
 def _choose_best_platform(house: HouseLite, listings: list[Listing]) -> str | None:
     if listings:
-        rentable = [l for l in listings if l.status == "可租"]
+        rentable = [l for l in listings if l.status and _is_rentable_status(l.status)]
         pool = rentable or listings
         sorted_pool = sorted(pool, key=lambda l: (l.rent if l.rent is not None else 10**9))
         if sorted_pool and sorted_pool[0].listing_platform:
             return sorted_pool[0].listing_platform
     return house.listing_platform or "安居客"
 
+
+
+
+def _layout_matches(expected_layout: str, actual_layout: str) -> bool:
+    expected = _normalize_digits(expected_layout)
+    actual = _normalize_digits(actual_layout)
+    return expected[:1] in actual
+
+
+def _normalize_digits(text: str) -> str:
+    table = str.maketrans({"一": "1", "二": "2", "两": "2", "三": "3", "四": "4", "五": "5", "六": "6", "七": "7", "八": "8", "九": "9"})
+    return text.translate(table)
+
+
+def _is_rentable_status(status: str) -> bool:
+    normalized = status.strip().lower()
+    return normalized in {"可租", "available"}
 
 def _amenities_score(amenities: dict[str, list[NearbyLandmark]], query: StructuredQuery) -> float:
     if not amenities:

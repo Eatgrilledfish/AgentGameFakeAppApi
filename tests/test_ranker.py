@@ -91,3 +91,70 @@ async def test_ranker_relaxes_budget_by_ten_percent_when_no_results() -> None:
 
     assert len(top) == 1
     assert any("放宽预算上限 10%" in c for c in top[0].cons)
+
+
+@pytest.mark.asyncio
+async def test_ranker_accepts_english_available_status() -> None:
+    ranker = Ranker(houses_client=DummyHousesClient(), weights=RankingWeights(), enrich_concurrency=2)
+    query = StructuredQuery(
+        hard=HardConstraints(budget_max=8000, max_subway_dist=1000, max_commute_min=40),
+        soft=SoftPreferences(),
+    )
+    candidates = [
+        HouseLite(
+            house_id="HF_4",
+            rent=7000,
+            area=60,
+            district="海淀",
+            community="西二旗家园",
+            subway_distance=400,
+            commute_to_xierqi_min=18,
+            status="available",
+            layout="2居1厅1卫",
+            tags=["近地铁"],
+        )
+    ]
+
+    top = await ranker.rank_two_stage(candidates, query, max_output=5)
+
+    assert len(top) == 1
+    assert top[0].house_id == "HF_4"
+
+
+@pytest.mark.asyncio
+async def test_ranker_prioritizes_subway_distance_when_requested() -> None:
+    ranker = Ranker(houses_client=DummyHousesClient(), weights=RankingWeights(), enrich_concurrency=2)
+    query = StructuredQuery(
+        hard=HardConstraints(max_subway_dist=800),
+        soft=SoftPreferences(prioritize_subway_distance=True),
+    )
+    candidates = [
+        HouseLite(
+            house_id="HF_FAR",
+            rent=5000,
+            area=70,
+            district="西城",
+            community="A",
+            subway_distance=700,
+            commute_to_xierqi_min=20,
+            status="available",
+            layout="1居1厅1卫",
+            tags=[],
+        ),
+        HouseLite(
+            house_id="HF_NEAR",
+            rent=9000,
+            area=50,
+            district="西城",
+            community="B",
+            subway_distance=200,
+            commute_to_xierqi_min=35,
+            status="available",
+            layout="1居1厅1卫",
+            tags=[],
+        ),
+    ]
+
+    top = await ranker.rank_two_stage(candidates, query, max_output=2)
+
+    assert [item.house_id for item in top] == ["HF_NEAR", "HF_FAR"]

@@ -31,7 +31,7 @@ class RuleBasedNLU:
         self._extract_rent_type(text, hard)
         self._extract_layout(text, hard)
         self._extract_area(text, hard)
-        self._extract_subway(text, lowered, hard)
+        self._extract_subway(text, lowered, hard, soft)
         self._extract_commute(text, hard)
         self._extract_move_in_date(text, hard)
         self._extract_landmark_or_community(text, hard)
@@ -135,9 +135,10 @@ class RuleBasedNLU:
         if m:
             hard.area_min = float(m.group(1))
 
-    def _extract_subway(self, text: str, lowered: str, hard: HardConstraints) -> None:
-        if "近地铁" in text:
+    def _extract_subway(self, text: str, lowered: str, hard: HardConstraints, soft: SoftPreferences) -> None:
+        if any(keyword in text for keyword in ["近地铁", "离地铁近", "靠近地铁"]):
             hard.max_subway_dist = 800
+            soft.prioritize_subway_distance = True
         if "地铁可达" in text:
             hard.max_subway_dist = 1000
 

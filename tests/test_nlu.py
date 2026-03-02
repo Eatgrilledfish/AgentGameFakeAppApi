@@ -12,6 +12,7 @@ def test_extract_budget_subway_and_commute() -> None:
 
     assert q.hard.budget_max == 12000
     assert q.hard.max_subway_dist == 800
+    assert q.soft.prioritize_subway_distance is True
     assert q.hard.max_commute_min == 30
     assert q.hard.layout is not None
 
@@ -30,3 +31,11 @@ def test_multi_case_generates_clarify_questions() -> None:
     q = nlu.parse("我想租房", _state(), CaseType.multi)
 
     assert len(q.clarify_questions) >= 1
+
+
+def test_extract_subway_distance_without_priority_keyword() -> None:
+    nlu = RuleBasedNLU()
+    q = nlu.parse("地铁500米内的两居", _state(), CaseType.single)
+
+    assert q.hard.max_subway_dist == 500
+    assert q.soft.prioritize_subway_distance is False

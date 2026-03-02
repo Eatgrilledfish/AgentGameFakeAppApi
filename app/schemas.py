@@ -54,6 +54,7 @@ class SoftPreferences(BaseModel):
     noise_preference: str | None = None
     amenities: list[str] = Field(default_factory=list)
     value_for_money: bool | None = None
+    prioritize_subway_distance: bool = False
 
 
 class StructuredQuery(BaseModel):
