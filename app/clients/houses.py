@@ -170,4 +170,25 @@ def _normalize_house(raw: dict[str, Any]) -> dict[str, Any]:
     if "status" not in normalized and "house_status" in normalized:
         normalized["status"] = normalized.get("house_status")
 
+    normalized["area"] = _to_float(normalized.get("area"))
+
     return normalized
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        digits = "".join(ch for ch in text if ch.isdigit() or ch in {".", "-"})
+        if not digits:
+            return None
+        try:
+            return float(digits)
+        except ValueError:
+            return None
+    return None
