@@ -16,6 +16,44 @@ from app.infra.logging import setup_logging
 from app.schemas import CaseType, ChatRequest, ChatResponse, HealthResponse, InvokeRequest, InvokeResponse
 from app.settings import AgentSettings, load_settings
 
+LOGGER = logging.getLogger(__name__)
+
+
+def _build_model_base_url(model_ip: str) -> str:
+    if model_ip.startswith(("http://", "https://")):
+        return model_ip
+    return f"http://{model_ip}:8888"
+
+
+async def _forward_chat_completion(
+    http_client: httpx.AsyncClient,
+    *,
+    model_ip: str,
+    message: str,
+    session_id: str | None = None,
+) -> str | None:
+    headers: dict[str, str] = {}
+    if session_id:
+        headers["Session-ID"] = session_id
+
+    payload = {
+        "model": "",
+        "messages": [{"role": "user", "content": message}],
+        "stream": False,
+    }
+    resp = await http_client.post(
+        f"{_build_model_base_url(model_ip)}/v1/chat/completions",
+        json=payload,
+        headers=headers,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    choices = data.get("choices", [])
+    if not choices:
+        return None
+    msg = choices[0].get("message", {})
+    return msg.get("content")
+
 
 def _build_model_base_url(model_ip: str) -> str:
     if model_ip.startswith(("http://", "https://")):
@@ -94,6 +132,39 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             await http_client.aclose()
 
     app = FastAPI(title="Smart Rental Agent", version="0.1.0", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def log_http_requests(request: Request, call_next):
+        started = time.perf_counter()
+        raw_body = await request.body()
+
+        async def receive() -> dict[str, bytes | bool]:
+            return {"type": "http.request", "body": raw_body, "more_body": False}
+
+        request._receive = receive
+
+        body_preview = raw_body.decode("utf-8", errors="replace") if raw_body else ""
+        if len(body_preview) > 500:
+            body_preview = body_preview[:500] + "...(truncated)"
+
+        LOGGER.info(
+            "incoming request method=%s path=%s query=%s body=%s",
+            request.method,
+            request.url.path,
+            str(request.query_params),
+            body_preview or "<empty>",
+        )
+
+        response = await call_next(request)
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        LOGGER.info(
+            "request completed method=%s path=%s status=%s duration_ms=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+        )
+        return response
 
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
