@@ -17,7 +17,9 @@ from app.clients.landmarks import LandmarksClient
 from app.infra.cache import CacheManager
 from app.infra.logging import (
     bind_log_context,
+    clear_all_trace_events,
     clear_trace_events,
+    get_all_trace_events,
     get_trace_events,
     log_event,
     preview_payload,
@@ -140,7 +142,7 @@ function appendEvents(events){
     const key = `${ev.trace_id}-${ev.seq}-${ev.event}`;
     if(rendered.has(key)) continue;
     rendered.add(key);
-    lastSeq = Math.max(lastSeq, Number(ev.seq||0));
+    lastSeq = Math.max(lastSeq, Number(ev.eid||0));
     const item = document.createElement('div');
     item.className = cls(ev);
     item.innerHTML = `<div><b>${esc(ev.step||'-')}</b> · <span>${esc(ev.event||'-')}</span></div><div class="meta">seq=${esc(ev.seq)} trace_id=${esc(ev.trace_id)}</div><pre>${esc(JSON.stringify(ev,null,2))}</pre>`;
@@ -150,16 +152,16 @@ function appendEvents(events){
 
 async function refreshTrace(){
   const sid = sessionId();
-  if(!sid){ return; }
-  const url = `${baseUrl()}/debug/traces/${encodeURIComponent(sid)}?since_seq=${lastSeq}`;
+  const url = `${baseUrl()}/debug/traces?since_eid=${lastSeq}`;
   const res = await fetch(url);
   const data = await res.json();
-  const events = data.events || [];
+  const events = (data.events || []).filter(e => !sid || e.session_id === sid);
   appendEvents(events);
 
-  const full = await fetch(`${baseUrl()}/debug/traces/${encodeURIComponent(sid)}`);
+  const full = await fetch(`${baseUrl()}/debug/traces`);
   const fullData = await full.json();
-  renderSummary(fullData.events || []);
+  const fullEvents = (fullData.events || []).filter(e => !sid || e.session_id === sid);
+  renderSummary(fullEvents);
 }
 
 async function send(){
@@ -185,8 +187,11 @@ function stopWatch(){
 
 async function clearTrace(){
   const sid=sessionId();
-  if(!sid){alert('先输入 session_id');return;}
-  await fetch(`${baseUrl()}/debug/traces/${encodeURIComponent(sid)}`,{method:'DELETE'});
+  if(sid){
+    await fetch(`${baseUrl()}/debug/traces/${encodeURIComponent(sid)}`,{method:'DELETE'});
+  }else{
+    await fetch(`${baseUrl()}/debug/traces`,{method:'DELETE'});
+  }
   rendered = new Set();
   lastSeq = 0;
   document.getElementById('events').innerHTML='';
@@ -334,6 +339,16 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
     @app.get("/debug/chat-view", response_class=HTMLResponse)
     async def debug_chat_view() -> HTMLResponse:
         return HTMLResponse(content=DEBUG_CHAT_PAGE)
+
+    @app.get("/debug/traces")
+    async def debug_get_all_traces(since_eid: int = Query(default=0, ge=0)) -> dict:
+        events = get_all_trace_events(since_eid=since_eid)
+        return {"events": events}
+
+    @app.delete("/debug/traces")
+    async def debug_clear_all_traces() -> dict:
+        removed = clear_all_trace_events()
+        return {"cleared": removed}
 
     @app.get("/debug/traces/{session_id}")
     async def debug_get_trace(session_id: str, since_seq: int = Query(default=0, ge=0)) -> dict:
