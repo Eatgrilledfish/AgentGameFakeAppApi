@@ -151,8 +151,9 @@ def test_http_request_logging(caplog) -> None:
 
     assert resp.status_code == 200
     logs = "\n".join(record.getMessage() for record in caplog.records)
-    assert "incoming request method=POST path=/api/v1/chat" in logs
-    assert "request completed method=POST path=/api/v1/chat status=200" in logs
+    assert "\"event\": \"http.request.in\"" in logs
+    assert "\"path\": \"/api/v1/chat\"" in logs
+    assert "\"event\": \"http.request.out\"" in logs
 
 
 def test_init_houses_post_does_not_send_empty_json_or_params() -> None:

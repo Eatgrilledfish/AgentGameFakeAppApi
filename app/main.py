@@ -14,11 +14,17 @@ from app.agent.state import StateStore
 from app.clients.houses import HousesClient
 from app.clients.landmarks import LandmarksClient
 from app.infra.cache import CacheManager
-from app.infra.logging import bind_log_context, log_event, preview_text, reset_log_context, setup_logging
+from app.infra.logging import bind_log_context, log_event, preview_payload, preview_text, reset_log_context, setup_logging
 from app.schemas import CaseType, ChatRequest, ChatResponse, HealthResponse, InvokeRequest, InvokeResponse
 from app.settings import AgentSettings, load_settings
 
 LOGGER = logging.getLogger(__name__)
+
+STEP_RECV_USER_QUERY = "STEP-01-RECV-USER-QUERY"
+STEP_AGENT_PIPELINE = "STEP-02-AGENT-PIPELINE"
+STEP_LLM_FALLBACK = "STEP-03-LLM-FALLBACK"
+STEP_FINAL_RESPONSE = "STEP-04-FINAL-RESPONSE"
+STEP_HTTP = "STEP-00-HTTP"
 
 
 def _build_model_base_url(model_ip: str) -> str:
@@ -43,6 +49,14 @@ async def _forward_chat_completion(
         "messages": [{"role": "user", "content": message}],
         "stream": False,
     }
+    log_event(
+        LOGGER,
+        "chat.llm.forward.request",
+        step=STEP_LLM_FALLBACK,
+        model_ip=model_ip,
+        payload_preview=preview_payload(payload),
+    )
+
     resp = await http_client.post(
         f"{_build_model_base_url(model_ip)}/v1/chat/completions",
         json=payload,
@@ -50,6 +64,13 @@ async def _forward_chat_completion(
     )
     resp.raise_for_status()
     data = resp.json()
+    log_event(
+        LOGGER,
+        "chat.llm.forward.response",
+        step=STEP_LLM_FALLBACK,
+        status_code=resp.status_code,
+        body_preview=preview_payload(data),
+    )
     choices = data.get("choices", [])
     if not choices:
         return None
@@ -113,22 +134,26 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         if len(body_preview) > 500:
             body_preview = body_preview[:500] + "...(truncated)"
 
-        LOGGER.info(
-            "incoming request method=%s path=%s query=%s body=%s",
-            request.method,
-            request.url.path,
-            str(request.query_params),
-            body_preview or "<empty>",
+        log_event(
+            LOGGER,
+            "http.request.in",
+            step=STEP_HTTP,
+            method=request.method,
+            path=request.url.path,
+            query=str(request.query_params),
+            body=body_preview or "<empty>",
         )
 
         response = await call_next(request)
         duration_ms = int((time.perf_counter() - started) * 1000)
-        LOGGER.info(
-            "request completed method=%s path=%s status=%s duration_ms=%s",
-            request.method,
-            request.url.path,
-            response.status_code,
-            duration_ms,
+        log_event(
+            LOGGER,
+            "http.request.out",
+            step=STEP_HTTP,
+            method=request.method,
+            path=request.url.path,
+            status_code=response.status_code,
+            duration_ms=duration_ms,
         )
         return response
 
@@ -151,6 +176,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             log_event(
                 LOGGER,
                 "invoke.received",
+                step=STEP_RECV_USER_QUERY,
                 message=preview_text(req.message, limit=300),
                 history_len=len(req.history),
                 meta_keys=sorted(req.meta.keys()),
@@ -160,6 +186,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             log_event(
                 LOGGER,
                 "invoke.completed",
+                step=STEP_FINAL_RESPONSE,
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 candidate_count=len(resp.candidates),
                 clarify_count=len(resp.clarify_questions),
@@ -170,6 +197,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             log_event(
                 LOGGER,
                 "invoke.failed",
+                step=STEP_FINAL_RESPONSE,
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 error=str(exc),
             )
@@ -192,16 +220,32 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             log_event(
                 LOGGER,
                 "chat.received",
+                step=STEP_RECV_USER_QUERY,
                 model_ip=req.model_ip,
                 message=preview_text(req.message, limit=300),
             )
             app.state.session_model_ip[req.session_id] = req.model_ip
+            log_event(
+                LOGGER,
+                "chat.agent.invoke.start",
+                step=STEP_AGENT_PIPELINE,
+                input_message=preview_text(req.message, limit=300),
+            )
             invoke_resp = await service.handle(
                 InvokeRequest(
                     session_id=req.session_id,
                     case_type=CaseType.single,
                     message=req.message,
                 )
+            )
+            log_event(
+                LOGGER,
+                "chat.agent.invoke.done",
+                step=STEP_AGENT_PIPELINE,
+                invoke_text=preview_text(invoke_resp.text, limit=300),
+                candidate_count=len(invoke_resp.candidates),
+                clarify_count=len(invoke_resp.clarify_questions),
+                debug=invoke_resp.debug,
             )
 
             output = invoke_resp.text
@@ -242,16 +286,37 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                             )
                             if hasattr(service, "record_llm_fallback_usage"):
                                 service.record_llm_fallback_usage(req.session_id, prompt_tokens + completion_tokens)
+                            log_event(
+                                LOGGER,
+                                "chat.llm_fallback.applied",
+                                step=STEP_LLM_FALLBACK,
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                llm_output=preview_text(llm_text, limit=300),
+                            )
                     else:
-                        log_event(LOGGER, "chat.llm_fallback_skipped", reason="budget_exceeded")
+                        log_event(
+                            LOGGER,
+                            "chat.llm_fallback_skipped",
+                            step=STEP_LLM_FALLBACK,
+                            reason="budget_exceeded",
+                            estimated_prompt_tokens=prompt_tokens,
+                        )
                 except httpx.HTTPError as exc:
-                    log_event(LOGGER, "chat.llm_fallback_failed", error=str(exc))
+                    log_event(
+                        LOGGER,
+                        "chat.llm_fallback_failed",
+                        step=STEP_LLM_FALLBACK,
+                        error=str(exc),
+                    )
 
             now_ms = int(time.time() * 1000)
             log_event(
                 LOGGER,
                 "chat.completed",
+                step=STEP_FINAL_RESPONSE,
                 duration_ms=now_ms - started_ms,
+                invoke_output=preview_text(invoke_resp.text, limit=300),
                 response=preview_text(output, limit=300),
             )
             return ChatResponse(
