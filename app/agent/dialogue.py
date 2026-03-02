@@ -114,7 +114,24 @@ class DialogueManager:
                 resp = await self._handle_listings_query(merged, state)
             elif merged.intent == IntentType.house_detail:
                 resp = await self._handle_house_detail(merged, state)
-            elif request.case_type.value == "Multi" and merged.clarify_questions and state.phase in {
+            elif merged.intent == IntentType.search and state.phase in {
+                SessionPhase.chatting,
+                SessionPhase.slot_filling,
+            }:
+                clarify_questions = self._build_search_clarify_questions(merged.hard)
+                if clarify_questions:
+                    log_event(LOGGER, "dialogue.clarify", questions=clarify_questions)
+                    state.phase = SessionPhase.slot_filling
+                    resp = self.formatter.render(
+                        case_type=request.case_type,
+                        query=merged,
+                        top_houses=[],
+                        clarify_questions=clarify_questions,
+                        debug={"response_kind": "clarify"},
+                    )
+                else:
+                    resp = await self._handle_search(merged, request, state)
+            elif merged.clarify_questions and state.phase in {
                 SessionPhase.chatting,
                 SessionPhase.slot_filling,
             }:
@@ -148,11 +165,11 @@ class DialogueManager:
     def _build_query(self, request: InvokeRequest, state: SessionState) -> StructuredQuery:
         llm_parse = request.meta.get("llm_parse")
         if isinstance(llm_parse, dict) and self._llm_parse_has_signal(llm_parse):
-            llm_query = StructuredQuery()
+            # Start at zero confidence so low-signal parses can cleanly fall back to rule NLU.
+            llm_query = StructuredQuery(confidence=0.0)
             llm_query = self._apply_llm_parse(llm_query, llm_parse)
-            if self._query_is_actionable(llm_query):
-                return llm_query
-        # Fallback only when model parse is missing/invalid/low-confidence.
+            return llm_query
+        # Fallback only when model parse is missing/invalid.
         return self.nlu.parse(request.message, state, request.case_type)
 
     @staticmethod
@@ -161,12 +178,6 @@ class DialogueManager:
             if key in llm_parse:
                 return True
         return False
-
-    @staticmethod
-    def _query_is_actionable(query: StructuredQuery) -> bool:
-        has_hard = any(value is not None for value in query.hard.model_dump().values())
-        has_soft = any(_has_meaningful_soft_value(value) for value in query.soft.model_dump().values())
-        return query.confidence >= 0.45 or query.intent != IntentType.search or has_hard or has_soft
 
     async def _handle_search(self, query: StructuredQuery, request: InvokeRequest, state: SessionState) -> InvokeResponse:
         state.phase = SessionPhase.searching
@@ -363,6 +374,18 @@ class DialogueManager:
         self.cache.house_listings[house_id] = listings
         return listings
 
+    @staticmethod
+    def _build_search_clarify_questions(hard: HardConstraints) -> list[str]:
+        has_location = any([hard.district, hard.area, hard.community, hard.landmark_name, hard.landmark_id])
+        has_budget = hard.budget_max is not None or hard.budget_min is not None
+
+        questions: list[str] = []
+        if not has_location:
+            questions.append("你更倾向哪个区域、小区或地标附近？")
+        if not has_budget and not has_location:
+            questions.append("你的预算上限大概是多少（元/月）？")
+        return questions[:2]
+
     def _merge_query_with_state(self, query: StructuredQuery, state: SessionState, user_text: str) -> StructuredQuery:
         hard = HardConstraints.model_validate(state.confirmed_constraints.model_dump())
         soft = SoftPreferences.model_validate(state.soft_preferences.model_dump())
@@ -407,8 +430,8 @@ class DialogueManager:
             return query
 
         confidence = _to_float(llm_parse.get("confidence"))
-        if confidence is not None and confidence < 0.45:
-            return query
+        if confidence is not None:
+            query.confidence = confidence
 
         parsed_intent = _normalize_intent(llm_parse.get("intent"))
         if parsed_intent is not None:
@@ -434,8 +457,6 @@ class DialogueManager:
         if isinstance(soft_raw, dict):
             self._apply_soft_overrides(query.soft, soft_raw)
 
-        if confidence is not None:
-            query.confidence = max(query.confidence, confidence)
         return query
 
     def _normalize_tool_arguments(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -689,25 +710,37 @@ class DialogueManager:
         if state.confirmed_constraints.budget_max is not None:
             constraints.append(f"预算上限={state.confirmed_constraints.budget_max}")
 
-        search_notes = [
-            f"{idx + 1}:{'/'.join(snapshot.house_ids[:2])}"
-            for idx, snapshot in enumerate(state.search_history[-4:])
-            if snapshot.house_ids
-        ]
-        turn_notes = [
-            f"U:{turn.user}|A:{turn.assistant}" for turn in state.recent_turns[-4:]
+        focus_parts: list[str] = []
+        if state.focus_house_id:
+            focus_parts.append(f"house={state.focus_house_id}")
+        if state.focus_listing_platform:
+            focus_parts.append(f"platform={state.focus_listing_platform.value}")
+
+        search_notes: list[str] = []
+        for idx, snapshot in enumerate(state.search_history[-4:]):
+            if not snapshot.house_ids:
+                continue
+            anchor = snapshot.landmark_name or snapshot.community or snapshot.district or "-"
+            search_notes.append(f"{idx + 1}:{anchor}:{'/'.join(snapshot.house_ids[:2])}")
+
+        action_notes = [
+            f"{turn.intent.value}:{'/'.join(turn.house_ids[:2])}"
+            for turn in state.recent_turns[-6:]
+            if turn.intent in {IntentType.rent, IntentType.terminate, IntentType.offline} and turn.house_ids
         ]
 
         blocks: list[str] = []
         if constraints:
             blocks.append("约束[" + "，".join(constraints) + "]")
+        if focus_parts:
+            blocks.append("焦点[" + "，".join(focus_parts) + "]")
         if search_notes:
             blocks.append("检索[" + "；".join(search_notes) + "]")
-        if turn_notes:
-            blocks.append("对话[" + "；".join(turn_notes) + "]")
+        if action_notes:
+            blocks.append("动作[" + "；".join(action_notes) + "]")
 
         summary = " ".join(blocks)
-        return summary[:900]
+        return summary[:700]
 
 
 def _is_rentable_status(status: str) -> bool:
@@ -729,14 +762,6 @@ def _map_tool_operation_to_intent(value: Any) -> IntentType | None:
     if not isinstance(value, str):
         return None
     return _TOOL_OPERATION_TO_INTENT.get(value.strip())
-
-
-def _has_meaningful_soft_value(value: Any) -> bool:
-    if isinstance(value, list):
-        return bool(value)
-    if isinstance(value, bool):
-        return value
-    return value is not None
 
 
 def _to_int(value: Any) -> int | None:

@@ -22,6 +22,8 @@ class RuleBasedNLU:
         text = _normalize_typos(text)
         hard = HardConstraints()
         soft = SoftPreferences()
+        _ = state
+        _ = case_type
 
         lowered = text.lower()
         intent = self._detect_intent(text, lowered)
@@ -41,8 +43,6 @@ class RuleBasedNLU:
 
         if intent in {IntentType.rent, IntentType.terminate, IntentType.offline}:
             questions = self._build_action_questions(hard)
-        elif case_type == CaseType.multi:
-            questions = self._build_clarify_questions(hard)
         else:
             questions = []
 

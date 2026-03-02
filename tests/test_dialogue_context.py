@@ -220,6 +220,24 @@ async def test_dialogue_handles_listing_then_rent_with_context() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dialogue_clarifies_sparse_search_without_case_type_dependency() -> None:
+    planner = DummyPlanner()
+    houses = DummyHousesClient()
+    dialogue, state, planner, _ = _build_dialogue(planner=planner, houses_client=houses)
+
+    resp = await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-ctx", case_type=CaseType.single, message="帮我找房"),
+        state,
+        is_new_session=True,
+    )
+
+    assert resp.debug["response_kind"] == "clarify"
+    assert "区域、小区或地标" in resp.text
+    assert "预算上限" in resp.text
+    assert planner.executed_queries == []
+
+
+@pytest.mark.asyncio
 async def test_dialogue_can_refer_to_first_search_snapshot() -> None:
     planner = DummyPlanner()
     houses = DummyHousesClient()
@@ -294,6 +312,31 @@ async def test_dialogue_accepts_llm_intent_parse_override() -> None:
                     "intent": "rent",
                     "hard": {"house_id": "HF_4", "listing_platform": "安居客"},
                     "confidence": 0.93,
+                }
+            },
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    assert "已提交租房操作" in resp.text
+    assert houses.rent_calls[-1] == ("HF_4", "安居客")
+
+
+@pytest.mark.asyncio
+async def test_dialogue_prefers_llm_parse_even_with_low_confidence() -> None:
+    dialogue, state, _, houses = _build_dialogue()
+
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="帮我处理这个",
+            meta={
+                "llm_parse": {
+                    "intent": "rent",
+                    "hard": {"house_id": "HF_4", "listing_platform": "安居客"},
+                    "confidence": 0.1,
                 }
             },
         ),

@@ -181,6 +181,83 @@ def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
         assert captured["meta"]["llm_parse"]["tool_plan"]["arguments"]["house_id"] == "HF_1001"
 
 
+def test_chat_route_sanitizes_unknown_tool_operation_from_llm() -> None:
+    app = create_app()
+    captured: dict = {}
+
+    class StubState:
+        conversation_summary = "约束[区域=大兴] 焦点[house=HF_4]"
+        focus_house_id = "HF_4"
+        focus_listing_platform = None
+        confirmed_constraints = type(
+            "Hard",
+            (),
+            {"model_dump": staticmethod(lambda exclude_none=True: {"district": "大兴", "budget_max": 4000})},
+        )()
+        search_history = []
+        recent_turns = []
+
+    class StubStateStore:
+        def get(self, session_id):
+            assert session_id == "sess-unknown-op"
+            return StubState()
+
+    class StubService:
+        state_store = StubStateStore()
+
+        def rough_token_estimate(self, text: str) -> int:
+            return 10
+
+        def allow_llm_fallback(self, session_id: str, estimated_prompt_tokens: int) -> bool:
+            return True
+
+        async def handle(self, request):
+            captured["meta"] = request.meta
+            return InvokeResponse(text="ok", candidates=[], debug={"response_kind": "chat"})
+
+    class StubResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            assert url == "http://127.0.0.1:8888/v1/chat/completions"
+            return StubResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"intent":"search","tool_plan":{"operationId":"fake_op","arguments":'
+                                    '{"x":"y","house_id":"BAD-ID"}},"confidence":0.91}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-unknown-op", "message": "随便查查"},
+        )
+
+        assert resp.status_code == 200
+        tool_plan = captured["meta"]["llm_parse"]["tool_plan"]
+        assert tool_plan["operationId"] == "none"
+        assert tool_plan["arguments"] == {}
+
+
 def test_chat_route_skips_llm_nlu_when_service_policy_disallows() -> None:
     app = create_app()
     captured: dict = {"http_called": False}

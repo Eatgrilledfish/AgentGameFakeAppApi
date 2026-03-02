@@ -5,6 +5,7 @@ from functools import lru_cache
 import json
 import logging
 from pathlib import Path
+import re
 import time
 from typing import Any
 from uuid import uuid4
@@ -295,6 +296,26 @@ def _format_param_defs_for_prompt(param_defs: list[dict[str, Any]]) -> str:
     return ";".join(chunks) if chunks else "-"
 
 
+@lru_cache(maxsize=1)
+def _load_tool_required_params() -> dict[str, set[str]]:
+    payload = _load_compact_tool_schema_payload()
+    operations = payload.get("operations")
+    if not isinstance(operations, list):
+        return {}
+
+    mapping: dict[str, set[str]] = {}
+    for item in operations:
+        if not isinstance(item, dict):
+            continue
+        operation_id = item.get("operationId")
+        if not isinstance(operation_id, str) or not operation_id:
+            continue
+        param_defs = _collect_param_defs(item)
+        required = {spec["name"] for spec in param_defs if spec.get("required") is True and isinstance(spec.get("name"), str)}
+        mapping[operation_id] = required
+    return mapping
+
+
 def _sanitize_llm_parse(parsed: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(parsed)
     tool_plan = normalized.get("tool_plan")
@@ -306,8 +327,13 @@ def _sanitize_llm_parse(parsed: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(operation_id, str) or not operation_id:
         return normalized
 
+    known_op_specs = _load_tool_argument_specs()
+    if operation_id != "none" and operation_id not in known_op_specs:
+        normalized["tool_plan"] = {"operationId": "none", "arguments": {}}
+        return normalized
+
     sanitized_arguments: dict[str, Any] = {}
-    op_specs = _load_tool_argument_specs().get(operation_id, {})
+    op_specs = known_op_specs.get(operation_id, {})
     if isinstance(arguments, dict):
         if op_specs:
             for key, value in arguments.items():
@@ -322,6 +348,13 @@ def _sanitize_llm_parse(parsed: dict[str, Any]) -> dict[str, Any]:
         else:
             sanitized_arguments = {k: v for k, v in arguments.items() if isinstance(k, str)}
 
+    required = _load_tool_required_params().get(operation_id, set())
+    for req_key in required:
+        if req_key not in sanitized_arguments:
+            continue
+        if sanitized_arguments[req_key] is None:
+            sanitized_arguments.pop(req_key, None)
+
     normalized["tool_plan"] = {
         "operationId": operation_id,
         "arguments": sanitized_arguments,
@@ -331,6 +364,7 @@ def _sanitize_llm_parse(parsed: dict[str, Any]) -> dict[str, Any]:
 
 def _coerce_argument_value(value: Any, spec: dict[str, Any]) -> Any:
     type_name = str(spec.get("type", "string")).lower()
+    param_name = spec.get("name")
     if type_name == "integer":
         coerced = _coerce_int(value)
     elif type_name == "number":
@@ -343,6 +377,11 @@ def _coerce_argument_value(value: Any, spec: dict[str, Any]) -> Any:
         coerced = str(value).strip()
         if not coerced:
             return None
+        if param_name == "house_id":
+            upper = coerced.upper()
+            if not re.fullmatch(r"[A-Z]{2,4}_?\d{1,8}", upper):
+                return None
+            coerced = upper
     else:
         # Unknown schema types are kept as-is to avoid accidental data loss.
         coerced = value
@@ -421,13 +460,100 @@ def _normalize_enum_value(value: Any, enum_values: list[Any], param_name: Any) -
     return value
 
 
-def _build_llm_nlu_messages(message: str, summary: str) -> list[dict[str, str]]:
+def _build_llm_context_facts(state: Any) -> dict[str, Any]:
+    if state is None:
+        return {}
+
+    facts: dict[str, Any] = {}
+
+    focus_house_id = getattr(state, "focus_house_id", None)
+    if isinstance(focus_house_id, str) and focus_house_id:
+        facts["focus_house_id"] = focus_house_id
+
+    focus_platform = getattr(state, "focus_listing_platform", None)
+    if isinstance(focus_platform, str) and focus_platform:
+        facts["focus_listing_platform"] = focus_platform
+    elif hasattr(focus_platform, "value") and isinstance(getattr(focus_platform, "value"), str):
+        facts["focus_listing_platform"] = getattr(focus_platform, "value")
+
+    confirmed = getattr(state, "confirmed_constraints", None)
+    if confirmed is not None and hasattr(confirmed, "model_dump"):
+        confirmed_dict = confirmed.model_dump(exclude_none=True)
+        picked = {}
+        for key in (
+            "district",
+            "area",
+            "community",
+            "landmark_id",
+            "landmark_name",
+            "budget_min",
+            "budget_max",
+            "layout",
+            "rent_type",
+            "max_subway_dist",
+            "max_commute_min",
+            "utilities_type",
+            "listing_platform",
+        ):
+            value = confirmed_dict.get(key)
+            if value is None:
+                continue
+            if hasattr(value, "value") and isinstance(getattr(value, "value"), str):
+                picked[key] = getattr(value, "value")
+            else:
+                picked[key] = value
+        if picked:
+            facts["confirmed_constraints"] = picked
+
+    search_history = getattr(state, "search_history", None)
+    if isinstance(search_history, list) and search_history:
+        recent_searches: list[dict[str, Any]] = []
+        for snap in search_history[-3:]:
+            if not hasattr(snap, "house_ids"):
+                continue
+            house_ids = getattr(snap, "house_ids", [])
+            if not isinstance(house_ids, list) or not house_ids:
+                continue
+            row: dict[str, Any] = {"house_ids": [str(x) for x in house_ids[:3]]}
+            for key in ("district", "area", "community", "landmark_name"):
+                value = getattr(snap, key, None)
+                if isinstance(value, str) and value:
+                    row[key] = value
+            recent_searches.append(row)
+        if recent_searches:
+            facts["recent_searches"] = recent_searches
+            facts["latest_search_house_ids"] = recent_searches[-1]["house_ids"]
+
+    recent_turns = getattr(state, "recent_turns", None)
+    if isinstance(recent_turns, list) and recent_turns:
+        actions: list[dict[str, Any]] = []
+        for turn in recent_turns[-6:]:
+            intent = getattr(turn, "intent", None)
+            if intent is None:
+                continue
+            intent_value = getattr(intent, "value", intent)
+            if intent_value not in {"rent", "terminate", "offline"}:
+                continue
+            house_ids = getattr(turn, "house_ids", [])
+            if not isinstance(house_ids, list):
+                continue
+            actions.append({"intent": intent_value, "house_ids": [str(x) for x in house_ids[:2]]})
+        if actions:
+            facts["recent_actions"] = actions
+
+    return facts
+
+
+def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str, Any] | None = None) -> list[dict[str, str]]:
     tool_summary = _load_tool_schema_summary()
     prompt = (
         "你是租房Agent意图解析器。"
         "请把输入解析为严格JSON，不要输出任何额外文字或Markdown。\n"
         "intent可选值：chat/search/compare/amenities/house_detail/listings/rent/terminate/offline。\n"
         "你必须基于可用API工具目录判断本轮最匹配的operationId，并抽取调用参数。\n"
+        "严格反幻觉：不允许编造 house_id、listing_platform、地标ID 或未提供的硬约束。\n"
+        "当用户说“这套/第一套/最开始那套”时，优先使用 context_facts 中的 focus_house_id 或 latest_search_house_ids。\n"
+        "若必填参数未知，不要猜测，保留为空并降低confidence。\n"
         "只返回如下结构："
         '{"intent":"search","tool_plan":{"operationId":"get_houses_by_platform","arguments":{}},"hard":{},"soft":{},"confidence":0.0}。\n'
         "operationId必须从工具目录中选择；若是纯闲聊可填 none。\n"
@@ -440,7 +566,8 @@ def _build_llm_nlu_messages(message: str, summary: str) -> list[dict[str, str]]:
         f"工具目录:\n{tool_summary}"
     )
     user_payload = {
-        "history_summary": summary[:700] if summary else "",
+        "history_summary": summary[:500] if summary else "",
+        "context_facts": context_facts or {},
         "message": message,
     }
     return [
@@ -456,11 +583,12 @@ async def _analyze_intent_with_llm(
     session_id: str,
     message: str,
     summary: str,
+    context_facts: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     llm_text = await _forward_chat_completion(
         http_client,
         model_ip=model_ip,
-        messages=_build_llm_nlu_messages(message, summary),
+        messages=_build_llm_nlu_messages(message, summary, context_facts=context_facts),
         session_id=session_id,
     )
     if not llm_text:
@@ -630,12 +758,15 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                         allow_llm_nlu_by_policy, policy_reason = service.should_use_llm_nlu(req.session_id, req.message)
 
                     state_summary = ""
+                    context_facts: dict[str, Any] = {}
                     if hasattr(service, "state_store"):
                         state = service.state_store.get(req.session_id)  # type: ignore[attr-defined]
                         if state is not None and getattr(state, "conversation_summary", ""):
                             state_summary = state.conversation_summary
+                            context_facts = _build_llm_context_facts(state)
 
-                    prompt_tokens = service.rough_token_estimate(req.message + state_summary)  # type: ignore[attr-defined]
+                    prompt_basis = req.message + state_summary + json.dumps(context_facts, ensure_ascii=False)
+                    prompt_tokens = service.rough_token_estimate(prompt_basis)  # type: ignore[attr-defined]
                     allow_llm_nlu = service.allow_llm_fallback(req.session_id, prompt_tokens)  # type: ignore[attr-defined]
                     if allow_llm_nlu and allow_llm_nlu_by_policy:
                         http_client: httpx.AsyncClient = app.state.http_client
@@ -645,6 +776,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                             session_id=req.session_id,
                             message=req.message,
                             summary=state_summary,
+                            context_facts=context_facts,
                         )
                         if llm_parse:
                             invoke_meta["llm_parse"] = llm_parse

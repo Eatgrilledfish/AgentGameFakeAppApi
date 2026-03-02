@@ -26,11 +26,13 @@ def test_extract_action_intent_and_platform() -> None:
     assert q.hard.listing_platform is not None
 
 
-def test_multi_case_generates_clarify_questions() -> None:
+def test_nlu_does_not_depend_on_case_type_for_search_clarify() -> None:
     nlu = RuleBasedNLU()
-    q = nlu.parse("我想租房", _state(), CaseType.multi)
+    q_single = nlu.parse("帮我找房", _state(), CaseType.single)
+    q_multi = nlu.parse("帮我找房", _state(), CaseType.multi)
 
-    assert len(q.clarify_questions) >= 1
+    assert q_single.clarify_questions == []
+    assert q_multi.clarify_questions == []
 
 
 def test_extract_subway_distance_without_priority_keyword() -> None:
