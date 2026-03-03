@@ -63,6 +63,27 @@ def test_chat_route_returns_houses_json_when_candidates_exist() -> None:
         assert body["timestamp"] < 10_000_000_000
 
 
+def test_chat_route_accepts_content_field_as_user_input() -> None:
+    app = create_app()
+    captured: dict = {}
+
+    class StubService:
+        async def handle(self, request):
+            captured["message"] = request.message
+            return InvokeResponse(text="ok", candidates=[], debug={"response_kind": "action"})
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-content-field", "content": "这是content字段"},
+        )
+
+    assert resp.status_code == 200
+    assert captured["message"] == "这是content字段"
+    assert resp.json()["response"]["message"] == "ok"
+
+
 def test_chat_route_returns_response_object_for_search_without_candidates() -> None:
     app = create_app()
 
@@ -152,18 +173,34 @@ def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
         async def post(self, url, json, headers):
             assert url == "http://127.0.0.1:8888/v1/chat/completions"
             assert headers["Session-ID"] == "sess-llm-nlu"
-            assert json["messages"] == [{"role": "user", "content": "帮我把第一套租掉"}]
-            assert json["tools"] == []
+            assert json["messages"][0]["role"] == "user"
+            content = json["messages"][0]["content"]
+            assert "你是租房助手" in content
+            assert "用户输入：帮我把第一套租掉" in content
+            assert "上轮推荐 HF_1001" in content
+            assert isinstance(json["tools"], list) and len(json["tools"]) > 0
+            tool_names = {item["function"]["name"] for item in json["tools"]}
+            assert "rent_house" in tool_names
+            rent_tool = next(item for item in json["tools"] if item["function"]["name"] == "rent_house")
+            assert "POST /api/houses/{house_id}/rent" in rent_tool["function"]["description"]
             assert json["stream"] is False
             return StubResponse(
                 {
                     "choices": [
                         {
                             "message": {
-                                "content": (
-                                    '{"intent":"rent","tool_plan":{"operationId":"rent_house","arguments":'
-                                    '{"house_id":"HF_1001","listing_platform":"安居客"}},"confidence":0.92}'
-                                )
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "rent_house",
+                                            "arguments": '{"house_id":"HF_1001","listing_platform":"安居客"}',
+                                        },
+                                    }
+                                ],
                             }
                         }
                     ]
@@ -182,6 +219,49 @@ def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
         assert captured["meta"]["model_ip"] == "127.0.0.1"
         assert captured["meta"]["llm_parse"]["intent"] == "rent"
         assert captured["meta"]["llm_parse"]["tool_plan"]["arguments"]["house_id"] == "HF_1001"
+
+
+def test_chat_route_llm_fallback_payload_uses_user_input_content() -> None:
+    app = create_app()
+    captured: dict = {}
+
+    class StubService:
+        def rough_token_estimate(self, text: str) -> int:
+            return 10
+
+        async def handle(self, request):
+            return InvokeResponse(text="规则回复", candidates=[], debug={"response_kind": "chat"})
+
+    class StubResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            captured.setdefault("calls", []).append(json)
+            return StubResponse({"choices": [{"message": {"content": "LLM回答"}}]})
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-fallback-content", "message": "用户原话-用于fallback"},
+        )
+
+    assert resp.status_code == 200
+    assert len(captured["calls"]) == 2
+    # 第二次调用为chat fallback，必须携带用户原话。
+    fallback_payload = captured["calls"][1]
+    assert fallback_payload["messages"] == [{"role": "user", "content": "用户原话-用于fallback"}]
+    assert isinstance(fallback_payload["tools"], list)
 
 
 def test_chat_route_sanitizes_unknown_tool_operation_from_llm() -> None:

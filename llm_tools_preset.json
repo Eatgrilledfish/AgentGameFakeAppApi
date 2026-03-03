@@ -1,0 +1,465 @@
+{
+  "version": "2026-03-03",
+  "source": "上游工具_API.json",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_landmarks",
+        "description": "GET /api/landmarks | 获取地标列表 | 获取地标列表，支持 category、district 同时筛选（取交集）。用于查地铁站、公司、商圈等地标。不需 X-User-ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "category": {
+              "type": "string",
+              "description": "in=query | 地标类别：subway(地铁)/company(公司)/landmark(商圈等)，不传则不过滤"
+            },
+            "district": {
+              "type": "string",
+              "description": "in=query | 行政区，如 海淀、朝阳"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_landmark_by_name",
+        "description": "GET /api/landmarks/name/{name} | 按名称精确查询地标 | 按名称精确查询地标，如西二旗站、百度。返回地标 id、经纬度等，用于后续 nearby 查房。不需 X-User-ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "in=path | 地标名称，如 西二旗站、国贸"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_landmarks",
+        "description": "GET /api/landmarks/search | 关键词模糊搜索地标 | 关键词模糊搜索地标，q 必填。支持 category、district 同时筛选，多条件取交集。不需 X-User-ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "q": {
+              "type": "string",
+              "description": "in=query | 搜索关键词，必填"
+            },
+            "category": {
+              "type": "string",
+              "description": "in=query | 可选，限定类别：subway/company/landmark"
+            },
+            "district": {
+              "type": "string",
+              "description": "in=query | 可选，限定行政区，如 海淀、朝阳"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "q"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_landmark_by_id",
+        "description": "GET /api/landmarks/{id} | 按地标 id 查询地标详情 | 按地标 id 查询地标详情。不需 X-User-ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "description": "in=path | 地标 ID，如 SS_001、LM_002"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_landmark_stats",
+        "description": "GET /api/landmarks/stats | 获取地标统计信息 | 获取地标统计信息（总数、按类别分布等）。不需 X-User-ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_house_by_id",
+        "description": "GET /api/houses/{house_id} | 根据房源 ID 获取详情 | 根据房源 ID 获取单套房源详情。无 query 参数，仅路径带 house_id，返回一条（安居客），便于智能体解析。调用时请求头必带 X-User-ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "house_id": {
+              "type": "string",
+              "description": "in=path | 房源 ID，如 HF_2001"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "house_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_house_listings",
+        "description": "GET /api/houses/listings/{house_id} | 根据房源 ID 获取各平台挂牌记录 | 根据房源 ID 获取该房源在链家/安居客/58同城等各平台的全部挂牌记录。无 query 参数。调用时请求头必带 X-User-ID。响应 data 为 { total, page_size, items }。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "house_id": {
+              "type": "string",
+              "description": "in=path | 房源 ID，如 HF_2001"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "house_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_houses_by_community",
+        "description": "GET /api/houses/by_community | 按小区名查询可租房源 | 按小区名查询该小区下可租房源。默认每页 10 条、未传 listing_platform 时只返回安居客。用于指代消解、查某小区地铁信息或隐性属性。调用时请求头必带 X-User-ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "community": {
+              "type": "string",
+              "description": "in=query | 小区名，与数据一致，如 建清园(南区)、保利锦上(二期)"
+            },
+            "listing_platform": {
+              "type": "string",
+              "enum": [
+                "链家",
+                "安居客",
+                "58同城"
+              ],
+              "description": "in=query | 挂牌平台，不传则默认安居客"
+            },
+            "page": {
+              "type": "integer",
+              "description": "in=query | 页码，默认 1"
+            },
+            "page_size": {
+              "type": "integer",
+              "description": "in=query | 每页条数，默认 10，最大 10000"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "community"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_houses_by_platform",
+        "description": "GET /api/houses/by_platform | 按挂牌平台筛选房源（平台可选） | 查询可租房源，支持按挂牌平台筛选。listing_platform 可选：不传则默认使用安居客；传 链家/安居客/58同城 则只返回该平台。调用时请求头必带 X-User-ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "listing_platform": {
+              "type": "string",
+              "enum": [
+                "链家",
+                "安居客",
+                "58同城"
+              ],
+              "description": "in=query | 挂牌平台，可选。不传则默认安居客；传则仅返回该平台"
+            },
+            "district": {
+              "type": "string",
+              "description": "in=query | 行政区，逗号分隔，如 海淀,朝阳"
+            },
+            "area": {
+              "type": "string",
+              "description": "in=query | 商圈，逗号分隔，如 西二旗,上地"
+            },
+            "min_price": {
+              "type": "integer",
+              "description": "in=query | 最低月租金（元）"
+            },
+            "max_price": {
+              "type": "integer",
+              "description": "in=query | 最高月租金（元）"
+            },
+            "bedrooms": {
+              "type": "string",
+              "description": "in=query | 卧室数，逗号分隔，如 1,2"
+            },
+            "rental_type": {
+              "type": "string",
+              "description": "in=query | 整租 或 合租"
+            },
+            "decoration": {
+              "type": "string",
+              "description": "in=query | 精装/简装 等"
+            },
+            "orientation": {
+              "type": "string",
+              "description": "in=query | 朝向，如 朝南、南北"
+            },
+            "elevator": {
+              "type": "string",
+              "description": "in=query | 是否有电梯：true/false"
+            },
+            "min_area": {
+              "type": "integer",
+              "description": "in=query | 最小面积（平米）"
+            },
+            "max_area": {
+              "type": "integer",
+              "description": "in=query | 最大面积（平米）"
+            },
+            "property_type": {
+              "type": "string",
+              "description": "in=query | 物业类型，如 住宅"
+            },
+            "subway_line": {
+              "type": "string",
+              "description": "in=query | 地铁线路，如 13号线"
+            },
+            "max_subway_dist": {
+              "type": "integer",
+              "description": "in=query | 最大地铁距离（米），近地铁建议 800"
+            },
+            "subway_station": {
+              "type": "string",
+              "description": "in=query | 地铁站名，如 车公庄站"
+            },
+            "utilities_type": {
+              "type": "string",
+              "description": "in=query | 水电类型，如 民水民电"
+            },
+            "available_from_before": {
+              "type": "string",
+              "description": "in=query | 可入住日期上限，YYYY-MM-DD（如 2026-03-10）"
+            },
+            "commute_to_xierqi_max": {
+              "type": "integer",
+              "description": "in=query | 到西二旗通勤时间上限（分钟）"
+            },
+            "sort_by": {
+              "type": "string",
+              "description": "in=query | 排序字段：price/area/subway"
+            },
+            "sort_order": {
+              "type": "string",
+              "description": "in=query | asc 或 desc"
+            },
+            "page": {
+              "type": "integer",
+              "description": "in=query | 页码，默认 1"
+            },
+            "page_size": {
+              "type": "integer",
+              "description": "in=query | 每页条数，默认 10，最大 10000"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_nearby_landmarks",
+        "description": "GET /api/houses/nearby_landmarks | 查询小区周边地标 | 查询某小区周边某类地标（商超/公园），按距离排序。用于回答「附近有没有商场/公园」。调用时请求头必带 X-User-ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "community": {
+              "type": "string",
+              "description": "in=query | 小区名，用于定位基准点"
+            },
+            "type": {
+              "type": "string",
+              "description": "in=query | 地标类型：shopping(商超) 或 park(公园)，不传则不过滤"
+            },
+            "max_distance_m": {
+              "type": "number",
+              "description": "in=query | 最大距离（米），默认 3000"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "community"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_houses_nearby",
+        "description": "GET /api/houses/nearby | 以地标为圆心查附近房源 | 以地标为圆心，查询在指定距离内的可租房源，返回带直线距离、步行距离、步行时间。默认每页 10 条、未传 listing_platform 时只返回安居客。需先通过地标接口获得 landmark_id。调用时请求头必带 X-User-ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "landmark_id": {
+              "type": "string",
+              "description": "in=query | 地标 ID 或地标名称（支持按名称查找）"
+            },
+            "max_distance": {
+              "type": "number",
+              "description": "in=query | 最大直线距离（米），默认 2000"
+            },
+            "listing_platform": {
+              "type": "string",
+              "enum": [
+                "链家",
+                "安居客",
+                "58同城"
+              ],
+              "description": "in=query | 挂牌平台，不传则默认安居客"
+            },
+            "page": {
+              "type": "integer",
+              "description": "in=query | 页码，默认 1"
+            },
+            "page_size": {
+              "type": "integer",
+              "description": "in=query | 每页条数，默认 10，最大 10000"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "landmark_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_house_stats",
+        "description": "GET /api/houses/stats | 获取房源统计信息 | 获取房源统计信息（总套数、按状态/行政区/户型分布、价格区间等），按当前用户视角统计。调用时请求头必带 X-User-ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "rent_house",
+        "description": "POST /api/houses/{house_id}/rent | 租房 | 将当前用户视角下该房源设为已租。传入房源 ID 与 listing_platform（必填，链家/安居客/58同城）以明确租赁哪个平台；三平台状态一并更新，响应返回该条。调用时请求头必带 X-User-ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "house_id": {
+              "type": "string",
+              "description": "in=path | 房源 ID，如 HF_2001"
+            },
+            "listing_platform": {
+              "type": "string",
+              "enum": [
+                "链家",
+                "安居客",
+                "58同城"
+              ],
+              "description": "in=query | 必填。明确租赁哪个平台；三平台状态都会更新，返回该条"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "house_id",
+            "listing_platform"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "terminate_rental",
+        "description": "POST /api/houses/{house_id}/terminate | 退租 | 将当前用户视角下该房源恢复为可租。传入房源 ID 与 listing_platform（必填）以明确操作哪个平台；三平台状态一并更新，响应返回该条。调用时请求头必带 X-User-ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "house_id": {
+              "type": "string",
+              "description": "in=path | 房源 ID，如 HF_2001"
+            },
+            "listing_platform": {
+              "type": "string",
+              "enum": [
+                "链家",
+                "安居客",
+                "58同城"
+              ],
+              "description": "in=query | 必填。明确操作哪个平台；三平台状态都会更新，返回该条"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "house_id",
+            "listing_platform"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "take_offline",
+        "description": "POST /api/houses/{house_id}/offline | 下架 | 将当前用户视角下该房源设为下架。传入房源 ID 与 listing_platform（必填）以明确操作哪个平台；三平台状态一并更新，响应返回该条。调用时请求头必带 X-User-ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "house_id": {
+              "type": "string",
+              "description": "in=path | 房源 ID，如 HF_2001"
+            },
+            "listing_platform": {
+              "type": "string",
+              "enum": [
+                "链家",
+                "安居客",
+                "58同城"
+              ],
+              "description": "in=query | 必填。明确操作哪个平台；三平台状态都会更新，返回该条"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "house_id",
+            "listing_platform"
+          ]
+        }
+      }
+    }
+  ]
+}

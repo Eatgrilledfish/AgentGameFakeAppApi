@@ -4,7 +4,7 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class CaseType(str, Enum):
@@ -205,7 +205,7 @@ class InvokeResponse(BaseModel):
 class ChatRequest(BaseModel):
     model_ip: str
     session_id: str
-    message: str
+    message: str = Field(validation_alias=AliasChoices("message", "content"))
 
 
 class ChatResponse(BaseModel):

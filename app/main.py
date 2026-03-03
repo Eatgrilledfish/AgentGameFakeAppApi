@@ -156,8 +156,9 @@ async def _forward_chat_completion(
     *,
     model_ip: str,
     messages: list[dict[str, str]],
+    tools: list[dict[str, Any]] | None = None,
     session_id: str | None = None,
-) -> str | None:
+) -> dict[str, Any]:
     headers: dict[str, str] = {}
     if session_id:
         headers["Session-ID"] = session_id
@@ -166,7 +167,7 @@ async def _forward_chat_completion(
     payload = {
         "model": "",
         "messages": user_messages,
-        "tools": [],
+        "tools": tools if tools is not None else [],
         "stream": False,
     }
     target_url = f"{_build_model_base_url(model_ip)}/v1/chat/completions"
@@ -272,11 +273,7 @@ async def _forward_chat_completion(
         ),
     )
 
-    choices = data.get("choices", [])
-    if not choices:
-        return None
-    msg = choices[0].get("message", {})
-    return msg.get("content")
+    return data
 
 
 async def _llm_post(
@@ -480,6 +477,41 @@ def _collect_param_defs(item: dict[str, Any]) -> list[dict[str, Any]]:
         }
         for name in params
     ]
+
+
+@lru_cache(maxsize=1)
+def _load_llm_tools() -> list[dict[str, Any]]:
+    tools_path = Path(__file__).resolve().parents[1] / "llm_tools_preset.json"
+    try:
+        payload = json.loads(tools_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RuntimeError(f"llm_tools_preset.json not found: {tools_path}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"llm_tools_preset.json is invalid JSON: {tools_path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"llm_tools_preset.json must be a JSON object: {tools_path}")
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        raise RuntimeError(f"llm_tools_preset.json missing tools list: {tools_path}")
+    return [item for item in tools if isinstance(item, dict)]
+
+
+@lru_cache(maxsize=1)
+def _load_operation_intents() -> dict[str, str]:
+    payload = _load_compact_tool_schema_payload()
+    operations = payload.get("operations")
+    if not isinstance(operations, list):
+        return {}
+
+    mapping: dict[str, str] = {}
+    for item in operations:
+        if not isinstance(item, dict):
+            continue
+        operation_id = item.get("operationId")
+        intent = item.get("intent")
+        if isinstance(operation_id, str) and operation_id and isinstance(intent, str) and intent:
+            mapping[operation_id] = intent
+    return mapping
 
 
 def _format_param_defs_for_prompt(param_defs: list[dict[str, Any]]) -> str:
@@ -767,10 +799,38 @@ def _build_llm_context_facts(state: Any) -> dict[str, Any]:
 
 
 def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str, Any] | None = None) -> list[dict[str, str]]:
-    _ = summary
-    _ = context_facts
-    # Eval要求转发给模型时仅使用 user 角色，content保持用户原话。
-    return [{"role": "user", "content": message}]
+    summary_text = summary[:500] if summary else ""
+    context_json = json.dumps(context_facts or {}, ensure_ascii=False)
+    available_tools = ",".join(_load_llm_tool_names())
+    content = (
+        "你是租房助手，负责在tools中选择最合适的API并抽取参数。\n"
+        "请优先通过tool_calls调用一个function，参数名必须来自该function的parameters定义。\n"
+        "严格反幻觉：不允许编造house_id、listing_platform、landmark_id、district等硬约束。\n"
+        "若用户显式给出house_id（如HF_67），必须使用该house_id，不能被上下文覆盖。\n"
+        "仅当用户未显式给house_id且出现“这套/第一套/最开始那套”时，才可使用focus_house_id或latest_search_house_ids。\n"
+        "rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\n"
+        "若是纯闲聊且无需调用工具，可直接输出JSON："
+        '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},"hard":{},"soft":{},"confidence":0.6}。\n'
+        f"可用函数operationId列表：{available_tools}\n"
+        f"会话摘要：{summary_text}\n"
+        f"上下文事实：{context_json}\n"
+        f"用户输入：{message}"
+    )
+    return [{"role": "user", "content": content}]
+
+
+@lru_cache(maxsize=1)
+def _load_llm_tool_names() -> tuple[str, ...]:
+    tools = _load_llm_tools()
+    names: list[str] = []
+    for item in tools:
+        function_node = item.get("function")
+        if not isinstance(function_node, dict):
+            continue
+        name = function_node.get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return tuple(names)
 
 
 def _normalize_messages_for_eval(messages: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -791,6 +851,81 @@ def _normalize_messages_for_eval(messages: list[dict[str, str]]) -> list[dict[st
     return [{"role": "user", "content": ""}]
 
 
+def _extract_llm_assistant_message(data: dict[str, Any]) -> dict[str, Any] | None:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    if not isinstance(first, dict):
+        return None
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return None
+    return message
+
+
+def _extract_llm_text_content(data: dict[str, Any]) -> str | None:
+    message = _extract_llm_assistant_message(data)
+    if not message:
+        return None
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    return None
+
+
+def _extract_llm_tool_plan(data: dict[str, Any]) -> dict[str, Any] | None:
+    message = _extract_llm_assistant_message(data)
+    if not message:
+        return None
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return None
+
+    first_call = tool_calls[0]
+    if not isinstance(first_call, dict):
+        return None
+    function_node = first_call.get("function")
+    if not isinstance(function_node, dict):
+        return None
+
+    operation_id = function_node.get("name")
+    if not isinstance(operation_id, str) or not operation_id:
+        return None
+
+    arguments = _parse_llm_tool_arguments(function_node.get("arguments"))
+    parsed: dict[str, Any] = {
+        "tool_plan": {
+            "operationId": operation_id,
+            "arguments": arguments,
+        },
+        "confidence": 0.9,
+    }
+    mapped_intent = _load_operation_intents().get(operation_id)
+    if isinstance(mapped_intent, str) and mapped_intent:
+        parsed["intent"] = mapped_intent
+    return parsed
+
+
+def _parse_llm_tool_arguments(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return {k: v for k, v in raw.items() if isinstance(k, str)}
+    if not isinstance(raw, str):
+        return {}
+
+    parsed = _extract_json_object(raw)
+    if isinstance(parsed, dict):
+        return parsed
+
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(value, dict):
+        return {k: v for k, v in value.items() if isinstance(k, str)}
+    return {}
+
+
 async def _analyze_intent_with_llm(
     http_client: httpx.AsyncClient,
     *,
@@ -800,25 +935,30 @@ async def _analyze_intent_with_llm(
     summary: str,
     context_facts: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    llm_text = await _forward_chat_completion(
+    response_data = await _forward_chat_completion(
         http_client,
         model_ip=model_ip,
         messages=_build_llm_nlu_messages(message, summary, context_facts=context_facts),
+        tools=_load_llm_tools(),
         session_id=session_id,
     )
-    if not llm_text:
-        return None
-    parsed = _extract_json_object(llm_text)
-    if not parsed:
-        return None
-    return _sanitize_llm_parse(parsed)
+    tool_plan = _extract_llm_tool_plan(response_data)
+    if isinstance(tool_plan, dict):
+        return _sanitize_llm_parse(tool_plan)
+
+    llm_text = _extract_llm_text_content(response_data)
+    if llm_text:
+        parsed = _extract_json_object(llm_text)
+        if parsed:
+            return _sanitize_llm_parse(parsed)
+    return None
 
 
 def create_app(settings: AgentSettings | None = None) -> FastAPI:
     cfg = settings or load_settings()
     setup_logging(cfg.log_level)
-    # Fail fast at startup if compact LLM tool schema is unavailable.
-    _load_tool_schema_summary()
+    # Fail fast at startup if tool schema is unavailable or invalid.
+    _load_llm_tools()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -1110,12 +1250,13 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                         else max(1, int(len(req.message) / 2))
                     )
                     http_client: httpx.AsyncClient = app.state.http_client
-                    llm_text = await _forward_chat_completion(
+                    llm_response = await _forward_chat_completion(
                         http_client,
                         model_ip=req.model_ip,
                         messages=llm_messages,
                         session_id=req.session_id,
                     )
+                    llm_text = _extract_llm_text_content(llm_response)
                     if llm_text:
                         output_text = llm_text
                         completion_tokens = (
