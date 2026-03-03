@@ -149,9 +149,79 @@ def test_chat_route_keeps_natural_text_for_non_search_reply() -> None:
             json={"model_ip": "127.0.0.1", "session_id": "sess-3", "message": "HF_4多少钱"},
         )
 
-        assert resp.status_code == 200
-        assert resp.json()["response"]["message"].startswith("HF_4 各平台挂牌")
-        assert "houses" not in resp.json()["response"]
+    assert resp.status_code == 200
+    assert resp.json()["response"]["message"].startswith("HF_4 各平台挂牌")
+    assert "houses" not in resp.json()["response"]
+
+
+def test_chat_route_uses_second_llm_pass_to_polish_detail_reply() -> None:
+    app = create_app()
+    captured: dict = {"calls": []}
+
+    class StubService:
+        async def handle(self, request):
+            return InvokeResponse(
+                text="HF_4：朝阳望京，2居1厅1卫，3800 元/月。离最近地铁约 620 米。当前状态：可租。",
+                candidates=[],
+                debug={"response_kind": "detail"},
+            )
+
+    class StubResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            captured["calls"].append(json)
+            content = json["messages"][0]["content"]
+            if "你是租房智能Agent决策器" in content:
+                return StubResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": (
+                                        '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},'
+                                        '"assistant_reply":"收到，我来帮你确认这套房的关键信息。","confidence":0.7}'
+                                    )
+                                }
+                            }
+                        ]
+                    }
+                )
+            assert "你是专业、可靠的租房顾问" in content
+            assert "Agent草稿回复：" in content
+            return StubResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "这套房目前可租，离最近地铁约620米，整体通勤和居住条件较均衡。"
+                            }
+                        }
+                    ]
+                }
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-detail-polish", "message": "这套离地铁多远，能租吗？"},
+        )
+
+    assert resp.status_code == 200
+    assert len(captured["calls"]) == 2
+    assert captured["calls"][1]["tools"] == []
+    assert resp.json()["response"]["message"] == "这套房目前可租，离最近地铁约620米，整体通勤和居住条件较均衡。"
 
 
 def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:

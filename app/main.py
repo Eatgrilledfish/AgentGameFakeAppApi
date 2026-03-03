@@ -976,6 +976,57 @@ async def _analyze_intent_with_llm(
     return None
 
 
+def _build_llm_detail_reply_messages(
+    *,
+    user_message: str,
+    draft_reply: str,
+    context_facts: dict[str, Any] | None = None,
+    tool_results: list[dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
+    content = (
+        "你是专业、可靠的租房顾问。请基于“已知事实”回答用户当前问题，不得编造。\n"
+        "要求：\n"
+        "1) 优先直接回答用户关心点（如地铁距离、朝向、是否可租、标签风险等）。\n"
+        "2) 如果数据缺失，明确说“当前数据未提供该信息”，不要猜测。\n"
+        "3) 输出自然、专业、简洁中文，1-3句话，不要使用JSON。\n"
+        f"用户问题：{user_message}\n"
+        f"Agent草稿回复：{draft_reply}\n"
+        f"会话偏好上下文：{json.dumps(context_facts or {}, ensure_ascii=False)}\n"
+        f"上游工具结果：{json.dumps(tool_results or [], ensure_ascii=False)}"
+    )
+    return [{"role": "user", "content": content}]
+
+
+async def _polish_detail_reply_with_llm(
+    http_client: httpx.AsyncClient,
+    *,
+    model_ip: str,
+    session_id: str,
+    user_message: str,
+    draft_reply: str,
+    context_facts: dict[str, Any] | None = None,
+    tool_results: list[dict[str, Any]] | None = None,
+) -> str | None:
+    response_data = await _forward_chat_completion(
+        http_client,
+        model_ip=model_ip,
+        messages=_build_llm_detail_reply_messages(
+            user_message=user_message,
+            draft_reply=draft_reply,
+            context_facts=context_facts,
+            tool_results=tool_results,
+        ),
+        tools=[],
+        session_id=session_id,
+    )
+    llm_text = _extract_llm_text_content(response_data)
+    if isinstance(llm_text, str):
+        cleaned = llm_text.strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
 def create_app(settings: AgentSettings | None = None) -> FastAPI:
     cfg = settings or load_settings()
     setup_logging(cfg.log_level)
@@ -1249,6 +1300,34 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             output_text = invoke_resp.text
             response_kind = str(invoke_resp.debug.get("response_kind", "chat"))
             llm_parse = invoke_meta.get("llm_parse") if isinstance(invoke_meta.get("llm_parse"), dict) else {}
+            tool_results = get_tool_results()
+            has_llm_parse = bool(llm_parse)
+            if response_kind == "detail" and has_llm_parse:
+                try:
+                    polished = await _polish_detail_reply_with_llm(
+                        app.state.http_client,
+                        model_ip=req.model_ip,
+                        session_id=req.session_id,
+                        user_message=req.message,
+                        draft_reply=invoke_resp.text,
+                        context_facts=context_facts,
+                        tool_results=tool_results,
+                    )
+                    if isinstance(polished, str) and polished.strip():
+                        output_text = polished.strip()
+                        log_event(
+                            LOGGER,
+                            "chat.llm_detail_reply.applied",
+                            step=STEP_LLM_NLU,
+                            llm_output=preview_text(output_text, limit=300),
+                        )
+                except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
+                    log_event(
+                        LOGGER,
+                        "chat.llm_detail_reply.failed",
+                        step=STEP_LLM_NLU,
+                        error=str(exc),
+                    )
             if response_kind == "search" or bool(invoke_resp.candidates):
                 response_payload: dict[str, Any] = {
                     "message": invoke_resp.text,
@@ -1282,7 +1361,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                 session_id=req.session_id,
                 response=response_payload,
                 status="success",
-                tool_results=get_tool_results(),
+                tool_results=tool_results,
                 timestamp=timestamp,
                 duration_ms=duration_ms,
             )
