@@ -37,7 +37,7 @@ STEP_LLM_NLU = "STEP-02A-LLM-NLU"
 STEP_FINAL_RESPONSE = "STEP-04-FINAL-RESPONSE"
 STEP_HTTP = "STEP-00-HTTP"
 
-LLM_TIMEOUT = httpx.Timeout(connect=1.0, read=6.0, write=2.0, pool=0.5)
+LLM_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=30.0, pool=5.0)
 LLM_RETRYABLE_EXCEPTIONS = (httpx.ConnectTimeout, httpx.ReadTimeout)
 
 
@@ -205,8 +205,32 @@ async def _forward_chat_completion(
                 payload=payload,
                 headers=headers,
             )
+            response_body = _parse_llm_http_body(resp)
+            HTTP_IO_LOGGER.info(
+                "%s",
+                preview_payload(
+                    {
+                        **get_log_context(),
+                        "event": "http.agent_io.llm.response",
+                        "method": "POST",
+                        "url": target_url,
+                        "session_id": session_id or "-",
+                        "status_code": resp.status_code,
+                        "response_content_type": getattr(resp, "headers", {}).get("content-type", "application/json"),
+                        "response_body": preview_payload(response_body, limit=8000),
+                        "duration_ms": int((time.perf_counter() - started) * 1000),
+                    },
+                    limit=8000,
+                ),
+            )
             resp.raise_for_status()
-            data = resp.json()
+            if isinstance(response_body, dict):
+                data = response_body
+            else:
+                parsed = _extract_json_object(str(response_body))
+                if not parsed:
+                    raise ValueError("LLM response body is not a valid JSON object")
+                data = parsed
             break
         except LLM_RETRYABLE_EXCEPTIONS as exc:
             if attempt == 0:
@@ -246,7 +270,6 @@ async def _forward_chat_completion(
                 ),
             )
             raise
-
     log_event(
         LOGGER,
         "chat.llm.forward.response",
@@ -254,25 +277,16 @@ async def _forward_chat_completion(
         status_code=resp.status_code,
         body_preview=preview_payload(data),
     )
-    HTTP_IO_LOGGER.info(
-        "%s",
-        preview_payload(
-            {
-                **get_log_context(),
-                "event": "http.agent_io.llm.response",
-                "method": "POST",
-                "url": target_url,
-                "session_id": session_id or "-",
-                "status_code": resp.status_code,
-                "response_content_type": getattr(resp, "headers", {}).get("content-type", "application/json"),
-                "response_body": preview_payload(data, limit=8000),
-                "duration_ms": int((time.perf_counter() - started) * 1000),
-            },
-            limit=8000,
-        ),
-    )
 
     return data
+
+
+def _parse_llm_http_body(resp: httpx.Response) -> Any:
+    try:
+        return resp.json()
+    except ValueError:
+        text_body = resp.text.strip() if isinstance(resp.text, str) else ""
+        return {"raw": text_body} if text_body else {}
 
 
 async def _llm_post(
