@@ -1,4 +1,4 @@
-````markdown
+````
 # Agent API 接口文档
 
 > 说明：选手 Agent 程序运行在本地并启动监听端口；启动后将监听端口配置到大赛平台的 Agent 配置中。
@@ -204,5 +204,3 @@ curl -X POST http://localhost:8191/api/v1/chat \
 }
 ```
 
-```
-```
