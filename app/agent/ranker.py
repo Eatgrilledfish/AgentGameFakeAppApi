@@ -9,6 +9,8 @@ from app.infra.cache import CacheManager
 from app.schemas import HouseLite, HouseViewModel, Listing, NearbyLandmark, StructuredQuery
 from app.settings import RankingWeights
 
+_TAG_MATCH_WEIGHT = 8.0
+
 
 @dataclass(slots=True)
 class RankedHouse:
@@ -199,7 +201,13 @@ class Ranker:
         base = self._coarse_score(house, query)
         listing_consistency = _listing_consistency_score(listings)
         amenities_score = _amenities_score(amenities, query)
-        return base + self.weights.listing_consistency * listing_consistency + self.weights.amenities * amenities_score
+        tag_match_score = _tag_preference_score(house, query)
+        return (
+            base
+            + self.weights.listing_consistency * listing_consistency
+            + self.weights.amenities * amenities_score
+            + _TAG_MATCH_WEIGHT * tag_match_score
+        )
 
     def _to_view_model(self, ranked: RankedHouse, query: StructuredQuery, relax_notes: list[str]) -> HouseViewModel:
         house = ranked.house
@@ -359,3 +367,98 @@ def _amenities_score(amenities: dict[str, list[NearbyLandmark]], query: Structur
     if len(preferred) == 1:
         return min(1.0, score)
     return min(1.0, score / 2)
+
+
+def _tag_preference_score(house: HouseLite, query: StructuredQuery) -> float:
+    tags = [tag.strip() for tag in (house.tags or []) if isinstance(tag, str) and tag.strip()]
+    if not tags:
+        return 0.0
+
+    def hit(*keywords: str) -> bool:
+        lowered = [k.lower() for k in keywords]
+        for tag in tags:
+            norm_tag = tag.lower()
+            if any(key in norm_tag for key in lowered):
+                return True
+        return False
+
+    score = 0.0
+    total = 0.0
+
+    def add_check(matched: bool, weight: float = 1.0) -> None:
+        nonlocal score, total
+        total += weight
+        if matched:
+            score += weight
+
+    if query.soft.elevator is True:
+        add_check(hit("有电梯", "电梯房", "电梯"))
+    elif query.soft.elevator is False:
+        add_check(hit("无电梯", "步梯", "没电梯"))
+
+    if query.soft.orientation:
+        orient = query.soft.orientation.replace("朝", "").strip()
+        add_check(hit(query.soft.orientation, orient))
+
+    if query.soft.value_for_money:
+        add_check(hit("高性价比", "性价比", "低价", "优惠", "急租"))
+
+    if query.soft.noise_preference == "安静":
+        add_check(hit("安静", "不临街", "远离主路", "低噪"))
+
+    if query.hard.utilities_type:
+        add_check(hit(query.hard.utilities_type))
+
+    if query.hard.rent_type == "合租":
+        add_check(hit("合租", "单间"))
+    elif query.hard.rent_type == "整租":
+        add_check(hit("整租"))
+
+    if query.soft.prefer_spacious:
+        add_check(hit("大户型", "宽敞", "大面积", "南北通透"))
+
+    if query.soft.prioritize_subway_distance:
+        add_check(hit("近地铁", "地铁口", "地铁沿线", "地铁"))
+
+    if query.soft.prioritize_commute:
+        add_check(hit("通勤便利", "通勤友好", "近地铁", "近公司"))
+
+    preferred_amenities = set(query.soft.amenities or [])
+    if "商超" in preferred_amenities:
+        add_check(hit("商超", "商场", "商圈", "超市"))
+    if "公园" in preferred_amenities:
+        add_check(hit("公园", "绿地", "休闲"))
+
+    preferred_tags = [tag.strip() for tag in (query.soft.preferred_tags or []) if isinstance(tag, str) and tag.strip()]
+    if preferred_tags:
+        matched = 0
+        seen: set[str] = set()
+        for preferred in preferred_tags:
+            lowered = preferred.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            if hit(preferred):
+                matched += 1
+        total += float(len(seen))
+        score += float(matched)
+
+    avoid_tags = [tag.strip() for tag in (query.soft.avoid_tags or []) if isinstance(tag, str) and tag.strip()]
+    if avoid_tags:
+        hit_count = 0
+        seen_avoid: set[str] = set()
+        for avoid in avoid_tags:
+            lowered = avoid.lower()
+            if lowered in seen_avoid:
+                continue
+            seen_avoid.add(lowered)
+            if hit(avoid):
+                hit_count += 1
+        # Avoid tags are stronger negative signals.
+        weight = 1.2
+        total += weight * float(len(seen_avoid))
+        score += weight * float(max(0, len(seen_avoid) - hit_count))
+
+    if total <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, score / total))

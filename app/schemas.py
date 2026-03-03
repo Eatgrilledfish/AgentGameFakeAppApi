@@ -58,6 +58,8 @@ class SoftPreferences(BaseModel):
     orientation: str | None = None
     noise_preference: str | None = None
     amenities: list[str] = Field(default_factory=list)
+    preferred_tags: list[str] = Field(default_factory=list)
+    avoid_tags: list[str] = Field(default_factory=list)
     value_for_money: bool | None = None
     prefer_spacious: bool = False
     prioritize_subway_distance: bool = False

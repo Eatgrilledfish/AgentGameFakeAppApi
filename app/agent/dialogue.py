@@ -1130,7 +1130,7 @@ class DialogueManager:
             if value is None:
                 continue
 
-            if key == "amenities":
+            if key in {"amenities", "preferred_tags", "avoid_tags"}:
                 if isinstance(value, list):
                     tokens = [str(item).strip() for item in value if str(item).strip()]
                 elif isinstance(value, str):
@@ -1138,7 +1138,8 @@ class DialogueManager:
                 else:
                     tokens = []
                 if tokens:
-                    soft.amenities = sorted(set(soft.amenities + tokens))
+                    current = getattr(soft, key)
+                    setattr(soft, key, sorted(set(current + tokens)))
                 continue
 
             if key in {"elevator", "value_for_money", "prioritize_subway_distance", "prefer_spacious", "prioritize_commute"}:

@@ -158,3 +158,89 @@ async def test_ranker_prioritizes_subway_distance_when_requested() -> None:
     top = await ranker.rank_two_stage(candidates, query, max_output=2)
 
     assert [item.house_id for item in top] == ["HF_NEAR", "HF_FAR"]
+
+
+@pytest.mark.asyncio
+async def test_ranker_boosts_candidates_with_tags_matching_user_preferences() -> None:
+    ranker = Ranker(houses_client=DummyHousesClient(), weights=RankingWeights(), enrich_concurrency=2)
+    query = StructuredQuery(
+        hard=HardConstraints(budget_max=7000),
+        soft=SoftPreferences(
+            elevator=True,
+            orientation="朝南",
+            value_for_money=True,
+            amenities=["公园"],
+        ),
+    )
+    candidates = [
+        HouseLite(
+            house_id="HF_MATCH",
+            rent=6200,
+            area=68,
+            district="朝阳",
+            community="A",
+            subway_distance=650,
+            commute_to_xierqi_min=36,
+            status="available",
+            layout="2居1厅1卫",
+            tags=["有电梯", "朝南", "高性价比", "近公园"],
+        ),
+        HouseLite(
+            house_id="HF_PLAIN",
+            rent=6200,
+            area=68,
+            district="朝阳",
+            community="B",
+            subway_distance=650,
+            commute_to_xierqi_min=36,
+            status="available",
+            layout="2居1厅1卫",
+            tags=["普通装修"],
+        ),
+    ]
+
+    top = await ranker.rank_two_stage(candidates, query, max_output=2)
+
+    assert [item.house_id for item in top] == ["HF_MATCH", "HF_PLAIN"]
+
+
+@pytest.mark.asyncio
+async def test_ranker_penalizes_avoid_tags_and_prioritizes_preferred_tags() -> None:
+    ranker = Ranker(houses_client=DummyHousesClient(), weights=RankingWeights(), enrich_concurrency=2)
+    query = StructuredQuery(
+        hard=HardConstraints(budget_max=7000),
+        soft=SoftPreferences(
+            preferred_tags=["采光好", "近公园"],
+            avoid_tags=["收中介费", "临街"],
+        ),
+    )
+    candidates = [
+        HouseLite(
+            house_id="HF_SAFE",
+            rent=6200,
+            area=68,
+            district="朝阳",
+            community="A",
+            subway_distance=650,
+            commute_to_xierqi_min=36,
+            status="available",
+            layout="2居1厅1卫",
+            tags=["采光好", "近公园", "房东直租"],
+        ),
+        HouseLite(
+            house_id="HF_RISKY",
+            rent=6200,
+            area=68,
+            district="朝阳",
+            community="B",
+            subway_distance=650,
+            commute_to_xierqi_min=36,
+            status="available",
+            layout="2居1厅1卫",
+            tags=["采光好", "近公园", "收中介费", "临街"],
+        ),
+    ]
+
+    top = await ranker.rank_two_stage(candidates, query, max_output=2)
+
+    assert [item.house_id for item in top] == ["HF_SAFE", "HF_RISKY"]
