@@ -101,15 +101,8 @@ class Ranker:
         if not filtered:
             return []
 
-        if query.soft.prioritize_subway_distance:
-            coarse_sorted = sorted(
-                filtered,
-                key=lambda h: (
-                    h.subway_distance if h.subway_distance is not None else 10**9,
-                    -(self._coarse_score(h, query)),
-                    h.rent if h.rent is not None else 10**9,
-                ),
-            )
+        if query.soft.prioritize_subway_distance or query.soft.prioritize_commute:
+            coarse_sorted = sorted(filtered, key=lambda h: self._priority_sort_key(h, query))
         else:
             coarse_sorted = sorted(filtered, key=lambda h: self._coarse_score(h, query), reverse=True)
         top_n = coarse_sorted[: self.listing_top_n]
@@ -129,17 +122,35 @@ class Ranker:
             key=lambda item: self._fine_score(item.house, item.listings, query, amenities=item.amenities),
             reverse=True,
         )[:max_output]
-        if query.soft.prioritize_subway_distance:
+        if query.soft.prioritize_subway_distance or query.soft.prioritize_commute:
             combined = sorted(
                 combined,
-                key=lambda item: (
-                    item.house.subway_distance if item.house.subway_distance is not None else 10**9,
-                    -(self._fine_score(item.house, item.listings, query, amenities=item.amenities)),
-                    item.house.rent if item.house.rent is not None else 10**9,
+                key=lambda item: self._priority_sort_key(
+                    item.house,
+                    query,
+                    fallback_score=self._fine_score(item.house, item.listings, query, amenities=item.amenities),
                 ),
             )
         views = [self._to_view_model(item, query, relax_notes=relax_notes) for item in combined]
         return views
+
+    def _priority_sort_key(
+        self,
+        house: HouseLite,
+        query: StructuredQuery,
+        *,
+        fallback_score: float | None = None,
+    ) -> tuple[float, float, float, float]:
+        score = fallback_score if fallback_score is not None else self._coarse_score(house, query)
+        subway = house.subway_distance if house.subway_distance is not None else 10**9
+        commute = house.commute_to_xierqi_min if house.commute_to_xierqi_min is not None else 10**9
+        rent = house.rent if house.rent is not None else 10**9
+
+        if query.soft.prioritize_commute and query.soft.prioritize_subway_distance:
+            return (commute, subway, -score, rent)
+        if query.soft.prioritize_commute:
+            return (commute, -score, subway, rent)
+        return (subway, -score, commute, rent)
 
     async def _enrich_listings(self, houses: list[HouseLite]) -> list[RankedHouse]:
         sem = asyncio.Semaphore(self.enrich_concurrency)
@@ -263,6 +274,15 @@ def _layout_area_score(house: HouseLite, query: StructuredQuery) -> float:
         score += 0.2 if _layout_matches(query.hard.layout, house.layout) else -0.15
     if query.hard.area_min is not None and house.area is not None:
         score += 0.2 if house.area >= query.hard.area_min else -0.2
+    if query.soft.prefer_spacious:
+        if house.area is None:
+            score -= 0.05
+        elif house.area >= 90:
+            score += 0.15
+        elif house.area >= 70:
+            score += 0.08
+        elif house.area < 45:
+            score -= 0.15
     return max(0.0, min(1.0, score))
 
 

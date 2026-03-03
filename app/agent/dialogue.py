@@ -50,6 +50,36 @@ _COMPLAINT_SIGNALS = (
     "噪音大",
 )
 _SEARCH_SIGNALS = ("找房", "找个房", "推荐", "筛选", "查询", "搜", "帮我找", "看看房", "有房", "房源")
+_RENT_STATUS_QUERY_SIGNALS = ("可租吗", "可以租吗", "能租吗", "能不能租", "是否可租", "能否租")
+_RENT_COMMIT_SIGNALS = ("我要租", "我想租", "帮我租", "租这套", "租这一套", "租这个", "就租", "办理租房")
+_GENERIC_SEARCH_START_SIGNALS = (
+    "想换个房子",
+    "想换房子",
+    "想找房子",
+    "帮我找找",
+    "能帮我找",
+    "可以帮我找",
+    "帮我找房子",
+)
+_DISTRICT_HINTS = ("海淀", "朝阳", "通州", "昌平", "大兴", "房山", "西城", "丰台", "顺义", "东城")
+_CONTEXT_CONTINUE_SIGNALS = ("按之前", "按刚才", "按上次", "按这些", "就按这个", "继续找", "继续推荐", "照这个条件")
+_DIRECT_REQUIREMENT_SIGNALS = (
+    "朝南",
+    "采光好",
+    "近地铁",
+    "离地铁近",
+    "通勤方便",
+    "通勤短",
+    "合租",
+    "整租",
+    "民水民电",
+    "商水商电",
+    "有电梯",
+    "安静",
+    "公园",
+    "商场",
+)
+_STICKY_SOFT_BOOL_FIELDS = {"prefer_spacious", "prioritize_subway_distance", "prioritize_commute"}
 _TOOL_OPERATION_TO_INTENT = {
     "get_houses_by_platform": IntentType.search,
     "get_houses_by_community": IntentType.search,
@@ -125,6 +155,15 @@ class DialogueManager:
                 reason="complaint_without_explicit_search_request",
             )
             merged.intent = IntentType.chat
+        if merged.intent == IntentType.rent and self._is_rent_status_query(request.message):
+            log_event(
+                LOGGER,
+                "dialogue.intent.adjusted",
+                original_intent=IntentType.rent.value,
+                adjusted_intent=IntentType.house_detail.value,
+                reason="rent_status_question_without_commitment",
+            )
+            merged.intent = IntentType.house_detail
         log_event(
             LOGGER,
             "dialogue.nlu.done",
@@ -142,11 +181,13 @@ class DialogueManager:
                 resp = await self._handle_listings_query(merged, state)
             elif merged.intent == IntentType.house_detail:
                 resp = await self._handle_house_detail(merged, state)
+            elif merged.intent == IntentType.compare:
+                resp = self._handle_compare(merged, state, request.message)
             elif merged.intent == IntentType.search and state.phase in {
                 SessionPhase.chatting,
                 SessionPhase.slot_filling,
             }:
-                follow_up = self._build_search_follow_up_questions(merged)
+                follow_up = self._build_search_follow_up_questions(merged, request.message)
                 if follow_up:
                     state.phase = SessionPhase.slot_filling
                     assistant_reply = self._extract_llm_assistant_reply(request.meta)
@@ -213,26 +254,47 @@ class DialogueManager:
             return False
         if not self._has_complaint_signal(text):
             return False
-        return self._has_actionable_preferences(query)
+        return self._has_actionable_preferences(query) or self._text_implies_preferences(text)
 
     @staticmethod
-    def _build_search_follow_up_questions(query: StructuredQuery) -> list[str]:
+    def _text_implies_preferences(text: str) -> bool:
+        inferred_hard = HardConstraints()
+        inferred_soft = SoftPreferences()
+        DialogueManager._infer_preferences_from_user_text(text, inferred_hard, inferred_soft)
+        inferred_query = StructuredQuery(hard=inferred_hard, soft=inferred_soft)
+        return DialogueManager._has_actionable_preferences(inferred_query)
+
+    @staticmethod
+    def _is_rent_status_query(text: str) -> bool:
+        asks_status = any(token in text for token in _RENT_STATUS_QUERY_SIGNALS)
+        commits_rent = any(token in text for token in _RENT_COMMIT_SIGNALS)
+        return asks_status and not commits_rent
+
+    @staticmethod
+    def _build_search_follow_up_questions(query: StructuredQuery, user_text: str) -> list[str]:
         hard = query.hard
+        current_has_constraints = DialogueManager._text_has_explicit_search_constraints(user_text) or DialogueManager._text_has_direct_house_requirements(
+            user_text
+        )
+        context_continue = DialogueManager._text_requests_context_continuation(user_text)
         has_location = any([hard.district, hard.area, hard.community, hard.landmark_name, hard.landmark_id])
         has_budget = hard.budget_max is not None or hard.budget_min is not None
-        has_strong_constraints = any(
-            [
-                hard.layout,
-                hard.area_min is not None,
-                hard.max_subway_dist is not None,
-                hard.max_distance is not None,
-                hard.max_commute_min is not None,
-                hard.rent_type,
-                hard.utilities_type,
-            ]
-        )
+        has_actionable_context = DialogueManager._has_actionable_preferences(query)
+        has_searchable_signal = has_location or has_budget or has_actionable_context
 
-        if has_location or has_budget or has_strong_constraints:
+        if not current_has_constraints and not context_continue and not has_searchable_signal:
+            return [
+                "你的预算上限大概是多少（元/月）？",
+                "你更偏向哪个区域、小区或地铁站附近？",
+            ]
+
+        if context_continue and has_actionable_context:
+            return []
+
+        if has_location or has_budget:
+            return []
+
+        if current_has_constraints and has_actionable_context:
             return []
 
         questions: list[str] = []
@@ -246,6 +308,112 @@ class DialogueManager:
             return "请补充你的找房偏好。"
         lines = [f"{idx + 1}. {q}" for idx, q in enumerate(questions)]
         return "为了给你推荐更匹配的房源，请先补充这两点：\n" + "\n".join(lines)
+
+    def _handle_compare(self, query: StructuredQuery, state: SessionState, user_text: str) -> InvokeResponse:
+        _ = query
+        if not state.last_top5:
+            return InvokeResponse(
+                text="我可以帮你做多房源对比。先告诉我找房条件，我先筛出候选后再给你比价和决策建议。",
+                clarify_questions=["先说下你的预算上限和目标区域。"],
+                debug={"response_kind": "clarify"},
+            )
+
+        requested_ids = self._extract_compare_house_ids(user_text)
+        selected = state.last_top5[:5]
+        if requested_ids:
+            picked = [row for row in state.last_top5 if row.house_id in requested_ids]
+            if picked:
+                selected = picked[:5]
+        if len(selected) < 2 and len(state.last_top5) >= 2:
+            selected = state.last_top5[: min(5, len(state.last_top5))]
+
+        if not selected:
+            return InvokeResponse(
+                text="当前没有可对比的候选房源，请先让我帮你筛选房源。",
+                clarify_questions=["你可以先说：预算、区域、户型。"],
+                debug={"response_kind": "clarify"},
+            )
+
+        recommend = selected[0]
+        state.focus_house_id = recommend.house_id
+        preferred = self._platform_from_text(recommend.listing_platform)
+        if preferred is not None:
+            state.focus_listing_platform = preferred
+
+        lines: list[str] = ["已根据当前候选做多维对比（租金/通勤/地铁/户型）："]
+        for idx, row in enumerate(selected, start=1):
+            parts: list[str] = []
+            if row.rent is not None:
+                parts.append(f"租金{row.rent}元")
+            if row.commute_to_xierqi_min is not None:
+                parts.append(f"通勤{row.commute_to_xierqi_min}分钟")
+            if row.subway_distance is not None:
+                parts.append(f"地铁{row.subway_distance}米")
+            if row.layout:
+                parts.append(row.layout)
+            if row.area is not None:
+                parts.append(f"{row.area:.0f}㎡")
+            line = f"{idx}. {row.house_id}"
+            if parts:
+                line += f"（{'，'.join(parts)}）"
+            lines.append(line)
+        lines.append(f"当前综合优先推荐：{recommend.house_id}。如果你说“这套不错，我要租这套”，我会继续办理。")
+        return InvokeResponse(
+            text="\n".join(lines),
+            candidates=selected,
+            debug={"response_kind": "compare", "referenced_house_ids": [row.house_id for row in selected]},
+        )
+
+    @staticmethod
+    def _extract_compare_house_ids(text: str) -> list[str]:
+        if not isinstance(text, str) or not text:
+            return []
+        raw_ids = _EXPLICIT_HOUSE_ID_PATTERN.findall(text)
+        if not raw_ids:
+            return []
+        unique: list[str] = []
+        seen: set[str] = set()
+        for item in raw_ids:
+            normalized = item.upper()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            unique.append(normalized)
+        return unique
+
+    @staticmethod
+    def _is_generic_search_start(text: str) -> bool:
+        return any(token in text for token in _GENERIC_SEARCH_START_SIGNALS)
+
+    @staticmethod
+    def _text_has_explicit_search_constraints(text: str) -> bool:
+        if any(token in text for token in _DISTRICT_HINTS):
+            return True
+        if any(token in text for token in ("小区", "地铁站", "附近", "商圈", "区域")):
+            return True
+        if re.search(r"\d+\s*(元|块|w|万|k|千|米|分钟|分)", text):
+            return True
+        if re.search(r"[一二两三四五六七八九1-9]\s*(居|室)", text):
+            return True
+        return False
+
+    @staticmethod
+    def _text_has_direct_house_requirements(text: str) -> bool:
+        if any(token in text for token in _DIRECT_REQUIREMENT_SIGNALS):
+            return True
+        if re.search(r"(大一点|面积大|房间大)", text):
+            return True
+        return False
+
+    @staticmethod
+    def _text_requests_context_continuation(text: str) -> bool:
+        if any(token in text for token in _CONTEXT_CONTINUE_SIGNALS):
+            return True
+        if re.search(r"按之前.*条件", text):
+            return True
+        if re.search(r"(继续|接着).*(找房|推荐|筛选)", text):
+            return True
+        return False
 
     async def _handle_search(self, query: StructuredQuery, request: InvokeRequest, state: SessionState) -> InvokeResponse:
         state.phase = SessionPhase.searching
@@ -384,9 +552,11 @@ class DialogueManager:
                 debug={"response_kind": "action"},
             )
 
-        platform = query.hard.listing_platform or state.focus_listing_platform
+        requested_platform = query.hard.listing_platform
+        listings = await self._load_listings(house_id)
+        platform = requested_platform or state.focus_listing_platform
         if platform is None:
-            platform = self._choose_preferred_platform(await self._load_listings(house_id))
+            platform = self._choose_preferred_platform(listings)
         if platform is None:
             platform = Platform.anjuke
 
@@ -400,6 +570,23 @@ class DialogueManager:
         )
 
         if query.intent == IntentType.rent:
+            selected_platform, listing_status = self._resolve_rent_platform_and_status(
+                requested_platform=requested_platform,
+                current_platform=platform,
+                listings=listings,
+            )
+            if selected_platform is not None:
+                platform = selected_platform
+            detail = await self._load_house_detail(house_id)
+            detail_status = detail.status if detail else None
+            effective_status = detail_status or listing_status
+            if not effective_status or not _is_rentable_status(effective_status):
+                state.phase = SessionPhase.presenting
+                blocked_status = effective_status or "状态未知"
+                return InvokeResponse(
+                    text=f"{house_id} 当前状态为「{blocked_status}」，暂不可直接办理租房。",
+                    debug={"response_kind": "detail", "referenced_house_ids": [house_id]},
+                )
             result = await self.houses_client.rent(house_id, platform.value)
             action = "rent"
             message = "已提交租房操作"
@@ -422,6 +609,47 @@ class DialogueManager:
             text=f"{message}：{house_id}（{platform.value}）。",
             debug={"response_kind": "action", "action_result": result, "referenced_house_ids": [house_id]},
         )
+
+    def _resolve_rent_platform_and_status(
+        self,
+        *,
+        requested_platform: Platform | None,
+        current_platform: Platform,
+        listings: list[Listing],
+    ) -> tuple[Platform | None, str | None]:
+        if not listings:
+            return current_platform, None
+
+        if requested_platform is not None:
+            requested_listing = self._find_listing_for_platform(listings, requested_platform)
+            if requested_listing and requested_listing.status:
+                return requested_platform, requested_listing.status
+            return requested_platform, None
+
+        current_listing = self._find_listing_for_platform(listings, current_platform)
+        if current_listing and current_listing.status and _is_rentable_status(current_listing.status):
+            return current_platform, current_listing.status
+
+        for item in listings:
+            if not item.status or not _is_rentable_status(item.status):
+                continue
+            platform = self._platform_from_text(item.listing_platform)
+            if platform is not None:
+                return platform, item.status
+
+        if current_listing and current_listing.status:
+            return current_platform, current_listing.status
+        for item in listings:
+            if item.status:
+                return current_platform, item.status
+        return current_platform, None
+
+    def _find_listing_for_platform(self, listings: list[Listing], platform: Platform) -> Listing | None:
+        for item in listings:
+            normalized = self._platform_from_text(item.listing_platform)
+            if normalized == platform:
+                return item
+        return None
 
     async def _load_house_detail(self, house_id: str) -> HouseLite | None:
         cached = self.cache.house_detail.get(house_id)
@@ -460,6 +688,9 @@ class DialogueManager:
                 soft.elevator is not None,
                 soft.noise_preference,
                 bool(soft.amenities),
+                soft.prefer_spacious,
+                soft.prioritize_subway_distance,
+                soft.prioritize_commute,
             ]
         )
 
@@ -476,8 +707,17 @@ class DialogueManager:
             if isinstance(value, list) and value:
                 merged = sorted(set(getattr(soft, key) + value))
                 setattr(soft, key, merged)
+            elif isinstance(value, bool) and key in _STICKY_SOFT_BOOL_FIELDS:
+                if value:
+                    setattr(soft, key, True)
             elif value is not None:
                 setattr(soft, key, value)
+
+        if DialogueManager._has_complaint_signal(user_text) and not DialogueManager._has_explicit_search_request(user_text):
+            # Complaint turns should be remembered as ranking preferences, not concrete hard filters.
+            hard.area_min = None
+            hard.max_subway_dist = None
+            hard.max_commute_min = None
 
         DialogueManager._infer_preferences_from_user_text(user_text, hard, soft)
         state.confirmed_constraints = hard
@@ -488,11 +728,15 @@ class DialogueManager:
         text = user_text or ""
         if soft.orientation is None and any(token in text for token in ("采光不好", "阴暗", "不朝阳")):
             soft.orientation = "朝南"
-        if hard.area_min is None and any(token in text for token in ("房间小", "太小", "住的不舒服", "不太舒服")):
-            hard.area_min = 60
-        if hard.max_subway_dist is None and any(token in text for token in ("通勤时间长", "通勤太长", "每天都要早起", "上班太远")):
-            hard.max_subway_dist = 800
+        small_room = any(token in text for token in ("房间小", "太小", "住的不舒服", "不太舒服")) or bool(re.search(r"房间.{0,2}小", text))
+        if small_room:
+            soft.prefer_spacious = True
+        long_commute = any(token in text for token in ("通勤时间长", "通勤太长", "每天都要早起", "上班太远")) or bool(
+            re.search(r"通勤.{0,4}(太长|很长|过长|太远|很远|远)", text)
+        )
+        if long_commute:
             soft.prioritize_subway_distance = True
+            soft.prioritize_commute = True
 
     @staticmethod
     def _extract_llm_assistant_reply(meta: dict[str, Any] | None) -> str | None:
@@ -513,10 +757,12 @@ class DialogueManager:
         prefs: list[str] = []
         if query.soft.orientation:
             prefs.append(f"朝向{query.soft.orientation}")
-        if query.hard.area_min is not None:
-            prefs.append(f"面积至少{int(query.hard.area_min)}平")
-        if query.hard.max_subway_dist is not None:
-            prefs.append(f"地铁距离不超过{query.hard.max_subway_dist}米")
+        if query.soft.prefer_spacious:
+            prefs.append("面积更大优先")
+        if query.soft.prioritize_subway_distance:
+            prefs.append("地铁距离更近优先")
+        if query.soft.prioritize_commute:
+            prefs.append("通勤更短优先")
         if query.hard.max_commute_min is not None:
             prefs.append(f"通勤不超过{query.hard.max_commute_min}分钟")
 
@@ -559,6 +805,9 @@ class DialogueManager:
             if isinstance(value, list) and value:
                 merged = sorted(set(getattr(soft, field_name) + value))
                 setattr(soft, field_name, merged)
+            elif isinstance(value, bool) and field_name in _STICKY_SOFT_BOOL_FIELDS:
+                if value:
+                    setattr(soft, field_name, True)
             elif value is not None:
                 setattr(soft, field_name, value)
 
@@ -676,7 +925,7 @@ class DialogueManager:
                     soft.amenities = sorted(set(soft.amenities + tokens))
                 continue
 
-            if key in {"elevator", "value_for_money", "prioritize_subway_distance"}:
+            if key in {"elevator", "value_for_money", "prioritize_subway_distance", "prefer_spacious", "prioritize_commute"}:
                 parsed_bool = _to_bool(value)
                 if parsed_bool is not None:
                     setattr(soft, key, parsed_bool)
@@ -865,6 +1114,12 @@ class DialogueManager:
             constraints.append(f"通勤<={state.confirmed_constraints.max_commute_min}")
         if state.soft_preferences.orientation:
             constraints.append(f"朝向偏好={state.soft_preferences.orientation}")
+        if state.soft_preferences.prefer_spacious:
+            constraints.append("偏好更大面积")
+        if state.soft_preferences.prioritize_subway_distance:
+            constraints.append("优先近地铁")
+        if state.soft_preferences.prioritize_commute:
+            constraints.append("优先短通勤")
 
         focus_parts: list[str] = []
         if state.focus_house_id:

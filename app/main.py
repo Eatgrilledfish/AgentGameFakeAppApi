@@ -706,6 +706,10 @@ def _build_llm_context_facts(state: Any) -> dict[str, Any]:
         return {}
 
     facts: dict[str, Any] = {}
+    case_type = getattr(state, "case_type", None)
+    case_type_value = getattr(case_type, "value", case_type)
+    if isinstance(case_type_value, str) and case_type_value:
+        facts["case_type"] = case_type_value
 
     focus_house_id = getattr(state, "focus_house_id", None)
     if isinstance(focus_house_id, str) and focus_house_id:
@@ -758,7 +762,9 @@ def _build_llm_context_facts(state: Any) -> dict[str, Any]:
             "noise_preference",
             "amenities",
             "value_for_money",
+            "prefer_spacious",
             "prioritize_subway_distance",
+            "prioritize_commute",
         ):
             value = soft_dict.get(key)
             if value is None:
@@ -823,14 +829,15 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
         "5) 仅当用户未显式给house_id且出现“这套/第一套/最开始那套”时，才可用上下文focus_house_id/latest_search_house_ids。\n"
         "6) 对口语抱怨要做需求反推：\n"
         "   - 采光不好/阴暗 -> 倾向orientation=朝南。\n"
-        "   - 房子太小/住着不舒服 -> 倾向增大min_area。\n"
-        "   - 通勤太长 -> 倾向max_subway_dist更小或commute_to_xierqi_max更小。\n"
+        "   - 房子太小/住着不舒服 -> 记录soft.prefer_spacious=true（排序优先，不是硬过滤）。\n"
+        "   - 通勤太长 -> 记录soft.prioritize_commute=true、soft.prioritize_subway_distance=true（排序优先，不是硬过滤）。\n"
         "7) 若用户仅在抱怨居住体验/闲聊且未明确提出“找房/推荐/筛选”，禁止tool_calls；请输出intent=chat，"
         "并在hard/soft中保留可记忆偏好，同时给出assistant_reply（友善、专业、简洁）。\n"
         "8) 只有在用户明确提出找房/推荐/筛选需求时，才调用搜索类工具。\n"
-        "9) 当用户开始找房时，应继承上下文里已记住的约束/偏好（如orientation、min_area、max_subway_dist）并写入tool arguments。\n"
-        "10) rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\n"
-        "11) 如果只是打招呼、闲聊、情绪表达且无需工具，禁止tool_calls，直接输出JSON object：\n"
+        "9) 当用户开始找房时，应继承上下文里已记住的约束/偏好（如orientation、prefer_spacious、prioritize_commute）并用于决策。\n"
+        "10) 用户要求“对比/比价/决策”且上下文已有候选房源时，优先输出intent=compare，不要重复检索。\n"
+        "11) rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\n"
+        "12) 如果只是打招呼、闲聊、情绪表达且无需工具，禁止tool_calls，直接输出JSON object：\n"
         '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},"hard":{},"soft":{},"assistant_reply":"...","confidence":0.6}\n'
         "示例：用户说“找大兴区两居，租金4000以下”，应选择get_houses_by_platform并带district/bedrooms/max_price参数。\n"
         f"可用operationId：{available_tools}\n"
@@ -1207,14 +1214,16 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
     async def chat(req: ChatRequest) -> ChatResponse:
         started = time.perf_counter()
         trace_id = uuid4().hex[:12]
+        service: AgentService = app.state.agent_service
+        existing_state = service.state_store.get(req.session_id) if hasattr(service, "state_store") else None
+        resolved_case_type = CaseType.multi if existing_state is not None else CaseType.single
         tokens = bind_log_context(
             trace_id=trace_id,
             session_id=req.session_id,
-            case_type=CaseType.single.value,
+            case_type=resolved_case_type.value,
             user_id=cfg.default_user_id,
         )
         tool_recorder_tokens = begin_tool_recording()
-        service: AgentService = app.state.agent_service
         try:
             log_event(
                 LOGGER,
@@ -1228,11 +1237,10 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             invoke_meta: dict[str, Any] = {"model_ip": req.model_ip}
             state_summary = ""
             context_facts: dict[str, Any] = {}
-            if hasattr(service, "state_store"):
-                state = service.state_store.get(req.session_id)  # type: ignore[attr-defined]
-                if state is not None and getattr(state, "conversation_summary", ""):
-                    state_summary = state.conversation_summary
-                    context_facts = _build_llm_context_facts(state)
+            state = existing_state
+            if state is not None and getattr(state, "conversation_summary", ""):
+                state_summary = state.conversation_summary
+                context_facts = _build_llm_context_facts(state)
 
             prompt_basis = req.message + state_summary + json.dumps(context_facts, ensure_ascii=False)
             nlu_prompt_tokens = (
@@ -1282,7 +1290,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             invoke_resp = await service.handle(
                 InvokeRequest(
                     session_id=req.session_id,
-                    case_type=CaseType.single,
+                    case_type=resolved_case_type,
                     message=req.message,
                     meta=invoke_meta,
                 )
@@ -1301,33 +1309,6 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             response_kind = str(invoke_resp.debug.get("response_kind", "chat"))
             llm_parse = invoke_meta.get("llm_parse") if isinstance(invoke_meta.get("llm_parse"), dict) else {}
             tool_results = get_tool_results()
-            has_llm_parse = bool(llm_parse)
-            if response_kind == "detail" and has_llm_parse:
-                try:
-                    polished = await _polish_detail_reply_with_llm(
-                        app.state.http_client,
-                        model_ip=req.model_ip,
-                        session_id=req.session_id,
-                        user_message=req.message,
-                        draft_reply=invoke_resp.text,
-                        context_facts=context_facts,
-                        tool_results=tool_results,
-                    )
-                    if isinstance(polished, str) and polished.strip():
-                        output_text = polished.strip()
-                        log_event(
-                            LOGGER,
-                            "chat.llm_detail_reply.applied",
-                            step=STEP_LLM_NLU,
-                            llm_output=preview_text(output_text, limit=300),
-                        )
-                except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
-                    log_event(
-                        LOGGER,
-                        "chat.llm_detail_reply.failed",
-                        step=STEP_LLM_NLU,
-                        error=str(exc),
-                    )
             if response_kind == "search" or bool(invoke_resp.candidates):
                 response_payload: dict[str, Any] = {
                     "message": invoke_resp.text,

@@ -108,6 +108,56 @@ def test_chat_route_accepts_content_field_as_user_input() -> None:
     assert resp.json()["response"]["message"] == "ok"
 
 
+def test_chat_route_uses_single_case_type_for_new_session() -> None:
+    app = create_app()
+    captured: dict = {}
+
+    class StubService:
+        async def handle(self, request):
+            captured["case_type"] = request.case_type.value
+            return InvokeResponse(text="ok", candidates=[], debug={"response_kind": "chat"})
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-case-type-new", "message": "你好"},
+        )
+
+    assert resp.status_code == 200
+    assert captured["case_type"] == "Single"
+
+
+def test_chat_route_uses_multi_case_type_for_existing_session() -> None:
+    app = create_app()
+    captured: dict = {}
+
+    class StubState:
+        conversation_summary = "之前聊过预算和区域"
+
+    class StubStateStore:
+        def get(self, session_id):
+            assert session_id == "sess-case-type-existing"
+            return StubState()
+
+    class StubService:
+        state_store = StubStateStore()
+
+        async def handle(self, request):
+            captured["case_type"] = request.case_type.value
+            return InvokeResponse(text="ok", candidates=[], debug={"response_kind": "chat"})
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-case-type-existing", "message": "你好"},
+        )
+
+    assert resp.status_code == 200
+    assert captured["case_type"] == "Multi"
+
+
 def test_chat_route_returns_response_object_for_search_without_candidates() -> None:
     app = create_app()
 
@@ -154,7 +204,7 @@ def test_chat_route_keeps_natural_text_for_non_search_reply() -> None:
     assert "houses" not in resp.json()["response"]
 
 
-def test_chat_route_uses_second_llm_pass_to_polish_detail_reply() -> None:
+def test_chat_route_uses_single_llm_pass_for_detail_reply() -> None:
     app = create_app()
     captured: dict = {"calls": []}
 
@@ -181,29 +231,16 @@ def test_chat_route_uses_second_llm_pass_to_polish_detail_reply() -> None:
         async def post(self, url, json, headers):
             captured["calls"].append(json)
             content = json["messages"][0]["content"]
-            if "你是租房智能Agent决策器" in content:
-                return StubResponse(
-                    {
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": (
-                                        '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},'
-                                        '"assistant_reply":"收到，我来帮你确认这套房的关键信息。","confidence":0.7}'
-                                    )
-                                }
-                            }
-                        ]
-                    }
-                )
-            assert "你是专业、可靠的租房顾问" in content
-            assert "Agent草稿回复：" in content
+            assert "你是租房智能Agent决策器" in content
             return StubResponse(
                 {
                     "choices": [
                         {
                             "message": {
-                                "content": "这套房目前可租，离最近地铁约620米，整体通勤和居住条件较均衡。"
+                                "content": (
+                                    '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},'
+                                    '"assistant_reply":"收到，我来帮你确认这套房的关键信息。","confidence":0.7}'
+                                )
                             }
                         }
                     ]
@@ -219,9 +256,8 @@ def test_chat_route_uses_second_llm_pass_to_polish_detail_reply() -> None:
         )
 
     assert resp.status_code == 200
-    assert len(captured["calls"]) == 2
-    assert captured["calls"][1]["tools"] == []
-    assert resp.json()["response"]["message"] == "这套房目前可租，离最近地铁约620米，整体通勤和居住条件较均衡。"
+    assert len(captured["calls"]) == 1
+    assert resp.json()["response"]["message"].startswith("HF_4：朝阳望京")
 
 
 def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:

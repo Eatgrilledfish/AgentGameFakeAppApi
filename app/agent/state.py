@@ -43,6 +43,10 @@ class StateStore:
     def get_or_create(self, session_id: str, user_id: str, case_type: CaseType) -> tuple[SessionState, bool]:
         existing = self.get(session_id)
         if existing:
+            if existing.case_type != case_type:
+                existing.case_type = case_type
+                existing.updated_at = datetime.now(timezone.utc)
+                self.upsert(existing)
             return existing, False
         state = SessionState(session_id=session_id, user_id=user_id, case_type=case_type)
         self.upsert(state)

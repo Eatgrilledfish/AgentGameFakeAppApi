@@ -28,7 +28,7 @@ class OutputFormatter:
         text = f"查找到以下符合您要求的房源（查询条件：{condition_text}）"
 
         if case_type == CaseType.multi:
-            text += "。如需进一步缩小到 1-2 套，可继续告诉我你的优先级。"
+            text += "。已按通勤、租金、地铁与居住条件综合排序（最多5套），如需我继续对比并给出决策建议可以直接说。"
 
         return InvokeResponse(text=text, candidates=top_houses, debug=debug or {})
 

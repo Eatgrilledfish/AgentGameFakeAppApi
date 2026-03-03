@@ -67,6 +67,13 @@ def test_detect_house_detail_intent_without_triggering_rent() -> None:
     assert q.intent.value == "house_detail"
 
 
+def test_detect_compare_intent_from_bijia_phrase() -> None:
+    nlu = RuleBasedNLU()
+    q = nlu.parse("这三套你帮我比价，哪个更合适？", _state(), CaseType.multi)
+
+    assert q.intent.value == "compare"
+
+
 def test_extract_utilities_and_typo_layout() -> None:
     nlu = RuleBasedNLU()
     q = nlu.parse("通州两局商水商电房源有没有？", _state(), CaseType.single)

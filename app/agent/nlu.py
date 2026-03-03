@@ -100,7 +100,7 @@ class RuleBasedNLU:
             word in text for word in ["附近", "周边", "有没有"]
         ):
             return IntentType.amenities
-        if any(word in text for word in ["比较", "对比"]):
+        if any(word in text for word in ["比较", "对比", "比价", "哪个好", "怎么选", "哪个更适合"]):
             return IntentType.compare
         if any(word in lowered for word in ["你好", "hello", "hi", "在吗"]) and not any(
             w in text for w in ["预算", "地铁", "通勤", "小区", "房"]

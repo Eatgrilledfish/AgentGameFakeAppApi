@@ -396,8 +396,49 @@ async def test_dialogue_explicit_house_id_overrides_llm_context_reference() -> N
         is_new_session=True,
     )
 
-    assert "已提交租房操作" in resp.text
-    assert houses.rent_calls[-1] == ("HF_67", "安居客")
+    assert "未找到房源 HF_67" in resp.text
+    assert houses.rent_calls == []
+
+
+@pytest.mark.asyncio
+async def test_dialogue_can_rent_question_checks_status_only() -> None:
+    dialogue, state, _, houses = _build_dialogue()
+
+    await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-ctx", case_type=CaseType.single, message="帮我找两居，预算4000以内"),
+        state,
+        is_new_session=True,
+    )
+    resp = await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-ctx", case_type=CaseType.single, message="这套不错，我可以租吗？"),
+        state,
+        is_new_session=False,
+    )
+
+    assert resp.debug["response_kind"] == "detail"
+    assert "当前状态：可租" in resp.text
+    assert houses.rent_calls == []
+
+
+@pytest.mark.asyncio
+async def test_dialogue_rent_requires_available_status() -> None:
+    dialogue, state, _, houses = _build_dialogue()
+
+    await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-ctx", case_type=CaseType.single, message="帮我找两居，预算4000以内"),
+        state,
+        is_new_session=True,
+    )
+    houses.details["HF_4"].status = "已租"
+    resp = await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-ctx", case_type=CaseType.single, message="这套不错，我要租这套"),
+        state,
+        is_new_session=False,
+    )
+
+    assert resp.debug["response_kind"] == "detail"
+    assert "暂不可直接办理租房" in resp.text
+    assert houses.rent_calls == []
 
 
 @pytest.mark.asyncio
@@ -433,7 +474,7 @@ async def test_dialogue_prefers_llm_tool_plan_for_search_arguments() -> None:
     assert resp.debug["response_kind"] == "search"
     assert resp.candidates[0].house_id == "HF_DX"
     assert planner.executed_queries[-1].hard.budget_max == 4000
-    assert planner.executed_queries[-1].hard.layout == "2居"
+    assert planner.executed_queries[-1].hard.layout in {"2居", "两居"}
     assert planner.executed_queries[-1].hard.utilities_type == "商水商电"
 
 
@@ -469,7 +510,7 @@ async def test_dialogue_preserves_llm_nearby_max_distance_argument() -> None:
     assert resp.debug["response_kind"] == "search"
     assert planner.executed_queries[-1].hard.landmark_id == "车公庄站"
     assert planner.executed_queries[-1].hard.max_distance == 500
-    assert planner.executed_queries[-1].hard.layout == "2居"
+    assert planner.executed_queries[-1].hard.layout in {"2居", "两居"}
 
 
 @pytest.mark.asyncio
@@ -502,8 +543,9 @@ async def test_dialogue_complaint_stores_preferences_then_search_uses_them() -> 
 
     assert chat_resp.debug["response_kind"] == "chat"
     assert planner.executed_queries == []
-    assert state.confirmed_constraints.area_min == 60
+    assert state.confirmed_constraints.area_min is None
     assert state.soft_preferences.orientation == "朝南"
+    assert state.soft_preferences.prefer_spacious is True
 
     chat_resp2 = await dialogue.handle_turn(
         InvokeRequest(
@@ -516,7 +558,9 @@ async def test_dialogue_complaint_stores_preferences_then_search_uses_them() -> 
     )
 
     assert chat_resp2.debug["response_kind"] == "chat"
-    assert state.confirmed_constraints.max_subway_dist == 800
+    assert state.confirmed_constraints.max_subway_dist is None
+    assert state.soft_preferences.prioritize_subway_distance is True
+    assert state.soft_preferences.prioritize_commute is True
 
     search_resp = await dialogue.handle_turn(
         InvokeRequest(
@@ -528,11 +572,99 @@ async def test_dialogue_complaint_stores_preferences_then_search_uses_them() -> 
         is_new_session=False,
     )
 
-    assert search_resp.debug["response_kind"] == "search"
+    assert search_resp.debug["response_kind"] == "clarify"
+    assert "预算上限" in search_resp.text
+    assert "区域、小区或地铁站" in search_resp.text
+    assert planner.executed_queries == []
+
+    search_resp2 = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="预算6000，朝阳区",
+        ),
+        state,
+        is_new_session=False,
+    )
+
+    assert search_resp2.debug["response_kind"] == "search"
     assert planner.executed_queries
-    assert planner.executed_queries[-1].hard.area_min == 60
-    assert planner.executed_queries[-1].hard.max_subway_dist == 800
+    assert planner.executed_queries[-1].hard.area_min is None
+    assert planner.executed_queries[-1].hard.max_subway_dist is None
     assert planner.executed_queries[-1].soft.orientation == "朝南"
+    assert planner.executed_queries[-1].soft.prefer_spacious is True
+    assert planner.executed_queries[-1].soft.prioritize_subway_distance is True
+    assert planner.executed_queries[-1].soft.prioritize_commute is True
+
+
+@pytest.mark.asyncio
+async def test_dialogue_direct_requirements_start_search_and_keep_context_tags() -> None:
+    planner = DummyPlanner()
+    houses = DummyHousesClient()
+    dialogue, state, planner, _ = _build_dialogue(planner=planner, houses_client=houses)
+
+    await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="现在住着不太舒服，采光不好，房间也小",
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="帮我找朝阳区两居，预算6000，离地铁近一点",
+        ),
+        state,
+        is_new_session=False,
+    )
+
+    assert resp.debug["response_kind"] == "search"
+    assert planner.executed_queries
+    assert planner.executed_queries[-1].hard.budget_max == 6000
+    assert planner.executed_queries[-1].hard.layout in {"2居", "两居"}
+    assert planner.executed_queries[-1].hard.district == "朝阳"
+    assert planner.executed_queries[-1].soft.orientation == "朝南"
+
+
+@pytest.mark.asyncio
+async def test_dialogue_context_continuation_can_start_search_with_previous_tags() -> None:
+    planner = DummyPlanner()
+    houses = DummyHousesClient()
+    dialogue, state, planner, _ = _build_dialogue(planner=planner, houses_client=houses)
+
+    await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="现在住着不太舒服，采光不好，房间也小，而且通勤时间长",
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="那就按之前的条件继续找房吧",
+        ),
+        state,
+        is_new_session=False,
+    )
+
+    assert resp.debug["response_kind"] == "search"
+    assert planner.executed_queries
+    assert planner.executed_queries[-1].hard.area_min is None
+    assert planner.executed_queries[-1].hard.max_subway_dist is None
+    assert planner.executed_queries[-1].soft.orientation == "朝南"
+    assert planner.executed_queries[-1].soft.prefer_spacious is True
+    assert planner.executed_queries[-1].soft.prioritize_subway_distance is True
+    assert planner.executed_queries[-1].soft.prioritize_commute is True
 
 
 @pytest.mark.asyncio
@@ -564,3 +696,74 @@ async def test_dialogue_treats_this_one_as_focus_not_first_rank() -> None:
 
     assert "已提交租房操作" in resp.text
     assert houses.rent_calls[-1][0] == "HF_WJ"
+
+
+@pytest.mark.asyncio
+async def test_dialogue_multi_flow_search_compare_then_rent() -> None:
+    class MultiPlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            self.executed_queries.append(query.model_copy(deep=True))
+            _ = plan
+            _ = case_type
+            return [
+                HouseLite(
+                    house_id="HF_M1",
+                    rent=6200,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="望京",
+                    subway_distance=550,
+                    commute_to_xierqi_min=42,
+                    status="可租",
+                ),
+                HouseLite(
+                    house_id="HF_M2",
+                    rent=5800,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="酒仙桥",
+                    subway_distance=900,
+                    commute_to_xierqi_min=55,
+                    status="可租",
+                ),
+                HouseLite(
+                    house_id="HF_M3",
+                    rent=6400,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="将台",
+                    subway_distance=780,
+                    commute_to_xierqi_min=50,
+                    status="可租",
+                ),
+            ]
+
+    planner = MultiPlanner()
+    houses = DummyHousesClient()
+    dialogue, state, _, houses = _build_dialogue(planner=planner, houses_client=houses)
+
+    search_resp = await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-multi", case_type=CaseType.multi, message="帮我找朝阳区两居，预算7000以内，通勤别太长"),
+        state,
+        is_new_session=True,
+    )
+    assert search_resp.debug["response_kind"] == "search"
+    assert len(search_resp.candidates) == 3
+
+    compare_resp = await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-multi", case_type=CaseType.multi, message="把这几套对比一下，给我一个决策建议"),
+        state,
+        is_new_session=False,
+    )
+    assert compare_resp.debug["response_kind"] == "compare"
+    assert compare_resp.candidates
+    best_house_id = compare_resp.candidates[0].house_id
+    assert state.focus_house_id == best_house_id
+
+    rent_resp = await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-multi", case_type=CaseType.multi, message="这套不错，我要租这套"),
+        state,
+        is_new_session=False,
+    )
+    assert "已提交租房操作" in rent_resp.text
+    assert houses.rent_calls[-1][0] == best_house_id
