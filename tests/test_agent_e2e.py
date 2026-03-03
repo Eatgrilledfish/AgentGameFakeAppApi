@@ -114,6 +114,46 @@ def test_startup_preload_landmark_catalog_primes_alias_dictionary() -> None:
     assert "subway" in cache.landmark_categories
 
 
+def test_startup_preload_landmark_calls_are_logged_into_agent_io(monkeypatch, tmp_path) -> None:
+    log_file = tmp_path / "agent_http_io.log"
+    monkeypatch.setenv("AGENT_HTTP_IO_LOG_PATH", str(log_file))
+
+    async def _stub_http_get(self, url, headers=None):
+        _ = self
+        _ = headers
+        request = httpx.Request("GET", url)
+        if url.endswith("/api/landmarks"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "items": [
+                            {"id": "LM_WJ", "name": "望京", "category": "landmark", "district": "朝阳"},
+                        ]
+                    }
+                },
+                request=request,
+            )
+        if url.endswith("/api/landmarks/stats"):
+            return httpx.Response(
+                200,
+                json={"data": {"categories": ["landmark"], "districts": ["朝阳"]}},
+                request=request,
+            )
+        return httpx.Response(404, json={"error": "not found"}, request=request)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _stub_http_get)
+
+    app = create_app()
+    with TestClient(app):
+        pass
+
+    content = log_file.read_text(encoding="utf-8")
+    assert '"event": "http.agent_io.api.request"' in content
+    assert '"url": "http://127.0.0.1:8080/api/landmarks"' in content
+    assert '"session_id": "startup_landmarks_preload"' in content
+
+
 def test_chat_route_accepts_content_field_as_user_input() -> None:
     app = create_app()
     captured: dict = {}

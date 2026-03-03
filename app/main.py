@@ -45,6 +45,7 @@ STEP_LLM_NLU = "STEP-02A-LLM-NLU"
 STEP_LLM_RESPOND = "STEP-03-LLM-RESPOND"
 STEP_FINAL_RESPONSE = "STEP-04-FINAL-RESPONSE"
 STEP_HTTP = "STEP-00-HTTP"
+STARTUP_LANDMARK_PRELOAD_SESSION_ID = "startup_landmarks_preload"
 
 LLM_TIMEOUT = httpx.Timeout(60.0)
 
@@ -1123,7 +1124,16 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         state_store = StateStore(cfg)
         landmarks_client = LandmarksClient(cfg.api_base_url, cfg.default_user_id, http_client)
         houses_client = HousesClient(cfg.api_base_url, cfg.default_user_id, http_client)
-        await _preload_landmark_catalog(cache=cache, landmarks_client=landmarks_client)
+        startup_tokens = bind_log_context(
+            trace_id="startup_landmarks",
+            session_id=STARTUP_LANDMARK_PRELOAD_SESSION_ID,
+            case_type="system",
+            user_id=cfg.default_user_id,
+        )
+        try:
+            await _preload_landmark_catalog(cache=cache, landmarks_client=landmarks_client)
+        finally:
+            reset_log_context(startup_tokens)
         service = AgentService(
             settings=cfg,
             state_store=state_store,
