@@ -129,6 +129,28 @@ def _build_model_base_url(model_ip: str) -> str:
     return f"http://{model_ip}:8888"
 
 
+def _normalize_error_payload(exc: Exception) -> dict[str, str]:
+    message = str(exc).strip()
+    if not message:
+        message = repr(exc)
+    timeout_reason: str | None = None
+    if isinstance(exc, httpx.ReadTimeout):
+        timeout_reason = f"LLM read timeout after {LLM_TIMEOUT.read}s while waiting for response data"
+    elif isinstance(exc, httpx.ConnectTimeout):
+        timeout_reason = f"LLM connect timeout after {LLM_TIMEOUT.connect}s while establishing TCP connection"
+    elif isinstance(exc, httpx.WriteTimeout):
+        timeout_reason = f"LLM write timeout after {LLM_TIMEOUT.write}s while sending request payload"
+    elif isinstance(exc, httpx.PoolTimeout):
+        timeout_reason = f"LLM pool timeout after {LLM_TIMEOUT.pool}s while acquiring HTTP connection"
+
+    if timeout_reason:
+        message = f"{timeout_reason}; raw_error={message}"
+    return {
+        "error": message,
+        "error_type": type(exc).__name__,
+    }
+
+
 async def _forward_chat_completion(
     http_client: httpx.AsyncClient,
     *,
@@ -196,8 +218,7 @@ async def _forward_chat_completion(
                         "method": "POST",
                         "url": target_url,
                         "session_id": session_id or "-",
-                        "error": str(exc),
-                        "error_type": type(exc).__name__,
+                        **_normalize_error_payload(exc),
                         "attempt": attempt + 1,
                         "duration_ms": int((time.perf_counter() - started) * 1000),
                     },
@@ -215,8 +236,7 @@ async def _forward_chat_completion(
                         "method": "POST",
                         "url": target_url,
                         "session_id": session_id or "-",
-                        "error": str(exc),
-                        "error_type": type(exc).__name__,
+                        **_normalize_error_payload(exc),
                         "duration_ms": int((time.perf_counter() - started) * 1000),
                     },
                     limit=8000,
