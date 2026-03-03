@@ -482,3 +482,13 @@ def test_init_houses_accepts_non_json_success_response() -> None:
     result = asyncio.run(run())
     assert captured["url"] == "http://fake-host:8080/api/houses/init"
     assert result == {"raw": "ok"}
+
+
+def test_stage_name_distinguishes_chat_request_and_response() -> None:
+    from app.main import _stage_name
+
+    request_stage = _stage_name({"event": "http.agent_io.request", "method": "POST", "path": "/api/v1/chat"})
+    response_stage = _stage_name({"event": "http.agent_io.response", "method": "POST", "path": "/api/v1/chat"})
+
+    assert request_stage == "agent接收用户输入"
+    assert response_stage == "agent最终返回用户"

@@ -73,6 +73,10 @@ def _stage_name(entry: dict[str, Any]) -> str:
     path = str(entry.get("path", ""))
     method = str(entry.get("method", ""))
 
+    if event == "http.agent_io.request" and method == "POST" and path == "/api/v1/chat":
+        return "agent接收用户输入"
+    if event == "http.agent_io.response" and method == "POST" and path == "/api/v1/chat":
+        return "agent最终返回用户"
     if event == "http.agent_io" and method == "POST" and path == "/api/v1/chat":
         return "agent接收用户输入 + agent最终返回用户"
     if event == "http.agent_io.llm.request":
@@ -152,6 +156,7 @@ async def _forward_chat_completion(
                     "url": target_url,
                     "session_id": session_id or "-",
                     "error": str(exc),
+                    "error_type": type(exc).__name__,
                     "duration_ms": int((time.perf_counter() - started) * 1000),
                 },
                 limit=8000,
@@ -800,17 +805,30 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
 
         if request.method in {"GET", "POST"}:
             req_content_type = request.headers.get("content-type")
-            resp_content_type = replay_response.headers.get("content-type")
             HTTP_IO_LOGGER.info(
                 "%s",
                 preview_payload(
                     {
-                        "event": "http.agent_io",
+                        "event": "http.agent_io.request",
                         "method": request.method,
                         "path": request.url.path,
                         "query": str(request.query_params),
                         "request_content_type": req_content_type or "<unknown>",
                         "request_body": _preview_http_body(raw_body, req_content_type),
+                    },
+                    limit=8000,
+                ),
+            )
+
+            resp_content_type = replay_response.headers.get("content-type")
+            HTTP_IO_LOGGER.info(
+                "%s",
+                preview_payload(
+                    {
+                        "event": "http.agent_io.response",
+                        "method": request.method,
+                        "path": request.url.path,
+                        "query": str(request.query_params),
                         "status_code": replay_response.status_code,
                         "response_content_type": resp_content_type or "<unknown>",
                         "response_body": _preview_http_body(response_body, resp_content_type),
