@@ -220,6 +220,38 @@ async def test_dialogue_handles_listing_then_rent_with_context() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dialogue_summarizes_top5_subway_distance_for_followup_question() -> None:
+    class MultiPlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            self.executed_queries.append(query.model_copy(deep=True))
+            return [
+                HouseLite(house_id="HF_A", district="朝阳", subway_distance=320, rent=6500, layout="2居1厅1卫", status="可租"),
+                HouseLite(house_id="HF_B", district="朝阳", subway_distance=780, rent=6200, layout="2居1厅1卫", status="可租"),
+                HouseLite(house_id="HF_C", district="朝阳", subway_distance=1200, rent=6000, layout="2居1厅1卫", status="可租"),
+            ]
+
+    dialogue, state, _, _ = _build_dialogue(planner=MultiPlanner())
+
+    await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-ctx", case_type=CaseType.single, message="帮我找朝阳区两居室，预算7000以内"),
+        state,
+        is_new_session=True,
+    )
+    resp = await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-ctx", case_type=CaseType.single, message="这套离地铁站多远？"),
+        state,
+        is_new_session=False,
+    )
+
+    assert resp.debug["response_kind"] == "detail"
+    assert resp.debug["detail_mode"] == "top5_subway_distance"
+    assert resp.debug["referenced_house_ids"] == ["HF_A", "HF_B", "HF_C"]
+    assert "HF_A：离地铁约 320 米" in resp.text
+    assert "HF_B：离地铁约 780 米" in resp.text
+    assert "HF_C：离地铁约 1200 米" in resp.text
+
+
+@pytest.mark.asyncio
 async def test_dialogue_asks_follow_up_on_underconstrained_search() -> None:
     planner = DummyPlanner()
     houses = DummyHousesClient()

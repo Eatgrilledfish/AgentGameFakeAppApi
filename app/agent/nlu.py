@@ -18,10 +18,32 @@ _ADMIN_DIVISION_SUFFIXES = ("区", "县", "旗", "市", "州", "盟")
 _ADMIN_DIVISION_LONG_SUFFIXES = ("新区", "开发区", "自治县", "自治州")
 _ADMIN_DIVISION_PATTERN = re.compile(r"([\u4e00-\u9fa5A-Za-z0-9]{1,20})(新区|开发区|自治县|自治州|区|县|旗|市|州|盟)")
 _ADMIN_DIVISION_STOPWORDS = {"小区", "片区", "商圈", "区域", "地区", "社区", "园区", "校区", "学区", "站区"}
+_LOCATION_PREFIXES = (
+    "帮我找",
+    "帮我",
+    "给我找",
+    "给我",
+    "我想在",
+    "我想",
+    "想在",
+    "想",
+    "我要在",
+    "我要",
+    "在",
+    "去",
+    "到",
+    "找",
+    "换到",
+    "换去",
+    "换",
+    "搬到",
+)
 _BUSINESS_AREA_PATTERN = re.compile(r"([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,20})(?:商圈|片区)")
 _STATION_PATTERN = re.compile(r"(?:在|离|到|去|靠近|近)?([\u4e00-\u9fa5A-Za-z0-9·\-]{2,16})站")
 _AREA_CUE_PATTERN = re.compile(r"(?:在|去|到|想在|希望在|换到|换去|搬到|住在)([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,20})(?:租|找|看|住|附近|一带)")
-_COMMUNITY_PATTERN = re.compile(r"(?:小区|住在|想在)([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,20})")
+_COMMUNITY_PATTERN = re.compile(
+    r"(?:小区|住在)([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,20}?)(?:小区|附近|一带|租|找|看|住|，|。|,|\.|\s|$)"
+)
 
 
 class RuleBasedNLU:
@@ -234,11 +256,19 @@ class RuleBasedNLU:
                 area_candidate = m_area.group(1).strip()
                 if area_candidate and not _contains_admin_division_token(area_candidate):
                     hard.area = area_candidate
+                    # Keep a lightweight anchor so downstream planner can resolve nearby lookup if needed.
+                    if hard.landmark_name is None:
+                        hard.landmark_name = area_candidate
 
         m_community = _COMMUNITY_PATTERN.search(text)
         if m_community:
-            candidate = m_community.group(1)
-            if not _contains_admin_division_token(candidate):
+            candidate = m_community.group(1).strip("，。,. ")
+            if (
+                candidate
+                and not _contains_admin_division_token(candidate)
+                and not re.search(r"(预算|房源|通勤|地铁|电梯)", candidate)
+                and not re.search(r"(一居|两居|三居|四居|\d+居|\d+室)", candidate)
+            ):
                 hard.community = candidate
 
     def _extract_soft_preferences(self, text: str, soft: SoftPreferences) -> None:
@@ -367,9 +397,15 @@ def _normalize_typos(text: str) -> str:
 
 def _normalize_admin_division(raw: str) -> str | None:
     cleaned = raw.strip()
+    if not cleaned:
+        return None
+    cleaned = re.sub(r"[，,。；;：:\s]+", "", cleaned)
+    cleaned = _strip_location_prefix(cleaned)
     if len(cleaned) <= 1:
         return None
     if cleaned in _ADMIN_DIVISION_STOPWORDS:
+        return None
+    if any(marker in cleaned for marker in _ADMIN_DIVISION_STOPWORDS):
         return None
     if cleaned.endswith("区") and cleaned in {"小区", "片区", "园区", "校区", "学区", "站区"}:
         return None
@@ -389,3 +425,16 @@ def _contains_admin_division_token(text: str) -> bool:
         if _normalize_admin_division(raw):
             return True
     return False
+
+
+def _strip_location_prefix(text: str) -> str:
+    stripped = text
+    changed = True
+    while changed and stripped:
+        changed = False
+        for prefix in _LOCATION_PREFIXES:
+            if stripped.startswith(prefix) and len(stripped) > len(prefix) + 1:
+                stripped = stripped[len(prefix) :]
+                changed = True
+                break
+    return stripped

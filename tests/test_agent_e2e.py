@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 import httpx
 
 from app.clients.houses import HousesClient
+from app.infra.tool_recorder import record_tool_result
 from app.main import _build_llm_context_facts, create_app
 from app.schemas import InvokeResponse
 
@@ -57,7 +58,7 @@ def test_chat_route_returns_houses_json_when_candidates_exist() -> None:
         assert resp.status_code == 200
         body = resp.json()
         assert body["session_id"] == "sess-1"
-        assert body["response"]["message"] == "给你筛选好了"
+        assert body["response"]["message"] == "为您找到以下符合条件的房源："
         assert body["response"]["houses"] == ["HF_2101"]
         assert body["status"] == "success"
     assert body["timestamp"] < 10_000_000_000
@@ -258,6 +259,90 @@ def test_chat_route_uses_single_llm_pass_for_detail_reply() -> None:
     assert resp.status_code == 200
     assert len(captured["calls"]) == 1
     assert resp.json()["response"]["message"].startswith("HF_4：朝阳望京")
+
+
+def test_chat_route_uses_two_llm_passes_for_detail_when_tool_results_exist() -> None:
+    app = create_app()
+    captured: dict = {"calls": []}
+
+    class StubService:
+        async def handle(self, request):
+            record_tool_result(
+                name="GET /api/houses/HF_4",
+                success=True,
+                output={"house_id": "HF_4", "status": "可租", "subway_distance": 620},
+                duration_ms=8,
+                method="GET",
+                url="http://mock/api/houses/HF_4",
+                status_code=200,
+            )
+            return InvokeResponse(
+                text="HF_4：朝阳望京，2居1厅1卫，3800 元/月。离最近地铁约 620 米。当前状态：可租。",
+                candidates=[],
+                debug={"response_kind": "detail"},
+            )
+
+    class StubResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            captured["calls"].append(json)
+            assert url == "http://127.0.0.1:8888/v1/chat/completions"
+            assert headers["Session-ID"] == "sess-two-llm-detail"
+            if len(captured["calls"]) == 1:
+                assert isinstance(json["tools"], list) and len(json["tools"]) > 0
+                assert "你是租房智能Agent决策器" in json["messages"][0]["content"]
+                return StubResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": (
+                                        '{"intent":"house_detail","tool_plan":{"operationId":"get_house_by_id","arguments":'
+                                        '{"house_id":"HF_4"}},"confidence":0.8}'
+                                    )
+                                }
+                            }
+                        ]
+                    }
+                )
+
+            assert json["tools"] == []
+            second_content = json["messages"][0]["content"]
+            assert "你是租房智能Agent的回复生成器" in second_content
+            assert "工具结果(JSON)" in second_content
+            return StubResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"assistant_reply":"已为你确认：HF_4 当前可租，离地铁约 620 米。"}'
+                            }
+                        }
+                    ]
+                }
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-two-llm-detail", "message": "这套离地铁多远，能租吗？"},
+        )
+
+    assert resp.status_code == 200
+    assert len(captured["calls"]) == 2
+    assert resp.json()["response"]["message"] == "已为你确认：HF_4 当前可租，离地铁约 620 米。"
 
 
 def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:

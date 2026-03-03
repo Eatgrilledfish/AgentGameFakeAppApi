@@ -14,6 +14,7 @@ from app.clients.houses import HousesClient
 from app.clients.landmarks import LandmarksClient
 from app.infra.cache import CacheManager
 from app.infra.logging import log_event, preview_text
+from app.infra.tool_recorder import record_tool_result
 from app.schemas import (
     HardConstraints,
     HouseLite,
@@ -186,7 +187,7 @@ class DialogueManager:
             elif merged.intent == IntentType.listings:
                 resp = await self._handle_listings_query(merged, state)
             elif merged.intent == IntentType.house_detail:
-                resp = await self._handle_house_detail(merged, state)
+                resp = await self._handle_house_detail(merged, state, request.message)
             elif merged.intent == IntentType.compare:
                 resp = self._handle_compare(merged, state, request.message)
             elif merged.intent == IntentType.search and state.phase in {
@@ -454,7 +455,10 @@ class DialogueManager:
             LOGGER.warning("init houses failed for session=%s", state.session_id)
             log_event(LOGGER, "dialogue.session.init.failed")
 
-    async def _handle_house_detail(self, query: StructuredQuery, state: SessionState) -> InvokeResponse:
+    async def _handle_house_detail(self, query: StructuredQuery, state: SessionState, user_text: str) -> InvokeResponse:
+        if self._should_summarize_top5_subway_distance(user_text, query, state):
+            return await self._summarize_top5_subway_distance(state)
+
         house_id = query.hard.house_id
         if not house_id:
             return InvokeResponse(
@@ -504,6 +508,68 @@ class DialogueManager:
             text="".join(details),
             debug={"response_kind": "detail", "referenced_house_ids": [house_id]},
         )
+
+    async def _summarize_top5_subway_distance(self, state: SessionState) -> InvokeResponse:
+        selected = state.last_top5[:5]
+        rows: list[dict[str, Any]] = []
+        rendered: list[str] = []
+        referenced: list[str] = []
+
+        for idx, item in enumerate(selected, start=1):
+            house_id = item.house_id
+            referenced.append(house_id)
+
+            detail = await self._load_house_detail(house_id)
+            distance = detail.subway_distance if detail and detail.subway_distance is not None else item.subway_distance
+            nearest_subway = getattr(item, "nearest_subway", None)
+            if detail and getattr(detail, "subway_distance", None) is None:
+                nearest_subway = None
+
+            rows.append(
+                {
+                    "house_id": house_id,
+                    "subway_distance": distance,
+                    "nearest_subway": nearest_subway,
+                }
+            )
+            if distance is None:
+                rendered.append(f"{idx}. {house_id}：地铁距离信息暂未提供")
+            else:
+                rendered.append(f"{idx}. {house_id}：离地铁约 {distance} 米")
+
+        if referenced:
+            state.focus_house_id = referenced[0]
+
+        record_tool_result(
+            name="SESSION_TOP5_SUBWAY_DISTANCE",
+            success=True,
+            output={"items": rows},
+            duration_ms=0,
+            method="LOCAL",
+            url="memory://session/last_top5",
+            status_code=None,
+        )
+
+        return InvokeResponse(
+            text="；".join(rendered) + "。",
+            debug={"response_kind": "detail", "referenced_house_ids": referenced, "detail_mode": "top5_subway_distance"},
+        )
+
+    @staticmethod
+    def _should_summarize_top5_subway_distance(text: str, query: StructuredQuery, state: SessionState) -> bool:
+        if not state.last_top5:
+            return False
+        if not isinstance(text, str) or not text:
+            return False
+        if not any(token in text for token in ("地铁", "站")):
+            return False
+        if not any(token in text for token in ("多远", "距离", "多少米", "几米")):
+            return False
+        if _EXPLICIT_HOUSE_ID_PATTERN.search(text):
+            return False
+        if query.hard.house_id and "这套" not in text and "这一套" not in text:
+            return False
+        return True
 
     async def _handle_listings_query(self, query: StructuredQuery, state: SessionState) -> InvokeResponse:
         house_id = query.hard.house_id

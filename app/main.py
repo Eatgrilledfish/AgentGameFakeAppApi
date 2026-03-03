@@ -41,6 +41,7 @@ STEP_RECV_USER_QUERY = "STEP-01-RECV-USER-QUERY"
 STEP_AGENT_PIPELINE = "STEP-02-AGENT-PIPELINE"
 STEP_LLM_FALLBACK = "STEP-03-LLM-FALLBACK"
 STEP_LLM_NLU = "STEP-02A-LLM-NLU"
+STEP_LLM_RESPOND = "STEP-03-LLM-RESPOND"
 STEP_FINAL_RESPONSE = "STEP-04-FINAL-RESPONSE"
 STEP_HTTP = "STEP-00-HTTP"
 
@@ -164,6 +165,8 @@ async def _forward_chat_completion(
     messages: list[dict[str, str]],
     tools: list[dict[str, Any]] | None = None,
     session_id: str | None = None,
+    step: str = STEP_LLM_FALLBACK,
+    llm_stage: str = "generic",
 ) -> dict[str, Any]:
     headers: dict[str, str] = {}
     if session_id:
@@ -181,7 +184,8 @@ async def _forward_chat_completion(
     log_event(
         LOGGER,
         "chat.llm.forward.request",
-        step=STEP_LLM_FALLBACK,
+        step=step,
+        llm_stage=llm_stage,
         model_ip=model_ip,
         payload_preview=preview_payload(payload),
     )
@@ -190,6 +194,7 @@ async def _forward_chat_completion(
         {
             **get_log_context(),
             "event": "http.agent_io.llm.request",
+            "llm_stage": llm_stage,
             "method": "POST",
             "url": target_url,
             "session_id": session_id or "-",
@@ -213,6 +218,7 @@ async def _forward_chat_completion(
             {
                 **get_log_context(),
                 "event": "http.agent_io.llm.response",
+                "llm_stage": llm_stage,
                 "method": "POST",
                 "url": target_url,
                 "session_id": session_id or "-",
@@ -236,6 +242,7 @@ async def _forward_chat_completion(
             {
                 **get_log_context(),
                 "event": "http.agent_io.llm.error",
+                "llm_stage": llm_stage,
                 "method": "POST",
                 "url": target_url,
                 "session_id": session_id or "-",
@@ -247,7 +254,8 @@ async def _forward_chat_completion(
     log_event(
         LOGGER,
         "chat.llm.forward.response",
-        step=STEP_LLM_FALLBACK,
+        step=step,
+        llm_stage=llm_stage,
         status_code=resp.status_code,
         body_preview=preview_payload(data),
     )
@@ -971,6 +979,8 @@ async def _analyze_intent_with_llm(
         messages=_build_llm_nlu_messages(message, summary, context_facts=context_facts),
         tools=_load_llm_tools(),
         session_id=session_id,
+        step=STEP_LLM_NLU,
+        llm_stage="plan",
     )
     tool_plan = _extract_llm_tool_plan(response_data)
     if isinstance(tool_plan, dict):
@@ -992,17 +1002,40 @@ def _build_llm_detail_reply_messages(
     tool_results: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
     content = (
-        "你是专业、可靠的租房顾问。请基于“已知事实”回答用户当前问题，不得编造。\n"
-        "要求：\n"
-        "1) 优先直接回答用户关心点（如地铁距离、朝向、是否可租、标签风险等）。\n"
-        "2) 如果数据缺失，明确说“当前数据未提供该信息”，不要猜测。\n"
-        "3) 输出自然、专业、简洁中文，1-3句话，不要使用JSON。\n"
-        f"用户问题：{user_message}\n"
-        f"Agent草稿回复：{draft_reply}\n"
-        f"会话偏好上下文：{json.dumps(context_facts or {}, ensure_ascii=False)}\n"
-        f"上游工具结果：{json.dumps(tool_results or [], ensure_ascii=False)}"
+        "你是租房智能Agent的回复生成器。必须严格基于工具结果作答，禁止臆测。\n"
+        "任务：根据“用户原话 + 工具结果 + Agent草稿”生成最终回复。\n"
+        "硬性要求：\n"
+        "1) 不得编造房源事实（状态、价格、距离、朝向等）。若工具结果缺失，明确说明“当前工具结果未提供该信息”。\n"
+        "2) 若是操作类结果（租房/退租/下架），要明确说明是否成功及关键对象（house_id、平台、状态）。\n"
+        "3) 语气专业、友善、简洁。\n"
+        "4) 仅输出JSON object，格式必须为：{\"assistant_reply\":\"...\"}，不要输出其他字段。\n"
+        f"用户原话：{user_message}\n"
+        f"Agent草稿：{draft_reply}\n"
+        f"会话上下文(JSON)：{json.dumps(context_facts or {}, ensure_ascii=False)}\n"
+        f"工具结果(JSON)：{json.dumps(tool_results or [], ensure_ascii=False)}"
     )
     return [{"role": "user", "content": content}]
+
+
+def _extract_llm_assistant_reply(data: dict[str, Any]) -> str | None:
+    message = _extract_llm_assistant_message(data)
+    if not message:
+        return None
+
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+
+    stripped = content.strip()
+    if not stripped:
+        return None
+
+    parsed = _extract_json_object(stripped)
+    if isinstance(parsed, dict):
+        reply = parsed.get("assistant_reply")
+        if isinstance(reply, str) and reply.strip():
+            return reply.strip()
+    return stripped
 
 
 async def _polish_detail_reply_with_llm(
@@ -1026,13 +1059,10 @@ async def _polish_detail_reply_with_llm(
         ),
         tools=[],
         session_id=session_id,
+        step=STEP_LLM_RESPOND,
+        llm_stage="respond",
     )
-    llm_text = _extract_llm_text_content(response_data)
-    if isinstance(llm_text, str):
-        cleaned = llm_text.strip()
-        if cleaned:
-            return cleaned
-    return None
+    return _extract_llm_assistant_reply(response_data)
 
 
 def create_app(settings: AgentSettings | None = None) -> FastAPI:
@@ -1310,11 +1340,61 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             response_kind = str(invoke_resp.debug.get("response_kind", "chat"))
             llm_parse = invoke_meta.get("llm_parse") if isinstance(invoke_meta.get("llm_parse"), dict) else {}
             tool_results = get_tool_results()
+            latest_state = service.state_store.get(req.session_id) if hasattr(service, "state_store") else None
+            respond_context_facts = _build_llm_context_facts(latest_state) if latest_state is not None else context_facts
             if response_kind == "search" or bool(invoke_resp.candidates):
+                houses = [item.house_id for item in invoke_resp.candidates]
                 response_payload: dict[str, Any] = {
-                    "message": invoke_resp.text,
-                    "houses": [item.house_id for item in invoke_resp.candidates],
+                    "message": "为您找到以下符合条件的房源：",
+                    "houses": houses,
                 }
+                if not houses:
+                    response_payload["message"] = invoke_resp.text
+            elif response_kind in {"detail", "action"} and tool_results:
+                respond_prompt_basis = (
+                    req.message
+                    + invoke_resp.text
+                    + json.dumps(respond_context_facts or {}, ensure_ascii=False)
+                    + json.dumps(tool_results, ensure_ascii=False)
+                )
+                respond_prompt_tokens = (
+                    service.rough_token_estimate(respond_prompt_basis)
+                    if hasattr(service, "rough_token_estimate")
+                    else max(1, int(len(respond_prompt_basis) / 2))
+                )
+                try:
+                    polished_reply = await _polish_detail_reply_with_llm(
+                        app.state.http_client,
+                        model_ip=req.model_ip,
+                        session_id=req.session_id,
+                        user_message=req.message,
+                        draft_reply=invoke_resp.text,
+                        context_facts=respond_context_facts,
+                        tool_results=tool_results,
+                    )
+                    if isinstance(polished_reply, str) and polished_reply.strip():
+                        output_text = polished_reply.strip()
+                        log_event(
+                            LOGGER,
+                            "chat.llm_respond.applied",
+                            step=STEP_LLM_RESPOND,
+                            llm_output=preview_text(output_text, limit=300),
+                        )
+                        if hasattr(service, "record_llm_fallback_usage"):
+                            completion_tokens = (
+                                service.rough_token_estimate(output_text)
+                                if hasattr(service, "rough_token_estimate")
+                                else max(1, int(len(output_text) / 2))
+                            )
+                            service.record_llm_fallback_usage(req.session_id, respond_prompt_tokens + completion_tokens)
+                except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
+                    log_event(
+                        LOGGER,
+                        "chat.llm_respond.failed",
+                        step=STEP_LLM_RESPOND,
+                        error=str(exc),
+                    )
+                response_payload = {"message": output_text}
             elif response_kind == "chat":
                 assistant_reply = llm_parse.get("assistant_reply")
                 if isinstance(assistant_reply, str) and assistant_reply.strip():
