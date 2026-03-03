@@ -4,7 +4,6 @@ import re
 
 from app.schemas import CaseType, HardConstraints, IntentType, Platform, SessionState, SoftPreferences, StructuredQuery
 
-_DISTRICTS = ["海淀", "朝阳", "通州", "昌平", "大兴", "房山", "西城", "丰台", "顺义", "东城"]
 _PLATFORMS = {
     "链家": Platform.lianjia,
     "安居客": Platform.anjuke,
@@ -15,6 +14,14 @@ _RENT_TYPE_KEYWORDS = {"合租": "合租", "单间": "合租", "整租": "整租
 _LAYOUT_PATTERN = re.compile(r"([一二两三四五六七八九1-9](?:居|室))(?:([0-9一二三四])厅)?(?:([0-9一二三四])卫)?")
 _DATE_PATTERN = re.compile(r"(20\d{2}-\d{1,2}-\d{1,2})")
 _HOUSE_ID_PATTERN = re.compile(r"([A-Z]{2,4}_?\d{1,8})", re.IGNORECASE)
+_ADMIN_DIVISION_SUFFIXES = ("区", "县", "旗", "市", "州", "盟")
+_ADMIN_DIVISION_LONG_SUFFIXES = ("新区", "开发区", "自治县", "自治州")
+_ADMIN_DIVISION_PATTERN = re.compile(r"([\u4e00-\u9fa5A-Za-z0-9]{1,20})(新区|开发区|自治县|自治州|区|县|旗|市|州|盟)")
+_ADMIN_DIVISION_STOPWORDS = {"小区", "片区", "商圈", "区域", "地区", "社区", "园区", "校区", "学区", "站区"}
+_BUSINESS_AREA_PATTERN = re.compile(r"([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,20})(?:商圈|片区)")
+_STATION_PATTERN = re.compile(r"(?:在|离|到|去|靠近|近)?([\u4e00-\u9fa5A-Za-z0-9·\-]{2,16})站")
+_AREA_CUE_PATTERN = re.compile(r"(?:在|去|到|想在|希望在|换到|换去|搬到|住在)([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,20})(?:租|找|看|住|附近|一带)")
+_COMMUNITY_PATTERN = re.compile(r"(?:小区|住在|想在)([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,20})")
 
 
 class RuleBasedNLU:
@@ -132,10 +139,20 @@ class RuleBasedNLU:
             hard.budget_max = max(values)
 
     def _extract_district(self, text: str, hard: HardConstraints) -> None:
-        for district in _DISTRICTS:
-            if district in text:
-                hard.district = district
-                return
+        best_token: str | None = None
+        best_score = -1
+        for match in _ADMIN_DIVISION_PATTERN.finditer(text):
+            raw = f"{match.group(1)}{match.group(2)}"
+            normalized = _normalize_admin_division(raw)
+            if not normalized:
+                continue
+            suffix = match.group(2)
+            score = 3 if suffix in {"区", "县", "旗"} else 2 if suffix in _ADMIN_DIVISION_LONG_SUFFIXES else 1
+            if score > best_score:
+                best_token = normalized
+                best_score = score
+        if best_token:
+            hard.district = best_token
 
     def _extract_rent_type(self, text: str, hard: HardConstraints) -> None:
         for key, value in _RENT_TYPE_KEYWORDS.items():
@@ -200,20 +217,28 @@ class RuleBasedNLU:
             hard.move_in_date = m.group(1)
 
     def _extract_landmark_or_community(self, text: str, hard: HardConstraints) -> None:
-        m_business_area = re.search(r"([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,20})(?:商圈|片区)", text)
+        m_business_area = _BUSINESS_AREA_PATTERN.search(text)
         if m_business_area:
             hard.area = m_business_area.group(1)
 
-        named_anchors = ["西二旗", "国贸", "望京", "上地", "中关村", "三里屯", "车公庄"]
-        for name in named_anchors:
-            if name in text:
-                hard.landmark_name = name
+        m_station = _STATION_PATTERN.search(text)
+        if m_station:
+            station_name = m_station.group(1).strip()
+            if station_name:
+                hard.landmark_name = station_name
                 return
 
-        m_community = re.search(r"(?:小区|住在|想在)([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,20})", text)
+        if hard.area is None:
+            m_area = _AREA_CUE_PATTERN.search(text)
+            if m_area:
+                area_candidate = m_area.group(1).strip()
+                if area_candidate and not _contains_admin_division_token(area_candidate):
+                    hard.area = area_candidate
+
+        m_community = _COMMUNITY_PATTERN.search(text)
         if m_community:
             candidate = m_community.group(1)
-            if not any(d in candidate for d in _DISTRICTS):
+            if not _contains_admin_division_token(candidate):
                 hard.community = candidate
 
     def _extract_soft_preferences(self, text: str, soft: SoftPreferences) -> None:
@@ -338,3 +363,29 @@ def _normalize_typos(text: str) -> str:
     normalized = normalized.replace("三局", "三居")
     normalized = normalized.replace("四局", "四居")
     return normalized
+
+
+def _normalize_admin_division(raw: str) -> str | None:
+    cleaned = raw.strip()
+    if len(cleaned) <= 1:
+        return None
+    if cleaned in _ADMIN_DIVISION_STOPWORDS:
+        return None
+    if cleaned.endswith("区") and cleaned in {"小区", "片区", "园区", "校区", "学区", "站区"}:
+        return None
+    if cleaned.endswith(_ADMIN_DIVISION_LONG_SUFFIXES):
+        return cleaned
+    if cleaned.endswith("区"):
+        token = cleaned[:-1]
+        return token if token else None
+    if cleaned.endswith(_ADMIN_DIVISION_SUFFIXES):
+        return cleaned
+    return None
+
+
+def _contains_admin_division_token(text: str) -> bool:
+    for match in _ADMIN_DIVISION_PATTERN.finditer(text):
+        raw = f"{match.group(1)}{match.group(2)}"
+        if _normalize_admin_division(raw):
+            return True
+    return False

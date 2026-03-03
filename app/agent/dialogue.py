@@ -11,6 +11,7 @@ from app.agent.ranker import Ranker
 from app.agent.state import StateStore
 from app.clients.exceptions import DataSourceError
 from app.clients.houses import HousesClient
+from app.clients.landmarks import LandmarksClient
 from app.infra.cache import CacheManager
 from app.infra.logging import log_event, preview_text
 from app.schemas import (
@@ -61,7 +62,7 @@ _GENERIC_SEARCH_START_SIGNALS = (
     "可以帮我找",
     "帮我找房子",
 )
-_DISTRICT_HINTS = ("海淀", "朝阳", "通州", "昌平", "大兴", "房山", "西城", "丰台", "顺义", "东城")
+_ADMIN_DIVISION_SUFFIXES = ("区", "县", "旗", "市", "州", "盟")
 _CONTEXT_CONTINUE_SIGNALS = ("按之前", "按刚才", "按上次", "按这些", "就按这个", "继续找", "继续推荐", "照这个条件")
 _DIRECT_REQUIREMENT_SIGNALS = (
     "朝南",
@@ -113,6 +114,7 @@ class DialogueManager:
         ranker: Ranker,
         formatter: OutputFormatter,
         houses_client: HousesClient,
+        landmarks_client: LandmarksClient | None = None,
         cache: CacheManager,
         max_output_candidates: int,
     ) -> None:
@@ -122,8 +124,10 @@ class DialogueManager:
         self.ranker = ranker
         self.formatter = formatter
         self.houses_client = houses_client
+        self.landmarks_client = landmarks_client
         self.cache = cache
         self.max_output_candidates = max_output_candidates
+        self._known_district_aliases: set[str] | None = None
 
     async def handle_turn(self, request: InvokeRequest, state: SessionState, is_new_session: bool) -> InvokeResponse:
         log_event(
@@ -138,6 +142,8 @@ class DialogueManager:
 
         query = self._build_query(request, state)
         merged = self._merge_query_with_state(query, state, request.message)
+        if merged.intent == IntentType.search:
+            await self._normalize_search_location_slots(merged, request.message)
         if merged.intent in {IntentType.house_detail, IntentType.listings, IntentType.rent, IntentType.terminate, IntentType.offline}:
             explicit_house_id = self._extract_explicit_house_id(request.message)
             if explicit_house_id:
@@ -387,7 +393,7 @@ class DialogueManager:
 
     @staticmethod
     def _text_has_explicit_search_constraints(text: str) -> bool:
-        if any(token in text for token in _DISTRICT_HINTS):
+        if DialogueManager._contains_admin_division_token(text):
             return True
         if any(token in text for token in ("小区", "地铁站", "附近", "商圈", "区域")):
             return True
@@ -899,11 +905,110 @@ class DialogueManager:
                 if isinstance(value, str) and value.strip():
                     hard.house_id = value.strip().upper()
                 continue
+            if key == "district":
+                if isinstance(value, str):
+                    normalized_district, normalized_area = self._normalize_district_or_area(value)
+                    if normalized_district is not None:
+                        hard.district = normalized_district
+                    if normalized_area is not None:
+                        hard.area = normalized_area
+                        if normalized_district is None:
+                            hard.district = None
+                continue
+            if key == "area":
+                if isinstance(value, str):
+                    cleaned_area = value.strip()
+                    if cleaned_area:
+                        hard.area = cleaned_area
+                continue
 
             if isinstance(value, str):
                 cleaned = value.strip()
                 if cleaned:
                     setattr(hard, key, cleaned)
+
+    @staticmethod
+    def _normalize_district_or_area(value: str) -> tuple[str | None, str | None]:
+        cleaned = value.strip()
+        if not cleaned:
+            return None, None
+
+        if DialogueManager._looks_like_admin_division(cleaned):
+            normalized = cleaned[:-1] if cleaned.endswith("区") else cleaned
+            return (normalized or cleaned), None
+        # Keep ambiguous values in district first; async normalization will refine using
+        # user text and upstream landmark districts to avoid city-specific hardcoding.
+        return cleaned, None
+
+    @staticmethod
+    def _looks_like_admin_division(value: str) -> bool:
+        cleaned = value.strip()
+        if not cleaned:
+            return False
+        if cleaned.endswith(("新区", "开发区", "自治县", "自治州")):
+            return True
+        return cleaned.endswith(_ADMIN_DIVISION_SUFFIXES)
+
+    @staticmethod
+    def _contains_admin_division_token(text: str) -> bool:
+        if not text:
+            return False
+        return bool(re.search(r"[\u4e00-\u9fa5A-Za-z0-9]{1,20}(新区|开发区|自治县|自治州|区|县|旗|市|州|盟)", text))
+
+    async def _normalize_search_location_slots(self, query: StructuredQuery, user_text: str) -> None:
+        district = query.hard.district
+        if not isinstance(district, str) or not district.strip():
+            return
+        if query.hard.area is not None:
+            return
+
+        cleaned = district.strip()
+        if self._looks_like_admin_division(cleaned):
+            query.hard.district = cleaned[:-1] if cleaned.endswith("区") else cleaned
+            return
+
+        known_districts = await self._get_known_district_aliases()
+        normalized = cleaned[:-1] if cleaned.endswith("区") else cleaned
+        if normalized in known_districts or cleaned in known_districts:
+            query.hard.district = normalized
+            return
+
+        if cleaned in user_text and not self._contains_explicit_admin_suffix_for(cleaned, user_text):
+            query.hard.area = cleaned
+            query.hard.district = None
+
+    async def _get_known_district_aliases(self) -> set[str]:
+        if self._known_district_aliases is not None:
+            return self._known_district_aliases
+
+        aliases: set[str] = set()
+        client = self.landmarks_client
+        list_fn = getattr(client, "list_landmarks", None) if client is not None else None
+        if callable(list_fn):
+            try:
+                landmarks = await list_fn()
+            except DataSourceError:
+                landmarks = []
+            for item in landmarks:
+                district = getattr(item, "district", None)
+                if not isinstance(district, str):
+                    continue
+                cleaned = district.strip()
+                if not cleaned:
+                    continue
+                aliases.add(cleaned)
+                if cleaned.endswith("区"):
+                    aliases.add(cleaned[:-1])
+
+        self._known_district_aliases = aliases
+        return aliases
+
+    @staticmethod
+    def _contains_explicit_admin_suffix_for(token: str, text: str) -> bool:
+        escaped = re.escape(token.strip())
+        if not escaped:
+            return False
+        return bool(re.search(rf"{escaped}(新区|开发区|自治县|自治州|区|县|旗|市|州|盟)", text))
 
     @staticmethod
     def _apply_soft_overrides(soft: SoftPreferences, payload: dict[str, Any]) -> None:

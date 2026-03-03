@@ -84,6 +84,14 @@ def test_extract_utilities_and_typo_layout() -> None:
     assert q.hard.utilities_type == "商水商电"
 
 
+def test_business_area_like_wangjing_goes_to_area_not_district() -> None:
+    nlu = RuleBasedNLU()
+    q = nlu.parse("我想在望京租一套两居室，预算8000以内，有电梯", _state(), CaseType.single)
+
+    assert q.hard.area == "望京"
+    assert q.hard.district is None
+
+
 def test_detect_rent_and_terminate_from_short_phrases() -> None:
     nlu = RuleBasedNLU()
     q1 = nlu.parse("就租第一套吧。", _state(), CaseType.single)

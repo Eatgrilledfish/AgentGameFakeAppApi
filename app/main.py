@@ -825,6 +825,7 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
         "1) 可用工具只允许从tools中选择，优先返回tool_calls，且一次只调用一个function。\n"
         "2) tool arguments必须严格使用该function的参数名，不得新增字段。\n"
         "3) 显式约束必须提取：区域、户型、价格、地铁距离、通勤、house_id、listing_platform。\n"
+        "   - 地点参数规则：行政区/县/市/旗（通常带区县市等后缀）填district；商圈/片区/地标名填area。\n"
         "4) 若用户显式给出house_id（如HF_67），必须使用该house_id，不能被上下文覆盖。\n"
         "5) 仅当用户未显式给house_id且出现“这套/第一套/最开始那套”时，才可用上下文focus_house_id/latest_search_house_ids。\n"
         "6) 对口语抱怨要做需求反推：\n"

@@ -479,6 +479,77 @@ async def test_dialogue_prefers_llm_tool_plan_for_search_arguments() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dialogue_maps_llm_business_area_in_district_field_to_area() -> None:
+    planner = DummyPlanner()
+    houses = DummyHousesClient()
+    dialogue, state, planner, _ = _build_dialogue(planner=planner, houses_client=houses)
+
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="我想在望京租一套两居室，预算8000以内，有电梯",
+            meta={
+                "llm_parse": {
+                    "tool_plan": {
+                        "operationId": "get_houses_by_platform",
+                        "arguments": {
+                            "district": "望京",
+                            "max_price": 8000,
+                            "bedrooms": "2",
+                            "elevator": True,
+                        },
+                    },
+                    "confidence": 0.9,
+                }
+            },
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    assert resp.debug["response_kind"] == "search"
+    assert planner.executed_queries
+    assert planner.executed_queries[-1].hard.district is None
+    assert planner.executed_queries[-1].hard.area == "望京"
+
+
+@pytest.mark.asyncio
+async def test_dialogue_keeps_admin_division_in_district_from_llm_arguments() -> None:
+    planner = DummyPlanner()
+    houses = DummyHousesClient()
+    dialogue, state, planner, _ = _build_dialogue(planner=planner, houses_client=houses)
+
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="帮我找天河区两居，预算8000",
+            meta={
+                "llm_parse": {
+                    "tool_plan": {
+                        "operationId": "get_houses_by_platform",
+                        "arguments": {
+                            "district": "天河区",
+                            "max_price": 8000,
+                            "bedrooms": "2",
+                        },
+                    },
+                    "confidence": 0.9,
+                }
+            },
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    assert resp.debug["response_kind"] == "search"
+    assert planner.executed_queries
+    assert planner.executed_queries[-1].hard.district == "天河"
+    assert planner.executed_queries[-1].hard.area is None
+
+
+@pytest.mark.asyncio
 async def test_dialogue_preserves_llm_nearby_max_distance_argument() -> None:
     planner = DummyPlanner()
     houses = DummyHousesClient()

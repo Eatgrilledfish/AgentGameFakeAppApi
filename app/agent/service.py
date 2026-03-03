@@ -57,6 +57,7 @@ class AgentService:
             ),
             formatter=OutputFormatter(),
             houses_client=houses_client,
+            landmarks_client=landmarks_client,
             cache=cache,
             max_output_candidates=settings.max_output_candidates,
         )
