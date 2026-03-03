@@ -162,10 +162,11 @@ async def _forward_chat_completion(
     if session_id:
         headers["Session-ID"] = session_id
 
+    user_messages = _normalize_messages_for_eval(messages)
     payload = {
         "model": "",
-        "messages": messages,
-        "max_tokens": 256,
+        "messages": user_messages,
+        "tools": [],
         "stream": False,
     }
     target_url = f"{_build_model_base_url(model_ip)}/v1/chat/completions"
@@ -186,6 +187,7 @@ async def _forward_chat_completion(
                 "method": "POST",
                 "url": target_url,
                 "session_id": session_id or "-",
+                "request_headers": headers,
                 "request_content_type": "application/json",
                 "request_body": preview_payload(payload, limit=8000),
             },
@@ -260,6 +262,7 @@ async def _forward_chat_completion(
                 "method": "POST",
                 "url": target_url,
                 "session_id": session_id or "-",
+                "request_headers": headers,
                 "status_code": resp.status_code,
                 "response_content_type": getattr(resp, "headers", {}).get("content-type", "application/json"),
                 "response_body": preview_payload(data, limit=8000),
@@ -764,36 +767,28 @@ def _build_llm_context_facts(state: Any) -> dict[str, Any]:
 
 
 def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str, Any] | None = None) -> list[dict[str, str]]:
-    tool_summary = _load_tool_schema_summary()
-    prompt = (
-        "你是租房Agent意图解析器。"
-        "请把输入解析为严格JSON，不要输出任何额外文字或Markdown。\n"
-        "intent可选值：chat/search/compare/amenities/house_detail/listings/rent/terminate/offline。\n"
-        "你必须基于可用API工具目录判断本轮最匹配的operationId，并抽取调用参数。\n"
-        "严格反幻觉：不允许编造 house_id、listing_platform、地标ID 或未提供的硬约束。\n"
-        "若用户文本里显式出现 house_id（如 HF_67），必须使用该 house_id，不得被上下文覆盖。\n"
-        "仅当用户未显式给出 house_id 且出现“这套/第一套/最开始那套”时，才可使用 context_facts 中的 focus_house_id 或 latest_search_house_ids。\n"
-        "若必填参数未知，不要猜测，保留为空并降低confidence。\n"
-        "只返回如下结构："
-        '{"intent":"search","tool_plan":{"operationId":"get_houses_by_platform","arguments":{}},"hard":{},"soft":{},"confidence":0.0}。\n'
-        "operationId必须从工具目录中选择；若是纯闲聊可填 none。\n"
-        "hard可含字段：district,area,community,landmark_id,landmark_name,landmark_category,budget_min,budget_max,rent_type,"
-        "layout,area_min,max_subway_dist,max_commute_min,utilities_type,move_in_date,listing_platform,house_id。\n"
-        "soft可含字段：decoration,elevator,orientation,noise_preference,amenities,value_for_money,prioritize_subway_distance。\n"
-        "tool_plan.arguments请使用API参数名（如 max_price/rental_type/listing_platform/house_id）。\n"
-        "tool_plan.arguments必须遵守argdefs中的参数类型(type)和必填(required)，不要返回未定义参数。\n"
-        "未提及字段不要猜测，可以不返回或设为null。\n"
-        f"工具目录:\n{tool_summary}"
-    )
-    user_payload = {
-        "history_summary": summary[:500] if summary else "",
-        "context_facts": context_facts or {},
-        "message": message,
-    }
-    return [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-    ]
+    _ = summary
+    _ = context_facts
+    # Eval要求转发给模型时仅使用 user 角色，content保持用户原话。
+    return [{"role": "user", "content": message}]
+
+
+def _normalize_messages_for_eval(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    if not messages:
+        return [{"role": "user", "content": ""}]
+
+    for item in reversed(messages):
+        role = str(item.get("role", "")).strip().lower()
+        content = item.get("content")
+        if role == "user" and isinstance(content, str):
+            return [{"role": "user", "content": content}]
+
+    for item in reversed(messages):
+        content = item.get("content")
+        if isinstance(content, str):
+            return [{"role": "user", "content": content}]
+
+    return [{"role": "user", "content": ""}]
 
 
 async def _analyze_intent_with_llm(

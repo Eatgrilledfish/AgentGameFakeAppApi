@@ -152,8 +152,9 @@ def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
         async def post(self, url, json, headers):
             assert url == "http://127.0.0.1:8888/v1/chat/completions"
             assert headers["Session-ID"] == "sess-llm-nlu"
-            assert "意图解析器" in json["messages"][0]["content"]
-            assert "operationId" in json["messages"][0]["content"]
+            assert json["messages"] == [{"role": "user", "content": "帮我把第一套租掉"}]
+            assert json["tools"] == []
+            assert json["stream"] is False
             return StubResponse(
                 {
                     "choices": [
