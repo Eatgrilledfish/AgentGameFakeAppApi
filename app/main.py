@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import httpx
 from fastapi import Body, FastAPI, Header, HTTPException, Request
+from fastapi.responses import Response
 
 from app.agent.service import AgentService
 from app.agent.state import StateStore
@@ -23,6 +24,7 @@ from app.schemas import CaseType, ChatRequest, ChatResponse, HealthResponse, Inv
 from app.settings import AgentSettings, load_settings
 
 LOGGER = logging.getLogger(__name__)
+HTTP_IO_LOGGER = logging.getLogger("agent.http.io")
 
 STEP_RECV_USER_QUERY = "STEP-01-RECV-USER-QUERY"
 STEP_AGENT_PIPELINE = "STEP-02-AGENT-PIPELINE"
@@ -30,6 +32,18 @@ STEP_LLM_FALLBACK = "STEP-03-LLM-FALLBACK"
 STEP_LLM_NLU = "STEP-02A-LLM-NLU"
 STEP_FINAL_RESPONSE = "STEP-04-FINAL-RESPONSE"
 STEP_HTTP = "STEP-00-HTTP"
+
+
+def _preview_http_body(raw_body: bytes, content_type: str | None, limit: int = 2000) -> str:
+    if not raw_body:
+        return "<empty>"
+
+    text = raw_body.decode("utf-8", errors="replace")
+    if content_type and "application/json" in content_type.lower():
+        parsed = _extract_json_object(text)
+        if parsed is not None:
+            return preview_payload(parsed, limit=limit)
+    return preview_text(text, limit=limit)
 
 def _build_model_base_url(model_ip: str) -> str:
     if model_ip.startswith(("http://", "https://")):
@@ -53,6 +67,8 @@ async def _forward_chat_completion(
         "messages": messages,
         "stream": False,
     }
+    target_url = f"{_build_model_base_url(model_ip)}/v1/chat/completions"
+    started = time.perf_counter()
     log_event(
         LOGGER,
         "chat.llm.forward.request",
@@ -60,14 +76,46 @@ async def _forward_chat_completion(
         model_ip=model_ip,
         payload_preview=preview_payload(payload),
     )
-
-    resp = await http_client.post(
-        f"{_build_model_base_url(model_ip)}/v1/chat/completions",
-        json=payload,
-        headers=headers,
+    HTTP_IO_LOGGER.info(
+        "%s",
+        preview_payload(
+            {
+                "event": "http.agent_io.llm.request",
+                "method": "POST",
+                "url": target_url,
+                "session_id": session_id or "-",
+                "request_content_type": "application/json",
+                "request_body": preview_payload(payload, limit=8000),
+            },
+            limit=8000,
+        ),
     )
-    resp.raise_for_status()
-    data = resp.json()
+
+    try:
+        resp = await http_client.post(
+            target_url,
+            json=payload,
+            headers=headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        HTTP_IO_LOGGER.info(
+            "%s",
+            preview_payload(
+                {
+                    "event": "http.agent_io.llm.error",
+                    "method": "POST",
+                    "url": target_url,
+                    "session_id": session_id or "-",
+                    "error": str(exc),
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                },
+                limit=8000,
+            ),
+        )
+        raise
+
     log_event(
         LOGGER,
         "chat.llm.forward.response",
@@ -75,6 +123,23 @@ async def _forward_chat_completion(
         status_code=resp.status_code,
         body_preview=preview_payload(data),
     )
+    HTTP_IO_LOGGER.info(
+        "%s",
+        preview_payload(
+            {
+                "event": "http.agent_io.llm.response",
+                "method": "POST",
+                "url": target_url,
+                "session_id": session_id or "-",
+                "status_code": resp.status_code,
+                "response_content_type": getattr(resp, "headers", {}).get("content-type", "application/json"),
+                "response_body": preview_payload(data, limit=8000),
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            },
+            limit=8000,
+        ),
+    )
+
     choices = data.get("choices", [])
     if not choices:
         return None
@@ -668,6 +733,17 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         )
 
         response = await call_next(request)
+        response_body = b""
+        async for chunk in response.body_iterator:
+            response_body += chunk
+
+        replay_response = Response(
+            content=response_body,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            media_type=response.media_type,
+            background=response.background,
+        )
         duration_ms = int((time.perf_counter() - started) * 1000)
         log_event(
             LOGGER,
@@ -678,7 +754,29 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             status_code=response.status_code,
             duration_ms=duration_ms,
         )
-        return response
+
+        if request.method in {"GET", "POST"}:
+            req_content_type = request.headers.get("content-type")
+            resp_content_type = replay_response.headers.get("content-type")
+            HTTP_IO_LOGGER.info(
+                "%s",
+                preview_payload(
+                    {
+                        "event": "http.agent_io",
+                        "method": request.method,
+                        "path": request.url.path,
+                        "query": str(request.query_params),
+                        "request_content_type": req_content_type or "<unknown>",
+                        "request_body": _preview_http_body(raw_body, req_content_type),
+                        "status_code": replay_response.status_code,
+                        "response_content_type": resp_content_type or "<unknown>",
+                        "response_body": _preview_http_body(response_body, resp_content_type),
+                        "duration_ms": duration_ms,
+                    },
+                    limit=8000,
+                ),
+            )
+        return replay_response
 
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
