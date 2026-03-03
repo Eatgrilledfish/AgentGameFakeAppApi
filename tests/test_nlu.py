@@ -84,6 +84,13 @@ def test_extract_utilities_and_typo_layout() -> None:
     assert q.hard.utilities_type == "商水商电"
 
 
+def test_extract_decoration_normalizes_jingzhuangxiu_to_jingzhuang() -> None:
+    nlu = RuleBasedNLU()
+    q = nlu.parse("我想找精装修的两居", _state(), CaseType.single)
+
+    assert q.soft.decoration == "精装"
+
+
 def test_business_area_like_wangjing_goes_to_area_not_district() -> None:
     nlu = RuleBasedNLU()
     q = nlu.parse("我想在望京租一套两居室，预算8000以内，有电梯", _state(), CaseType.single)

@@ -410,6 +410,34 @@ async def test_dialogue_prefers_llm_tool_plan_for_action() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dialogue_normalizes_llm_decoration_to_upstream_allowed_value() -> None:
+    planner = DummyPlanner()
+    dialogue, state, planner, _ = _build_dialogue(planner=planner)
+
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="帮我找精装修的两居",
+            meta={
+                "llm_parse": {
+                    "intent": "search",
+                    "soft": {"decoration": "精装修"},
+                    "hard": {"layout": "2居"},
+                    "confidence": 0.9,
+                }
+            },
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    assert resp.debug["response_kind"] == "search"
+    assert planner.executed_queries
+    assert planner.executed_queries[-1].soft.decoration == "精装"
+
+
+@pytest.mark.asyncio
 async def test_dialogue_explicit_house_id_overrides_llm_context_reference() -> None:
     dialogue, state, _, houses = _build_dialogue()
 

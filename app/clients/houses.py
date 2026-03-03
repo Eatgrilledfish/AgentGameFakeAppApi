@@ -23,6 +23,19 @@ def _build_page(data: Any) -> dict[str, Any]:
     return {"items": [], "total": 0, "page_size": 10}
 
 
+def _normalize_decoration_param(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if cleaned in {"精装", "精装修"}:
+        return "精装"
+    if cleaned in {"简装", "简装修"}:
+        return "简装"
+    return None
+
+
 class HousesClient(BaseClient):
     def __init__(self, base_url: str, user_id: str, http_client: httpx.AsyncClient) -> None:
         super().__init__(base_url, user_id, http_client)
@@ -95,7 +108,7 @@ class HousesClient(BaseClient):
             "max_price": max_price,
             "bedrooms": bedrooms,
             "rental_type": rental_type,
-            "decoration": decoration,
+            "decoration": _normalize_decoration_param(decoration),
             "orientation": orientation,
             "elevator": elevator,
             "min_area": min_area,

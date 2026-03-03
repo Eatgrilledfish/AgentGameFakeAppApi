@@ -1108,6 +1108,11 @@ class DialogueManager:
                 if value:
                     setattr(soft, field_name, True)
             elif value is not None:
+                if field_name == "decoration" and isinstance(value, str):
+                    normalized_decoration = _normalize_decoration_value(value)
+                    if normalized_decoration is not None:
+                        setattr(soft, field_name, normalized_decoration)
+                        continue
                 setattr(soft, field_name, value)
 
         query.hard = hard
@@ -1377,6 +1382,11 @@ class DialogueManager:
             if isinstance(value, str):
                 cleaned = value.strip()
                 if cleaned:
+                    if key == "decoration":
+                        normalized_decoration = _normalize_decoration_value(cleaned)
+                        if normalized_decoration is not None:
+                            soft.decoration = normalized_decoration
+                        continue
                     setattr(soft, key, cleaned)
 
     def _resolve_house_id(self, user_text: str, query: StructuredQuery, state: SessionState) -> str | None:
@@ -1661,4 +1671,15 @@ def _to_bool(value: Any) -> bool | None:
             return True
         if normalized in {"false", "0", "no", "n", "否"}:
             return False
+    return None
+
+
+def _normalize_decoration_value(value: str) -> str | None:
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if cleaned in {"精装", "精装修"}:
+        return "精装"
+    if cleaned in {"简装", "简装修"}:
+        return "简装"
     return None

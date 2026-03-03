@@ -66,6 +66,33 @@ async def test_house_area_string_can_be_parsed_to_float() -> None:
 
 
 @pytest.mark.asyncio
+async def test_by_platform_normalizes_decoration_to_upstream_allowed_values() -> None:
+    seen: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.params.get("decoration"))
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "items": [],
+                    "total": 0,
+                    "page_size": 10,
+                }
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = HousesClient("http://test", "u-123", http_client)
+        await client.by_platform(decoration="精装修", page=1, page_size=10)
+        await client.by_platform(decoration="豪华", page=1, page_size=10)
+
+    assert seen[0] == "精装"
+    assert seen[1] is None
+
+
+@pytest.mark.asyncio
 async def test_rent_post_uses_query_param_without_json_body() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"

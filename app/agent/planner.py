@@ -160,7 +160,7 @@ class Planner:
                 bedrooms=_layout_to_bedrooms(query.hard.layout),
                 min_area=int(query.hard.area_min) if query.hard.area_min is not None else None,
                 orientation=query.soft.orientation,
-                decoration=query.soft.decoration,
+                decoration=_normalize_decoration_param(query.soft.decoration),
                 elevator=_to_elevator_param(query.soft.elevator),
                 commute_to_xierqi_max=query.hard.max_commute_min,
                 utilities_type=query.hard.utilities_type,
@@ -295,6 +295,22 @@ def _landmark_fuzzy_keywords(*, original_landmark: str, landmark_name: str | Non
         seen.add(item)
         keywords.append(item)
     return keywords
+
+
+def _normalize_decoration_param(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    normalized_map = {
+        "精装修": "精装",
+        "精装": "精装",
+        "简装修": "简装",
+        "简装": "简装",
+    }
+    return normalized_map.get(cleaned)
 
 
 def _has_landmark_id(item: Any) -> bool:

@@ -292,9 +292,14 @@ class RuleBasedNLU:
                 hard.community = candidate
 
     def _extract_soft_preferences(self, text: str, soft: SoftPreferences) -> None:
-        for deco in ["豪华", "精装", "简装", "毛坯", "空房"]:
+        for deco in ["豪华", "精装修", "精装", "简装修", "简装", "毛坯", "空房"]:
             if deco in text:
-                soft.decoration = deco
+                if deco in {"精装修", "精装"}:
+                    soft.decoration = "精装"
+                elif deco in {"简装修", "简装"}:
+                    soft.decoration = "简装"
+                else:
+                    soft.decoration = deco
                 break
 
         if "电梯" in text:
