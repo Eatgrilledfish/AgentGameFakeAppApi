@@ -21,6 +21,7 @@ async def test_houses_client_injects_user_header() -> None:
 @pytest.mark.asyncio
 async def test_by_platform_area_query_is_business_area_string() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
+        assert "area=%E8%A5%BF%E4%BA%8C%E6%97%97%2C%E4%B8%8A%E5%9C%B0" in request.url.query.decode()
         assert request.url.params.get("area") == "西二旗,上地"
         assert request.url.params.get("min_area") == "60"
         return httpx.Response(

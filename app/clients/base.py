@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_random
@@ -48,6 +49,30 @@ class BaseClient:
             return {}
         return {k: ("***" if "authorization" in k.lower() else v) for k, v in headers.items()}
 
+    @staticmethod
+    def _encode_query_params(params: dict[str, Any] | None) -> str:
+        if not params:
+            return ""
+
+        encoded_pairs: list[str] = []
+        for key, value in params.items():
+            if value is None:
+                continue
+            encoded_key = quote(str(key), safe="")
+            if isinstance(value, str):
+                encoded_value = quote(value, safe="")
+            else:
+                encoded_value = quote(str(value), safe="")
+            encoded_pairs.append(f"{encoded_key}={encoded_value}")
+        return "&".join(encoded_pairs)
+
+    def _build_url(self, path: str, params: dict[str, Any] | None = None) -> str:
+        url = f"{self.base_url}{path}"
+        query = self._encode_query_params(params)
+        if not query:
+            return url
+        return f"{url}?{query}"
+
     async def _get(
         self,
         path: str,
@@ -55,7 +80,7 @@ class BaseClient:
         params: dict[str, Any] | None = None,
         need_user_id: bool = False,
     ) -> Any:
-        url = f"{self.base_url}{path}"
+        url = self._build_url(path, params)
         headers = self._headers_houses() if need_user_id else None
 
         log_event(
@@ -82,10 +107,7 @@ class BaseClient:
         )
 
         async def request() -> httpx.Response:
-            kwargs: dict[str, Any] = {"headers": headers}
-            if params is not None:
-                kwargs["params"] = params
-            return await self.http_client.get(url, **kwargs)
+            return await self.http_client.get(url, headers=headers)
 
         try:
             response = await self._retry_get(request)
@@ -139,7 +161,7 @@ class BaseClient:
         json: dict[str, Any] | None = None,
         need_user_id: bool = False,
     ) -> Any:
-        url = f"{self.base_url}{path}"
+        url = self._build_url(path, params)
         headers = self._headers_houses() if need_user_id else None
         log_event(
             LOGGER,
@@ -167,8 +189,6 @@ class BaseClient:
         )
         try:
             kwargs: dict[str, Any] = {"headers": headers}
-            if params is not None:
-                kwargs["params"] = params
             if json is not None:
                 kwargs["json"] = json
             response = await self.http_client.post(url, **kwargs)
