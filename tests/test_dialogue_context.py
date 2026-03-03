@@ -220,7 +220,7 @@ async def test_dialogue_handles_listing_then_rent_with_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dialogue_clarifies_sparse_search_without_case_type_dependency() -> None:
+async def test_dialogue_executes_sparse_search_without_clarify_template() -> None:
     planner = DummyPlanner()
     houses = DummyHousesClient()
     dialogue, state, planner, _ = _build_dialogue(planner=planner, houses_client=houses)
@@ -231,10 +231,9 @@ async def test_dialogue_clarifies_sparse_search_without_case_type_dependency() -
         is_new_session=True,
     )
 
-    assert resp.debug["response_kind"] == "clarify"
-    assert "区域、小区或地标" in resp.text
-    assert "预算上限" in resp.text
-    assert planner.executed_queries == []
+    assert resp.debug["response_kind"] == "search"
+    assert resp.candidates
+    assert planner.executed_queries
 
 
 @pytest.mark.asyncio
@@ -470,6 +469,55 @@ async def test_dialogue_preserves_llm_nearby_max_distance_argument() -> None:
     assert planner.executed_queries[-1].hard.landmark_id == "车公庄站"
     assert planner.executed_queries[-1].hard.max_distance == 500
     assert planner.executed_queries[-1].hard.layout == "2居"
+
+
+@pytest.mark.asyncio
+async def test_dialogue_complaint_stores_preferences_then_search_uses_them() -> None:
+    planner = DummyPlanner()
+    houses = DummyHousesClient()
+    dialogue, state, planner, _ = _build_dialogue(planner=planner, houses_client=houses)
+
+    chat_resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="唉，我现在的房子住的不太舒服，采光不好，房间也小",
+            meta={
+                "llm_parse": {
+                    "tool_plan": {
+                        "operationId": "get_houses_by_platform",
+                        "arguments": {
+                            "orientation": "朝南",
+                            "min_area": 60,
+                        },
+                    },
+                    "confidence": 0.9,
+                }
+            },
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    assert chat_resp.debug["response_kind"] == "chat"
+    assert planner.executed_queries == []
+    assert state.confirmed_constraints.area_min == 60
+    assert state.soft_preferences.orientation == "朝南"
+
+    search_resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="帮我找房子吧",
+        ),
+        state,
+        is_new_session=False,
+    )
+
+    assert search_resp.debug["response_kind"] == "search"
+    assert planner.executed_queries
+    assert planner.executed_queries[-1].hard.area_min == 60
+    assert planner.executed_queries[-1].soft.orientation == "朝南"
 
 
 @pytest.mark.asyncio

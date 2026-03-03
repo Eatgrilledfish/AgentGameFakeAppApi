@@ -803,8 +803,11 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
         "   - 采光不好/阴暗 -> 倾向orientation=朝南。\n"
         "   - 房子太小/住着不舒服 -> 倾向增大min_area。\n"
         "   - 通勤太长 -> 倾向max_subway_dist更小或commute_to_xierqi_max更小。\n"
-        "7) rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\n"
-        "8) 如果只是打招呼、闲聊、情绪表达且无需工具，禁止tool_calls，直接输出JSON object：\n"
+        "7) 若用户仅在抱怨居住体验/闲聊且未明确提出“找房/推荐/筛选”，禁止tool_calls；请输出intent=chat，"
+        "并在hard/soft中保留可记忆偏好，同时给出assistant_reply（友善、专业、简洁）。\n"
+        "8) 只有在用户明确提出找房/推荐/筛选需求时，才调用搜索类工具。\n"
+        "9) rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\n"
+        "10) 如果只是打招呼、闲聊、情绪表达且无需工具，禁止tool_calls，直接输出JSON object：\n"
         '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},"hard":{},"soft":{},"assistant_reply":"...","confidence":0.6}\n'
         "示例：用户说“找大兴区两居，租金4000以下”，应选择get_houses_by_platform并带district/bedrooms/max_price参数。\n"
         f"可用operationId：{available_tools}\n"

@@ -37,6 +37,18 @@ _CH_NUM_TO_INT = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "�
 _REPLACE_SIGNALS = ("换", "改成", "换成", "重新", "重来")
 _HOUSE_REF_WORDS = ("这套", "这一套", "这间", "这个房", "它", "上一套", "刚才那套", "最开始", "最初")
 _EXPLICIT_HOUSE_ID_PATTERN = re.compile(r"([A-Z]{2,4}_?\d{1,8})", re.IGNORECASE)
+_COMPLAINT_SIGNALS = (
+    "住的不舒服",
+    "不太舒服",
+    "不舒服",
+    "采光不好",
+    "太小",
+    "房间小",
+    "阴暗",
+    "通勤太长",
+    "噪音大",
+)
+_SEARCH_SIGNALS = ("找房", "找个房", "推荐", "筛选", "查询", "搜", "帮我找", "看看房", "有房", "房源")
 _TOOL_OPERATION_TO_INTENT = {
     "get_houses_by_platform": IntentType.search,
     "get_houses_by_community": IntentType.search,
@@ -103,6 +115,15 @@ class DialogueManager:
                 resolved_house_id = self._resolve_house_id(request.message, merged, state)
                 if merged.hard.house_id is None and resolved_house_id:
                     merged.hard.house_id = resolved_house_id
+        if self._should_treat_search_as_chat(request.message, merged):
+            log_event(
+                LOGGER,
+                "dialogue.intent.adjusted",
+                original_intent=IntentType.search.value,
+                adjusted_intent=IntentType.chat.value,
+                reason="complaint_without_explicit_search_request",
+            )
+            merged.intent = IntentType.chat
         log_event(
             LOGGER,
             "dialogue.nlu.done",
@@ -124,37 +145,15 @@ class DialogueManager:
                 SessionPhase.chatting,
                 SessionPhase.slot_filling,
             }:
-                clarify_questions = self._build_search_clarify_questions(merged.hard)
-                if clarify_questions:
-                    log_event(LOGGER, "dialogue.clarify", questions=clarify_questions)
-                    state.phase = SessionPhase.slot_filling
-                    resp = self.formatter.render(
-                        case_type=request.case_type,
-                        query=merged,
-                        top_houses=[],
-                        clarify_questions=clarify_questions,
-                        debug={"response_kind": "clarify"},
-                    )
-                else:
-                    resp = await self._handle_search(merged, request, state)
-            elif merged.clarify_questions and state.phase in {
-                SessionPhase.chatting,
-                SessionPhase.slot_filling,
-            }:
-                log_event(LOGGER, "dialogue.clarify", questions=merged.clarify_questions)
-                state.phase = SessionPhase.slot_filling
-                resp = self.formatter.render(
-                    case_type=request.case_type,
-                    query=merged,
-                    top_houses=[],
-                    clarify_questions=merged.clarify_questions,
-                    debug={"response_kind": "clarify"},
-                )
+                # In evaluation mode, avoid clarification templates and execute with current constraints.
+                resp = await self._handle_search(merged, request, state)
             elif merged.intent == IntentType.chat:
                 log_event(LOGGER, "dialogue.chat")
+                self._remember_chat_preferences(state, merged)
                 state.phase = SessionPhase.chatting
+                assistant_reply = self._extract_llm_assistant_reply(request.meta)
                 resp = InvokeResponse(
-                    text="你好，我可以按预算、地铁距离、通勤和小区等条件帮你找房。",
+                    text=assistant_reply or self._fallback_chat_reply(request.message, merged),
                     debug={"response_kind": "chat"},
                 )
             else:
@@ -184,6 +183,23 @@ class DialogueManager:
             if key in llm_parse:
                 return True
         return False
+
+    @staticmethod
+    def _has_explicit_search_request(text: str) -> bool:
+        return any(token in text for token in _SEARCH_SIGNALS)
+
+    @staticmethod
+    def _has_complaint_signal(text: str) -> bool:
+        return any(token in text for token in _COMPLAINT_SIGNALS)
+
+    def _should_treat_search_as_chat(self, text: str, query: StructuredQuery) -> bool:
+        if query.intent != IntentType.search:
+            return False
+        if self._has_explicit_search_request(text):
+            return False
+        if not self._has_complaint_signal(text):
+            return False
+        return self._has_actionable_preferences(query)
 
     async def _handle_search(self, query: StructuredQuery, request: InvokeRequest, state: SessionState) -> InvokeResponse:
         state.phase = SessionPhase.searching
@@ -381,16 +397,77 @@ class DialogueManager:
         return listings
 
     @staticmethod
-    def _build_search_clarify_questions(hard: HardConstraints) -> list[str]:
-        has_location = any([hard.district, hard.area, hard.community, hard.landmark_name, hard.landmark_id])
-        has_budget = hard.budget_max is not None or hard.budget_min is not None
+    def _has_actionable_preferences(query: StructuredQuery) -> bool:
+        hard = query.hard
+        soft = query.soft
+        return any(
+            [
+                hard.layout,
+                hard.area_min is not None,
+                hard.max_subway_dist is not None,
+                hard.max_distance is not None,
+                hard.max_commute_min is not None,
+                hard.rent_type,
+                hard.utilities_type,
+                soft.orientation,
+                soft.decoration,
+                soft.elevator is not None,
+                soft.noise_preference,
+                bool(soft.amenities),
+            ]
+        )
 
-        questions: list[str] = []
-        if not has_location:
-            questions.append("你更倾向哪个区域、小区或地标附近？")
-        if not has_budget and not has_location:
-            questions.append("你的预算上限大概是多少（元/月）？")
-        return questions[:2]
+    @staticmethod
+    def _remember_chat_preferences(state: SessionState, query: StructuredQuery) -> None:
+        hard = HardConstraints.model_validate(state.confirmed_constraints.model_dump())
+        soft = SoftPreferences.model_validate(state.soft_preferences.model_dump())
+
+        for key, value in query.hard.model_dump().items():
+            if value is not None:
+                setattr(hard, key, value)
+
+        for key, value in query.soft.model_dump().items():
+            if isinstance(value, list) and value:
+                merged = sorted(set(getattr(soft, key) + value))
+                setattr(soft, key, merged)
+            elif value is not None:
+                setattr(soft, key, value)
+
+        state.confirmed_constraints = hard
+        state.soft_preferences = soft
+
+    @staticmethod
+    def _extract_llm_assistant_reply(meta: dict[str, Any] | None) -> str | None:
+        if not isinstance(meta, dict):
+            return None
+        llm_parse = meta.get("llm_parse")
+        if not isinstance(llm_parse, dict):
+            return None
+        assistant_reply = llm_parse.get("assistant_reply")
+        if isinstance(assistant_reply, str):
+            stripped = assistant_reply.strip()
+            if stripped:
+                return stripped
+        return None
+
+    @staticmethod
+    def _fallback_chat_reply(user_text: str, query: StructuredQuery) -> str:
+        prefs: list[str] = []
+        if query.soft.orientation:
+            prefs.append(f"朝向{query.soft.orientation}")
+        if query.hard.area_min is not None:
+            prefs.append(f"面积至少{int(query.hard.area_min)}平")
+        if query.hard.max_subway_dist is not None:
+            prefs.append(f"地铁距离不超过{query.hard.max_subway_dist}米")
+        if query.hard.max_commute_min is not None:
+            prefs.append(f"通勤不超过{query.hard.max_commute_min}分钟")
+
+        if prefs:
+            return f"已记录你提到的偏好：{'，'.join(prefs)}。"
+        cleaned = preview_text(user_text, limit=60).strip()
+        if cleaned:
+            return f"已收到你的反馈：{cleaned}"
+        return "已收到你的反馈。"
 
     def _merge_query_with_state(self, query: StructuredQuery, state: SessionState, user_text: str) -> StructuredQuery:
         hard = HardConstraints.model_validate(state.confirmed_constraints.model_dump())
