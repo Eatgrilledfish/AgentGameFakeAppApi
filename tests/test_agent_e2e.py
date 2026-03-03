@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 import httpx
 
 from app.clients.houses import HousesClient
-from app.main import create_app
+from app.main import _build_llm_context_facts, create_app
 from app.schemas import InvokeResponse
 
 
@@ -60,7 +60,31 @@ def test_chat_route_returns_houses_json_when_candidates_exist() -> None:
         assert body["response"]["message"] == "给你筛选好了"
         assert body["response"]["houses"] == ["HF_2101"]
         assert body["status"] == "success"
-        assert body["timestamp"] < 10_000_000_000
+    assert body["timestamp"] < 10_000_000_000
+
+
+def test_llm_context_facts_include_soft_preferences() -> None:
+    class StubState:
+        focus_house_id = None
+        focus_listing_platform = None
+        confirmed_constraints = type(
+            "Hard",
+            (),
+            {"model_dump": staticmethod(lambda exclude_none=True: {"max_subway_dist": 800, "area_min": 60})},
+        )()
+        soft_preferences = type(
+            "Soft",
+            (),
+            {"model_dump": staticmethod(lambda exclude_none=True: {"orientation": "朝南", "prioritize_subway_distance": True})},
+        )()
+        search_history = []
+        recent_turns = []
+
+    facts = _build_llm_context_facts(StubState())
+
+    assert facts["confirmed_constraints"]["max_subway_dist"] == 800
+    assert facts["soft_preferences"]["orientation"] == "朝南"
+    assert facts["soft_preferences"]["prioritize_subway_distance"] is True
 
 
 def test_chat_route_accepts_content_field_as_user_input() -> None:

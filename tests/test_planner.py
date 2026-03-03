@@ -69,6 +69,22 @@ class NearbyWithFallbackHousesClient:
         return {"items": [], "total": 0, "page_size": 10}
 
 
+class ByPlatformCaptureHousesClient:
+    def __init__(self) -> None:
+        self.by_platform_calls: list[dict] = []
+
+    async def by_platform(self, **kwargs):
+        self.by_platform_calls.append(kwargs)
+        page = int(kwargs.get("page", 1))
+        if page == 1:
+            return {
+                "items": [HouseLite(house_id="HF_PLATFORM_O1", district="朝阳", layout="2居1厅1卫", rent=5600, status="可租")],
+                "total": 1,
+                "page_size": 10,
+            }
+        return {"items": [], "total": 0, "page_size": 10}
+
+
 def test_planner_falls_back_to_search_when_name_lookup_fails() -> None:
     landmarks = DummyLandmarksClient()
     planner = Planner(landmarks_client=landmarks, houses_client=DummyHousesClient())
@@ -143,3 +159,22 @@ def test_planner_by_community_degrades_to_by_platform_when_empty() -> None:
     assert houses.by_platform_calls >= 1
     assert len(rows) == 1
     assert rows[0].house_id == "HF_PLATFORM_1"
+
+
+def test_planner_by_platform_passes_soft_preferences_to_upstream_params() -> None:
+    landmarks = FuzzyLandmarksClient()
+    houses = ByPlatformCaptureHousesClient()
+    planner = Planner(landmarks_client=landmarks, houses_client=houses)
+    query = StructuredQuery(hard=HardConstraints(area_min=60, max_subway_dist=800), soft={"orientation": "朝南", "elevator": True})
+    plan = RetrievalPlan(plan_type="by_platform")
+
+    rows = asyncio.run(planner.execute_plan(plan, query, CaseType.single))
+
+    assert len(rows) == 1
+    assert rows[0].house_id == "HF_PLATFORM_O1"
+    assert houses.by_platform_calls
+    first = houses.by_platform_calls[0]
+    assert first["min_area"] == 60
+    assert first["max_subway_dist"] == 800
+    assert first["orientation"] == "朝南"
+    assert first["elevator"] == "true"

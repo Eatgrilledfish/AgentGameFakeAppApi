@@ -46,6 +46,7 @@ _COMPLAINT_SIGNALS = (
     "房间小",
     "阴暗",
     "通勤太长",
+    "通勤时间太长",
     "噪音大",
 )
 _SEARCH_SIGNALS = ("找房", "找个房", "推荐", "筛选", "查询", "搜", "帮我找", "看看房", "有房", "房源")
@@ -145,11 +146,20 @@ class DialogueManager:
                 SessionPhase.chatting,
                 SessionPhase.slot_filling,
             }:
-                # In evaluation mode, avoid clarification templates and execute with current constraints.
-                resp = await self._handle_search(merged, request, state)
+                follow_up = self._build_search_follow_up_questions(merged)
+                if follow_up:
+                    state.phase = SessionPhase.slot_filling
+                    assistant_reply = self._extract_llm_assistant_reply(request.meta)
+                    resp = InvokeResponse(
+                        text=assistant_reply or self._build_follow_up_text(follow_up),
+                        clarify_questions=follow_up,
+                        debug={"response_kind": "clarify"},
+                    )
+                else:
+                    resp = await self._handle_search(merged, request, state)
             elif merged.intent == IntentType.chat:
                 log_event(LOGGER, "dialogue.chat")
-                self._remember_chat_preferences(state, merged)
+                self._remember_chat_preferences(state, merged, request.message)
                 state.phase = SessionPhase.chatting
                 assistant_reply = self._extract_llm_assistant_reply(request.meta)
                 resp = InvokeResponse(
@@ -190,7 +200,11 @@ class DialogueManager:
 
     @staticmethod
     def _has_complaint_signal(text: str) -> bool:
-        return any(token in text for token in _COMPLAINT_SIGNALS)
+        if any(token in text for token in _COMPLAINT_SIGNALS):
+            return True
+        if re.search(r"通勤.{0,4}太长", text):
+            return True
+        return False
 
     def _should_treat_search_as_chat(self, text: str, query: StructuredQuery) -> bool:
         if query.intent != IntentType.search:
@@ -200,6 +214,38 @@ class DialogueManager:
         if not self._has_complaint_signal(text):
             return False
         return self._has_actionable_preferences(query)
+
+    @staticmethod
+    def _build_search_follow_up_questions(query: StructuredQuery) -> list[str]:
+        hard = query.hard
+        has_location = any([hard.district, hard.area, hard.community, hard.landmark_name, hard.landmark_id])
+        has_budget = hard.budget_max is not None or hard.budget_min is not None
+        has_strong_constraints = any(
+            [
+                hard.layout,
+                hard.area_min is not None,
+                hard.max_subway_dist is not None,
+                hard.max_distance is not None,
+                hard.max_commute_min is not None,
+                hard.rent_type,
+                hard.utilities_type,
+            ]
+        )
+
+        if has_location or has_budget or has_strong_constraints:
+            return []
+
+        questions: list[str] = []
+        questions.append("你的预算上限大概是多少（元/月）？")
+        questions.append("你更偏向哪个区域、小区或地铁站附近？")
+        return questions
+
+    @staticmethod
+    def _build_follow_up_text(questions: list[str]) -> str:
+        if not questions:
+            return "请补充你的找房偏好。"
+        lines = [f"{idx + 1}. {q}" for idx, q in enumerate(questions)]
+        return "为了给你推荐更匹配的房源，请先补充这两点：\n" + "\n".join(lines)
 
     async def _handle_search(self, query: StructuredQuery, request: InvokeRequest, state: SessionState) -> InvokeResponse:
         state.phase = SessionPhase.searching
@@ -418,7 +464,7 @@ class DialogueManager:
         )
 
     @staticmethod
-    def _remember_chat_preferences(state: SessionState, query: StructuredQuery) -> None:
+    def _remember_chat_preferences(state: SessionState, query: StructuredQuery, user_text: str) -> None:
         hard = HardConstraints.model_validate(state.confirmed_constraints.model_dump())
         soft = SoftPreferences.model_validate(state.soft_preferences.model_dump())
 
@@ -433,8 +479,20 @@ class DialogueManager:
             elif value is not None:
                 setattr(soft, key, value)
 
+        DialogueManager._infer_preferences_from_user_text(user_text, hard, soft)
         state.confirmed_constraints = hard
         state.soft_preferences = soft
+
+    @staticmethod
+    def _infer_preferences_from_user_text(user_text: str, hard: HardConstraints, soft: SoftPreferences) -> None:
+        text = user_text or ""
+        if soft.orientation is None and any(token in text for token in ("采光不好", "阴暗", "不朝阳")):
+            soft.orientation = "朝南"
+        if hard.area_min is None and any(token in text for token in ("房间小", "太小", "住的不舒服", "不太舒服")):
+            hard.area_min = 60
+        if hard.max_subway_dist is None and any(token in text for token in ("通勤时间长", "通勤太长", "每天都要早起", "上班太远")):
+            hard.max_subway_dist = 800
+            soft.prioritize_subway_distance = True
 
     @staticmethod
     def _extract_llm_assistant_reply(meta: dict[str, Any] | None) -> str | None:
@@ -799,6 +857,14 @@ class DialogueManager:
             constraints.append(f"户型={state.confirmed_constraints.layout}")
         if state.confirmed_constraints.budget_max is not None:
             constraints.append(f"预算上限={state.confirmed_constraints.budget_max}")
+        if state.confirmed_constraints.area_min is not None:
+            constraints.append(f"最小面积={int(state.confirmed_constraints.area_min)}")
+        if state.confirmed_constraints.max_subway_dist is not None:
+            constraints.append(f"地铁距离<={state.confirmed_constraints.max_subway_dist}")
+        if state.confirmed_constraints.max_commute_min is not None:
+            constraints.append(f"通勤<={state.confirmed_constraints.max_commute_min}")
+        if state.soft_preferences.orientation:
+            constraints.append(f"朝向偏好={state.soft_preferences.orientation}")
 
         focus_parts: list[str] = []
         if state.focus_house_id:

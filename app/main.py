@@ -747,6 +747,28 @@ def _build_llm_context_facts(state: Any) -> dict[str, Any]:
         if picked:
             facts["confirmed_constraints"] = picked
 
+    soft = getattr(state, "soft_preferences", None)
+    if soft is not None and hasattr(soft, "model_dump"):
+        soft_dict = soft.model_dump(exclude_none=True)
+        picked_soft: dict[str, Any] = {}
+        for key in (
+            "orientation",
+            "decoration",
+            "elevator",
+            "noise_preference",
+            "amenities",
+            "value_for_money",
+            "prioritize_subway_distance",
+        ):
+            value = soft_dict.get(key)
+            if value is None:
+                continue
+            if isinstance(value, list) and not value:
+                continue
+            picked_soft[key] = value
+        if picked_soft:
+            facts["soft_preferences"] = picked_soft
+
     search_history = getattr(state, "search_history", None)
     if isinstance(search_history, list) and search_history:
         recent_searches: list[dict[str, Any]] = []
@@ -806,8 +828,9 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
         "7) 若用户仅在抱怨居住体验/闲聊且未明确提出“找房/推荐/筛选”，禁止tool_calls；请输出intent=chat，"
         "并在hard/soft中保留可记忆偏好，同时给出assistant_reply（友善、专业、简洁）。\n"
         "8) 只有在用户明确提出找房/推荐/筛选需求时，才调用搜索类工具。\n"
-        "9) rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\n"
-        "10) 如果只是打招呼、闲聊、情绪表达且无需工具，禁止tool_calls，直接输出JSON object：\n"
+        "9) 当用户开始找房时，应继承上下文里已记住的约束/偏好（如orientation、min_area、max_subway_dist）并写入tool arguments。\n"
+        "10) rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\n"
+        "11) 如果只是打招呼、闲聊、情绪表达且无需工具，禁止tool_calls，直接输出JSON object：\n"
         '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},"hard":{},"soft":{},"assistant_reply":"...","confidence":0.6}\n'
         "示例：用户说“找大兴区两居，租金4000以下”，应选择get_houses_by_platform并带district/bedrooms/max_price参数。\n"
         f"可用operationId：{available_tools}\n"

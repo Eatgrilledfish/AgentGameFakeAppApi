@@ -220,7 +220,7 @@ async def test_dialogue_handles_listing_then_rent_with_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dialogue_executes_sparse_search_without_clarify_template() -> None:
+async def test_dialogue_asks_follow_up_on_underconstrained_search() -> None:
     planner = DummyPlanner()
     houses = DummyHousesClient()
     dialogue, state, planner, _ = _build_dialogue(planner=planner, houses_client=houses)
@@ -231,9 +231,10 @@ async def test_dialogue_executes_sparse_search_without_clarify_template() -> Non
         is_new_session=True,
     )
 
-    assert resp.debug["response_kind"] == "search"
-    assert resp.candidates
-    assert planner.executed_queries
+    assert resp.debug["response_kind"] == "clarify"
+    assert "预算上限" in resp.text
+    assert "区域、小区或地铁站" in resp.text
+    assert planner.executed_queries == []
 
 
 @pytest.mark.asyncio
@@ -504,11 +505,24 @@ async def test_dialogue_complaint_stores_preferences_then_search_uses_them() -> 
     assert state.confirmed_constraints.area_min == 60
     assert state.soft_preferences.orientation == "朝南"
 
+    chat_resp2 = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="而且通勤时间也太长了，每天都要早起",
+        ),
+        state,
+        is_new_session=False,
+    )
+
+    assert chat_resp2.debug["response_kind"] == "chat"
+    assert state.confirmed_constraints.max_subway_dist == 800
+
     search_resp = await dialogue.handle_turn(
         InvokeRequest(
             session_id="sess-ctx",
             case_type=CaseType.single,
-            message="帮我找房子吧",
+            message="想换个房子了，你能帮我找找吗？",
         ),
         state,
         is_new_session=False,
@@ -517,6 +531,7 @@ async def test_dialogue_complaint_stores_preferences_then_search_uses_them() -> 
     assert search_resp.debug["response_kind"] == "search"
     assert planner.executed_queries
     assert planner.executed_queries[-1].hard.area_min == 60
+    assert planner.executed_queries[-1].hard.max_subway_dist == 800
     assert planner.executed_queries[-1].soft.orientation == "朝南"
 
 

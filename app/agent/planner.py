@@ -159,6 +159,9 @@ class Planner:
                 max_price=query.hard.budget_max,
                 bedrooms=_layout_to_bedrooms(query.hard.layout),
                 min_area=int(query.hard.area_min) if query.hard.area_min is not None else None,
+                orientation=query.soft.orientation,
+                decoration=query.soft.decoration,
+                elevator=_to_elevator_param(query.soft.elevator),
                 commute_to_xierqi_max=query.hard.max_commute_min,
                 utilities_type=query.hard.utilities_type,
                 max_subway_dist=query.hard.max_subway_dist,
@@ -269,6 +272,12 @@ def _layout_to_bedrooms(layout: str | None) -> str | None:
         if ch.isdigit():
             return ch
     return None
+
+
+def _to_elevator_param(value: bool | None) -> str | None:
+    if value is None:
+        return None
+    return "true" if value else "false"
 
 
 def _landmark_fuzzy_keywords(*, original_landmark: str, landmark_name: str | None) -> list[str]:
