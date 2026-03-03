@@ -780,6 +780,71 @@ async def test_dialogue_direct_requirements_start_search_and_keep_context_tags()
 
 
 @pytest.mark.asyncio
+async def test_dialogue_promotes_llm_chat_to_search_for_tag_refinement_with_active_context() -> None:
+    class TagPlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            self.executed_queries.append(query.model_copy(deep=True))
+            _ = plan
+            _ = case_type
+            return [
+                HouseLite(
+                    house_id="HF_ONLINE",
+                    rent=3000,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="A",
+                    subway_distance=500,
+                    commute_to_xierqi_min=35,
+                    status="可租",
+                    tags=["仅线上VR看房", "近公园"],
+                ),
+                HouseLite(
+                    house_id="HF_OFFLINE",
+                    rent=2900,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="B",
+                    subway_distance=480,
+                    commute_to_xierqi_min=33,
+                    status="可租",
+                    tags=["仅线下看房", "近公园"],
+                ),
+            ]
+
+    dialogue, state, planner, _ = _build_dialogue(planner=TagPlanner())
+
+    first = await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-ctx", case_type=CaseType.single, message="帮我找朝阳区两居室，预算3000以内"),
+        state,
+        is_new_session=True,
+    )
+    assert first.debug["response_kind"] == "search"
+
+    second = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="平时工作太忙，希望能线上VR看房，不用跑现场",
+            meta={
+                "llm_parse": {
+                    "intent": "chat",
+                    "tool_plan": {"operationId": "none", "arguments": {}},
+                    "assistant_reply": "这里是一个聊天回复",
+                    "confidence": 0.8,
+                }
+            },
+        ),
+        state,
+        is_new_session=False,
+    )
+
+    assert second.debug["response_kind"] == "search"
+    refined = planner.executed_queries[-1]
+    assert any("线上" in tag for tag in refined.soft.preferred_tags)
+    assert any("线下" in tag for tag in refined.soft.avoid_tags)
+
+
+@pytest.mark.asyncio
 async def test_dialogue_context_continuation_can_start_search_with_previous_tags() -> None:
     planner = DummyPlanner()
     houses = DummyHousesClient()

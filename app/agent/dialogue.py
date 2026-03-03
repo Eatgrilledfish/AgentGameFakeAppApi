@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from difflib import SequenceMatcher
 from typing import Any
 
 from app.agent.formatter import OutputFormatter
@@ -80,8 +81,19 @@ _DIRECT_REQUIREMENT_SIGNALS = (
     "安静",
     "公园",
     "商场",
+    "VR",
+    "AR",
+    "线上看房",
+    "线下看房",
+    "养狗",
+    "宠物",
+    "遛狗",
+    "金毛",
 )
 _STICKY_SOFT_BOOL_FIELDS = {"prefer_spacious", "prioritize_subway_distance", "prioritize_commute"}
+_NEGATION_TOKENS = ("不", "不要", "不想", "不用", "别", "避免", "拒绝", "不希望", "不能")
+_TAG_TEXT_STOPWORDS = ("仅", "可", "需", "看房", "房", "租", "费用", "费", "押", "付", "支持")
+_POSITIVE_TOKENS = ("要", "想", "希望", "能", "可以", "必须", "优先", "倾向")
 _TOOL_OPERATION_TO_INTENT = {
     "get_houses_by_platform": IntentType.search,
     "get_houses_by_community": IntentType.search,
@@ -144,6 +156,20 @@ class DialogueManager:
 
         query = self._build_query(request, state)
         merged = self._merge_query_with_state(query, state, request.message)
+        self._augment_tag_preferences_from_context(merged, state, request.message)
+        if merged.intent == IntentType.chat:
+            fallback_query = self.nlu.parse(request.message, state, request.case_type)
+            self._augment_tag_preferences_from_context(fallback_query, state, request.message)
+            if self._should_promote_chat_to_search_refinement(request.message, merged, fallback_query, state):
+                log_event(
+                    LOGGER,
+                    "dialogue.intent.adjusted",
+                    original_intent=IntentType.chat.value,
+                    adjusted_intent=IntentType.search.value,
+                    reason="preference_refinement_with_active_search_context",
+                )
+                merged = self._merge_query_with_state(fallback_query, state, request.message)
+                merged.intent = IntentType.search
         if merged.intent == IntentType.search:
             await self._normalize_search_location_slots(merged, request.message)
         if merged.intent in {IntentType.house_detail, IntentType.listings, IntentType.rent, IntentType.terminate, IntentType.offline}:
@@ -263,6 +289,39 @@ class DialogueManager:
         if not self._has_complaint_signal(text):
             return False
         return self._has_actionable_preferences(query) or self._text_implies_preferences(text)
+
+    def _should_promote_chat_to_search_refinement(
+        self,
+        text: str,
+        chat_query: StructuredQuery,
+        fallback_query: StructuredQuery,
+        state: SessionState,
+    ) -> bool:
+        if chat_query.intent != IntentType.chat:
+            return False
+
+        has_active_search_context = bool(state.last_top5) or bool(state.last_candidates) or state.phase in {
+            SessionPhase.searching,
+            SessionPhase.presenting,
+            SessionPhase.refining,
+        }
+        if not has_active_search_context:
+            return False
+
+        if self._has_explicit_search_request(text):
+            return True
+        if self._text_requests_context_continuation(text):
+            return True
+        if self._text_has_direct_house_requirements(text):
+            return True
+        if self._text_has_explicit_search_constraints(text):
+            return True
+
+        if self._has_actionable_preferences(chat_query):
+            return True
+        if fallback_query.intent == IntentType.search and self._has_actionable_preferences(fallback_query):
+            return True
+        return False
 
     @staticmethod
     def _text_implies_preferences(text: str) -> bool:
@@ -761,11 +820,178 @@ class DialogueManager:
                 soft.elevator is not None,
                 soft.noise_preference,
                 bool(soft.amenities),
+                bool(soft.preferred_tags),
+                bool(soft.avoid_tags),
                 soft.prefer_spacious,
                 soft.prioritize_subway_distance,
                 soft.prioritize_commute,
             ]
         )
+
+    def _augment_tag_preferences_from_context(self, query: StructuredQuery, state: SessionState, user_text: str) -> None:
+        text = user_text.strip()
+        if not text:
+            return
+
+        tag_pool = self._collect_context_tags(state)
+        if not tag_pool:
+            return
+
+        preferred_tags, avoid_tags = self._infer_tag_preferences_from_text(text, tag_pool)
+        if not preferred_tags and not avoid_tags:
+            return
+
+        merged_preferred = sorted(set(query.soft.preferred_tags + preferred_tags))
+        merged_avoid = sorted(set(query.soft.avoid_tags + avoid_tags))
+        query.soft.preferred_tags = merged_preferred
+        query.soft.avoid_tags = merged_avoid
+        log_event(
+            LOGGER,
+            "dialogue.tag_preferences.augmented",
+            preferred_tags=merged_preferred[:8],
+            avoid_tags=merged_avoid[:8],
+        )
+
+    @staticmethod
+    def _collect_context_tags(state: SessionState, *, max_tags: int = 200) -> list[str]:
+        seen: set[str] = set()
+        tags: list[str] = []
+
+        def collect(values: list[Any] | None) -> None:
+            if not isinstance(values, list):
+                return
+            for raw in values:
+                if not isinstance(raw, str):
+                    continue
+                tag = raw.strip()
+                if not tag or tag in seen:
+                    continue
+                seen.add(tag)
+                tags.append(tag)
+                if len(tags) >= max_tags:
+                    return
+
+        for house in state.last_candidates[:40]:
+            collect(getattr(house, "tags", []))
+            if len(tags) >= max_tags:
+                return tags
+        for house in state.last_top5[:5]:
+            collect(getattr(house, "tags", []))
+            if len(tags) >= max_tags:
+                return tags
+        return tags
+
+    @staticmethod
+    def _infer_tag_preferences_from_text(text: str, tag_pool: list[str]) -> tuple[list[str], list[str]]:
+        normalized_text = DialogueManager._normalize_tag_text(text)
+        if not normalized_text:
+            return [], []
+
+        preferred: list[str] = []
+        avoid: list[str] = []
+
+        for tag in tag_pool:
+            score, matched_signals = DialogueManager._match_tag_signal_score(normalized_text, tag)
+            if score < 0.46:
+                continue
+
+            if DialogueManager._is_negative_intent_for_tag(normalized_text, tag, matched_signals):
+                if tag not in avoid:
+                    avoid.append(tag)
+            else:
+                if tag not in preferred:
+                    preferred.append(tag)
+
+        # If both sides include same tag, keep explicit avoid only.
+        preferred = [tag for tag in preferred if tag not in avoid]
+        return preferred[:10], avoid[:10]
+
+    @staticmethod
+    def _match_tag_signal_score(text: str, tag: str) -> tuple[float, list[str]]:
+        normalized_tag = DialogueManager._normalize_tag_text(tag)
+        if not normalized_tag:
+            return 0.0, []
+
+        signals = DialogueManager._extract_tag_signals(tag)
+        matched = [sig for sig in signals if len(sig) >= 2 and sig in text]
+
+        ratio = SequenceMatcher(None, normalized_tag, text).ratio()
+        if normalized_tag in text:
+            ratio = max(ratio, 0.78)
+        if matched:
+            ratio = max(ratio, min(0.95, 0.56 + 0.06 * len(matched) + 0.05 * max(len(sig) for sig in matched)))
+
+        return ratio, matched
+
+    @staticmethod
+    def _is_negative_intent_for_tag(text: str, tag: str, matched_signals: list[str]) -> bool:
+        tag_norm = DialogueManager._normalize_tag_text(tag)
+        if not tag_norm:
+            return False
+
+        signals = matched_signals or [sig for sig in DialogueManager._extract_tag_signals(tag) if len(sig) >= 2]
+        has_positive = False
+        for signal in signals:
+            start = text.find(signal)
+            if start == -1:
+                continue
+            left = text[max(0, start - 4) : start]
+            right = text[start + len(signal) : start + len(signal) + 4]
+            if any(pos in left or pos in right for pos in _POSITIVE_TOKENS):
+                has_positive = True
+            if any(f"{neg}{signal}" in text or f"{signal}{neg}" in text for neg in _NEGATION_TOKENS):
+                return True
+
+        if has_positive:
+            return False
+
+        # Generic fallback for expressions like "不用跑现场" against "线下看房".
+        if "线下" in tag_norm and any(
+            token in text for token in ("不用线下", "不想线下", "不跑现场", "不去现场", "不用跑线下", "不跑线下", "不去线下")
+        ):
+            return True
+        if "线上" in tag_norm and any(token in text for token in ("希望线上", "想线上", "能线上", "可以线上")):
+            return False
+        if "线上" in tag_norm and any(token in text for token in ("不要线上", "不想线上")):
+            return True
+        return False
+
+    @staticmethod
+    def _normalize_tag_text(text: str) -> str:
+        lowered = text.lower()
+        replaced = (
+            lowered.replace("现场", "线下")
+            .replace("实地", "线下")
+            .replace("到店", "线下")
+            .replace("在线", "线上")
+            .replace("vr", "vr")
+            .replace("ar", "ar")
+        )
+        return re.sub(r"[^0-9a-z\u4e00-\u9fa5]+", "", replaced)
+
+    @staticmethod
+    def _extract_tag_signals(tag: str) -> list[str]:
+        normalized = DialogueManager._normalize_tag_text(tag)
+        if not normalized:
+            return []
+
+        chunks = re.findall(r"[0-9a-z]+|[\u4e00-\u9fa5]{2,}", normalized)
+        signals: list[str] = []
+        seen: set[str] = set()
+        for chunk in chunks:
+            if chunk in _TAG_TEXT_STOPWORDS:
+                continue
+            if len(chunk) >= 2 and chunk not in seen:
+                seen.add(chunk)
+                signals.append(chunk)
+            if len(chunk) >= 4:
+                for i in range(len(chunk) - 1):
+                    part = chunk[i : i + 2]
+                    if part in _TAG_TEXT_STOPWORDS or part in seen:
+                        continue
+                    seen.add(part)
+                    signals.append(part)
+        return signals
 
     @staticmethod
     def _remember_chat_preferences(state: SessionState, query: StructuredQuery, user_text: str) -> None:

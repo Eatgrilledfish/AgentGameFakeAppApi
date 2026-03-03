@@ -148,7 +148,8 @@ class HousesClient(BaseClient):
         items = _build_page(data)["items"]
         if not items and isinstance(data, list):
             items = data
-        return [NearbyLandmark.model_validate(item) for item in items if isinstance(item, dict)]
+        normalized = [_normalize_nearby_landmark(item, fallback_category=category) for item in items if isinstance(item, dict)]
+        return [NearbyLandmark.model_validate(item) for item in normalized if item]
 
     async def stats(self) -> dict[str, Any]:
         data = await self._get("/api/houses/stats", need_user_id=True)
@@ -253,3 +254,20 @@ def _coerce_area_to_float(value: Any) -> float | None:
     if m:
         return float(m.group(1))
     return None
+
+
+def _normalize_nearby_landmark(raw: dict[str, Any], *, fallback_category: str | None = None) -> dict[str, Any]:
+    # API may return either flat {name, category, distance_m} or nested
+    # {"landmark": {...}, "distance": ...}.
+    item = dict(raw)
+    landmark = item.get("landmark")
+    if isinstance(landmark, dict):
+        item.setdefault("name", landmark.get("name"))
+        item.setdefault("category", landmark.get("category"))
+
+    if "distance_m" not in item and "distance" in item:
+        item["distance_m"] = item.get("distance")
+    if "category" not in item or not isinstance(item.get("category"), str):
+        if isinstance(fallback_category, str) and fallback_category:
+            item["category"] = fallback_category
+    return item

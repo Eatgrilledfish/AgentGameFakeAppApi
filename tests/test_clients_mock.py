@@ -117,3 +117,34 @@ async def test_base_client_records_upstream_output_into_tool_results() -> None:
     assert first["name"] == "GET /api/houses/by_platform"
     assert first["success"] is True
     assert first["output"]["items"][0]["house_id"] == "HF_9"
+
+
+@pytest.mark.asyncio
+async def test_nearby_landmarks_normalizes_nested_distance_shape() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/api/houses/nearby_landmarks")
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "community": "测试小区",
+                    "type": "park",
+                    "total": 1,
+                    "items": [
+                        {
+                            "landmark": {"name": "奥林匹克公园", "category": "landmark"},
+                            "distance": 822.5,
+                        }
+                    ],
+                }
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = HousesClient("http://test", "u-123", http_client)
+        rows = await client.nearby_landmarks("测试小区", "park")
+
+    assert len(rows) == 1
+    assert rows[0].name == "奥林匹克公园"
+    assert rows[0].distance_m == 822.5

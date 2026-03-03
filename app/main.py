@@ -490,7 +490,75 @@ def _load_llm_tools() -> list[dict[str, Any]]:
     tools = payload.get("tools")
     if not isinstance(tools, list):
         raise RuntimeError(f"llm_tools_preset.json missing tools list: {tools_path}")
-    return [item for item in tools if isinstance(item, dict)]
+    raw_tools = [item for item in tools if isinstance(item, dict)]
+    return _compact_tools_for_llm(raw_tools)
+
+
+def _compact_tools_for_llm(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for item in tools:
+        function_node = item.get("function")
+        if not isinstance(function_node, dict):
+            continue
+        name = function_node.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        parameters = _compact_tool_parameters(function_node.get("parameters"))
+        description = function_node.get("description")
+        if not isinstance(description, str) or not description.strip():
+            compact_description = name
+        else:
+            # Keep only the first sentence/segment to reduce token usage while
+            # preserving endpoint hints (e.g. "POST /api/...").
+            compact_description = description.strip().split("。", 1)[0].split("|", 1)[0].strip()
+            if len(compact_description) > 96:
+                compact_description = compact_description[:96]
+        compacted.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": compact_description,
+                    "parameters": parameters,
+                },
+            }
+        )
+    return compacted
+
+
+def _compact_tool_parameters(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {"type": "object", "properties": {}, "additionalProperties": False}
+
+    properties = raw.get("properties")
+    compact_props: dict[str, Any] = {}
+    if isinstance(properties, dict):
+        for key, spec in properties.items():
+            if not isinstance(key, str) or not key:
+                continue
+            if not isinstance(spec, dict):
+                compact_props[key] = {"type": "string"}
+                continue
+            entry: dict[str, Any] = {}
+            param_type = spec.get("type")
+            if isinstance(param_type, str) and param_type:
+                entry["type"] = param_type
+            else:
+                entry["type"] = "string"
+            enum_values = spec.get("enum")
+            if isinstance(enum_values, list) and enum_values:
+                entry["enum"] = [v for v in enum_values if isinstance(v, (str, int, float, bool))][:8]
+            compact_props[key] = entry
+
+    compact: dict[str, Any] = {
+        "type": "object",
+        "properties": compact_props,
+        "additionalProperties": False,
+    }
+    required = raw.get("required")
+    if isinstance(required, list) and required:
+        compact["required"] = [x for x in required if isinstance(x, str) and x in compact_props]
+    return compact
 
 
 @lru_cache(maxsize=1)
@@ -796,7 +864,7 @@ def _build_llm_context_facts(state: Any) -> dict[str, Any]:
             house_ids = getattr(snap, "house_ids", [])
             if not isinstance(house_ids, list) or not house_ids:
                 continue
-            row: dict[str, Any] = {"house_ids": [str(x) for x in house_ids[:3]]}
+            row: dict[str, Any] = {"house_ids": [str(x) for x in house_ids[:2]]}
             for key in ("district", "area", "community", "landmark_name"):
                 value = getattr(snap, key, None)
                 if isinstance(value, str) and value:
@@ -809,7 +877,7 @@ def _build_llm_context_facts(state: Any) -> dict[str, Any]:
     last_top5 = getattr(state, "last_top5", None)
     if isinstance(last_top5, list) and last_top5:
         compact_houses: list[dict[str, Any]] = []
-        for item in last_top5[:5]:
+        for item in last_top5[:3]:
             compact = _compact_house_for_llm_context(item)
             if compact:
                 compact_houses.append(compact)
@@ -842,7 +910,7 @@ def _compact_house_for_llm_context(item: Any) -> dict[str, Any]:
         return {}
 
     row: dict[str, Any] = {"house_id": house_id}
-    for key in ("district", "community", "layout", "rent", "subway_distance", "commute_to_xierqi_min"):
+    for key in ("rent", "subway_distance", "commute_to_xierqi_min"):
         value = getattr(item, key, None)
         if value is None:
             continue
@@ -887,7 +955,7 @@ def _infer_pet_friendly_from_tags(tags: list[Any]) -> bool | None:
     return None
 
 
-def _pick_key_tags_for_llm(tags: list[Any], *, limit: int = 8) -> list[str]:
+def _pick_key_tags_for_llm(tags: list[Any], *, limit: int = 4) -> list[str]:
     picked: list[str] = []
     seen: set[str] = set()
     keywords = (
@@ -928,27 +996,17 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
     available_tools = ",".join(_load_llm_tool_names())
     content = (
         "你是租房智能Agent决策器，目标是根据用户问题和tools列表决定如何查询。\n"
-        "核心任务：识别用户意图、选择最合适的一个API工具、提取参数，供agent直接调用。\n"
-        "规则：\n"
-        "1) 可用工具只允许从tools中选择，优先返回tool_calls，且一次只调用一个function。\n"
-        "2) tool arguments必须严格使用该function的参数名，不得新增字段。\n"
-        "3) 显式约束必须提取：区域、户型、价格、地铁距离、通勤、house_id、listing_platform。\n"
-        "   - 地点参数规则：行政区/县/市/旗（通常带区县市等后缀）填district；商圈/片区/地标名填area。\n"
-        "4) 若用户显式给出house_id（如HF_67），必须使用该house_id，不能被上下文覆盖。\n"
-        "5) 仅当用户未显式给house_id且出现“这套/第一套/最开始那套”时，才可用上下文focus_house_id/latest_search_house_ids。\n"
-        "6) 对口语抱怨要做需求反推：\n"
-        "   - 采光不好/阴暗 -> 倾向orientation=朝南。\n"
-        "   - 房子太小/住着不舒服 -> 记录soft.prefer_spacious=true（排序优先，不是硬过滤）。\n"
-        "   - 通勤太长 -> 记录soft.prioritize_commute=true、soft.prioritize_subway_distance=true（排序优先，不是硬过滤）。\n"
-        "7) 若用户仅在抱怨居住体验/闲聊且未明确提出“找房/推荐/筛选”，禁止tool_calls；请输出intent=chat，"
-        "并在hard/soft中保留可记忆偏好，同时给出assistant_reply（友善、专业、简洁）。\n"
-        "8) 只有在用户明确提出找房/推荐/筛选需求时，才调用搜索类工具。\n"
-        "9) 当用户开始找房时，应继承上下文里已记住的约束/偏好（如orientation、prefer_spacious、prioritize_commute）并用于决策。\n"
-        "10) 用户要求“对比/比价/决策”且上下文已有候选房源时，优先输出intent=compare，不要重复检索。\n"
-        "11) rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\n"
-        "12) 如果只是打招呼、闲聊、情绪表达且无需工具，禁止tool_calls，直接输出JSON object：\n"
+        "只做三件事：识别intent、选择一个operationId、给出arguments。\n"
+        "要求：\n"
+        "1) 只能从tools选择，优先返回tool_calls；每次最多一个function。\n"
+        "2) arguments只允许使用工具定义参数名，不得新增字段。\n"
+        "3) 用户明确给house_id时必须使用；“这套/第一套”等可用focus_house_id/latest_search_house_ids指代。\n"
+        "4) 地点槽位：行政区/县/市/旗填district；商圈/片区/地标名填area。\n"
+        "5) 闲聊/情绪表达且无需工具时禁止tool_calls，返回chat JSON。\n"
+        "6) 有历史候选且用户补充偏好（如养宠/公园/看房方式/费用偏好）时，应视为继续筛选，优先search/compare而非chat。\n"
+        "7) rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\n"
+        "chat返回格式：\n"
         '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},"hard":{},"soft":{},"assistant_reply":"...","confidence":0.6}\n'
-        "示例：用户说“找大兴区两居，租金4000以下”，应选择get_houses_by_platform并带district/bedrooms/max_price参数。\n"
         f"可用operationId：{available_tools}\n"
         f"会话摘要：{summary_text}\n"
         f"上下文事实：{context_json}\n"
