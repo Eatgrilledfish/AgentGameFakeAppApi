@@ -70,6 +70,15 @@ def reset_log_context(
     _CTX_SEQ.reset(t5)
 
 
+def get_log_context() -> dict[str, str]:
+    return {
+        "trace_id": _CTX_TRACE_ID.get(),
+        "session_id": _CTX_SESSION_ID.get(),
+        "case_type": _CTX_CASE_TYPE.get(),
+        "user_id": _CTX_USER_ID.get(),
+    }
+
+
 def preview_payload(payload: Any, limit: int = 1000) -> str:
     try:
         text = json.dumps(payload, ensure_ascii=False, default=str)

@@ -567,3 +567,29 @@ def test_stage_name_distinguishes_chat_request_and_response() -> None:
 
     assert request_stage == "agent接收用户输入"
     assert response_stage == "agent最终返回用户"
+
+
+def test_debug_agent_io_events_support_session_filter(monkeypatch, tmp_path) -> None:
+    log_file = tmp_path / "agent_http_io.log"
+    log_file.write_text(
+        "\n".join(
+            [
+                '2026-03-03 10:00:00 {"event":"http.agent_io.request","method":"POST","path":"/api/v1/chat","session_id":"sess-a"}',
+                '2026-03-03 10:00:01 {"event":"http.agent_io.api.request","method":"GET","url":"http://x/api/houses/by_platform","session_id":"sess-a"}',
+                '2026-03-03 10:00:02 {"event":"http.agent_io.request","method":"GET","path":"/debug/agent-io/events","session_id":"-"}',
+                '2026-03-03 10:00:03 {"event":"http.agent_io.response","method":"POST","path":"/api/v1/chat","session_id":"sess-b"}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_HTTP_IO_LOG_PATH", str(log_file))
+
+    app = create_app()
+    with TestClient(app) as client:
+        resp = client.get("/debug/agent-io/events", params={"session_id": "sess-a", "limit": 50})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["session_id"] == "sess-a"
+    assert body["count"] == 2
+    assert all(item["session_id"] == "sess-a" for item in body["items"])

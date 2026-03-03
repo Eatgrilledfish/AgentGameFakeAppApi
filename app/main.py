@@ -22,7 +22,7 @@ from app.agent.state import StateStore
 from app.clients.houses import HousesClient
 from app.clients.landmarks import LandmarksClient
 from app.infra.cache import CacheManager
-from app.infra.logging import bind_log_context, log_event, preview_payload, preview_text, reset_log_context, setup_logging
+from app.infra.logging import bind_log_context, get_log_context, log_event, preview_payload, preview_text, reset_log_context, setup_logging
 from app.infra.tool_recorder import begin_tool_recording, get_tool_results, reset_tool_recording
 from app.schemas import CaseType, ChatRequest, ChatResponse, HealthResponse, InvokeRequest, InvokeResponse
 from app.settings import AgentSettings, load_settings
@@ -51,6 +51,31 @@ def _preview_http_body(raw_body: bytes, content_type: str | None, limit: int = 2
         if parsed is not None:
             return preview_payload(parsed, limit=limit)
     return preview_text(text, limit=limit)
+
+
+def _resolve_http_session_id(request: Request, raw_body: bytes, content_type: str | None) -> str:
+    header_session = request.headers.get("Session-ID") or request.headers.get("session-id")
+    if isinstance(header_session, str) and header_session.strip():
+        return header_session.strip()
+
+    query_session = request.query_params.get("session_id")
+    if isinstance(query_session, str) and query_session.strip():
+        return query_session.strip()
+
+    if content_type and "application/json" in content_type.lower() and raw_body:
+        parsed = _extract_json_object(raw_body.decode("utf-8", errors="replace"))
+        candidate = parsed.get("session_id") if isinstance(parsed, dict) else None
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+
+    context_session = get_log_context().get("session_id", "-")
+    if isinstance(context_session, str) and context_session.strip():
+        return context_session.strip()
+    return "-"
+
+
+def _is_debug_agent_io_path(path: str) -> bool:
+    return path.startswith("/debug/agent-io")
 
 def _read_agent_http_io_entries(limit: int = 200) -> list[dict[str, Any]]:
     log_path = os.getenv("AGENT_HTTP_IO_LOG_PATH", "agent_http_io.log")
@@ -134,6 +159,7 @@ async def _forward_chat_completion(
         "%s",
         preview_payload(
             {
+                **get_log_context(),
                 "event": "http.agent_io.llm.request",
                 "method": "POST",
                 "url": target_url,
@@ -165,6 +191,7 @@ async def _forward_chat_completion(
                 "%s",
                 preview_payload(
                     {
+                        **get_log_context(),
                         "event": "http.agent_io.llm.error",
                         "method": "POST",
                         "url": target_url,
@@ -183,6 +210,7 @@ async def _forward_chat_completion(
                 "%s",
                 preview_payload(
                     {
+                        **get_log_context(),
                         "event": "http.agent_io.llm.error",
                         "method": "POST",
                         "url": target_url,
@@ -207,6 +235,7 @@ async def _forward_chat_completion(
         "%s",
         preview_payload(
             {
+                **get_log_context(),
                 "event": "http.agent_io.llm.response",
                 "method": "POST",
                 "url": target_url,
@@ -839,12 +868,16 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         )
 
         req_content_type = request.headers.get("content-type")
-        if request.method in {"GET", "POST"}:
+        http_session_id = _resolve_http_session_id(request, raw_body, req_content_type)
+        should_log_http_io = request.method in {"GET", "POST"} and not _is_debug_agent_io_path(request.url.path)
+        if should_log_http_io:
             HTTP_IO_LOGGER.info(
                 "%s",
                 preview_payload(
                     {
+                        **get_log_context(),
                         "event": "http.agent_io.request",
+                        "session_id": http_session_id,
                         "method": request.method,
                         "path": request.url.path,
                         "query": str(request.query_params),
@@ -878,13 +911,15 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             duration_ms=duration_ms,
         )
 
-        if request.method in {"GET", "POST"}:
+        if should_log_http_io:
             resp_content_type = replay_response.headers.get("content-type")
             HTTP_IO_LOGGER.info(
                 "%s",
                 preview_payload(
                     {
+                        **get_log_context(),
                         "event": "http.agent_io.response",
+                        "session_id": http_session_id,
                         "method": request.method,
                         "path": request.url.path,
                         "query": str(request.query_params),
@@ -1146,10 +1181,29 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         return response.json()
 
     @app.get("/debug/agent-io/events")
-    async def debug_agent_io_events(limit: int = 200) -> dict[str, Any]:
-        entries = _read_agent_http_io_entries(limit=max(1, min(limit, 1000)))
+    async def debug_agent_io_events(
+        limit: int = 200,
+        session_id: str | None = None,
+        include_debug_endpoints: bool = False,
+    ) -> dict[str, Any]:
+        requested_limit = max(1, min(limit, 1000))
+        scan_limit = max(200, requested_limit)
+        if session_id:
+            scan_limit = min(5000, max(scan_limit, requested_limit * 20))
+
+        entries = _read_agent_http_io_entries(limit=scan_limit)
+        if not include_debug_endpoints:
+            entries = [item for item in entries if not _is_debug_agent_io_path(str(item.get("path", "")))]
+        if session_id:
+            entries = [item for item in entries if str(item.get("session_id", "")).strip() == session_id]
+        entries = entries[-requested_limit:]
+
         enriched = [{"stage": _stage_name(item), **item} for item in entries]
-        return {"count": len(enriched), "items": enriched}
+        return {
+            "count": len(enriched),
+            "items": enriched,
+            "session_id": session_id or "",
+        }
 
     @app.get("/debug/agent-io", response_class=HTMLResponse)
     async def debug_agent_io_page() -> HTMLResponse:
@@ -1171,11 +1225,16 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
 </head>
 <body>
   <h1>Agent 交互实时面板</h1>
-  <div class="hint">顺序关注：用户输入 → LLM输入 → LLM输出 → API调用 → API输出 → 最终回复</div>
+  <div class="hint">顺序关注：用户输入 → LLM输入 → LLM输出 → API调用 → API输出 → 最终回复。可在 URL 上附加 ?session_id=xxx 只看单会话。</div>
   <div id="list"></div>
   <script>
+    const query = new URLSearchParams(window.location.search);
+    const sessionId = query.get('session_id');
+
     async function load() {
-      const res = await fetch('/debug/agent-io/events?limit=200');
+      const params = new URLSearchParams({ limit: '200' });
+      if (sessionId) params.set('session_id', sessionId);
+      const res = await fetch('/debug/agent-io/events?' + params.toString());
       const data = await res.json();
       const list = document.getElementById('list');
       list.innerHTML = '';

@@ -10,7 +10,7 @@ import httpx
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_random
 
 from app.clients.exceptions import DataSourceError
-from app.infra.logging import log_event, preview_payload
+from app.infra.logging import get_log_context, log_event, preview_payload
 from app.infra.tool_recorder import record_tool_result
 
 LOGGER = logging.getLogger(__name__)
@@ -99,6 +99,7 @@ class BaseClient:
             "%s",
             preview_payload(
                 {
+                    **get_log_context(),
                     "event": "http.agent_io.api.request",
                     "method": "GET",
                     "url": url,
@@ -129,6 +130,7 @@ class BaseClient:
                 "%s",
                 preview_payload(
                     {
+                        **get_log_context(),
                         "event": "http.agent_io.api.response",
                         "method": "GET",
                         "url": url,
@@ -154,6 +156,7 @@ class BaseClient:
                 "%s",
                 preview_payload(
                     {
+                        **get_log_context(),
                         "event": "http.agent_io.api.error",
                         "method": "GET",
                         "url": url,
@@ -200,6 +203,7 @@ class BaseClient:
             "%s",
             preview_payload(
                 {
+                    **get_log_context(),
                     "event": "http.agent_io.api.request",
                     "method": "POST",
                     "url": url,
@@ -236,6 +240,7 @@ class BaseClient:
                 "%s",
                 preview_payload(
                     {
+                        **get_log_context(),
                         "event": "http.agent_io.api.response",
                         "method": "POST",
                         "url": url,
@@ -261,6 +266,7 @@ class BaseClient:
                 "%s",
                 preview_payload(
                     {
+                        **get_log_context(),
                         "event": "http.agent_io.api.error",
                         "method": "POST",
                         "url": url,
