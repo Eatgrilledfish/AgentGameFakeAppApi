@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 from contextlib import asynccontextmanager
 from functools import lru_cache
 import json
 import logging
 import os
 from pathlib import Path
-import random
 import re
 import time
 from typing import Any
@@ -792,15 +790,23 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
     context_json = json.dumps(context_facts or {}, ensure_ascii=False)
     available_tools = ",".join(_load_llm_tool_names())
     content = (
-        "你是租房助手，负责在tools中选择最合适的API并抽取参数。\n"
-        "请优先通过tool_calls调用一个function，参数名必须来自该function的parameters定义。\n"
-        "严格反幻觉：不允许编造house_id、listing_platform、landmark_id、district等硬约束。\n"
-        "若用户显式给出house_id（如HF_67），必须使用该house_id，不能被上下文覆盖。\n"
-        "仅当用户未显式给house_id且出现“这套/第一套/最开始那套”时，才可使用focus_house_id或latest_search_house_ids。\n"
-        "rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\n"
-        "若是纯闲聊且无需调用工具，可直接输出JSON："
-        '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},"hard":{},"soft":{},"confidence":0.6}。\n'
-        f"可用函数operationId列表：{available_tools}\n"
+        "你是租房智能Agent决策器，目标是根据用户问题和tools列表决定如何查询。\n"
+        "核心任务：识别用户意图、选择最合适的一个API工具、提取参数，供agent直接调用。\n"
+        "规则：\n"
+        "1) 可用工具只允许从tools中选择，优先返回tool_calls，且一次只调用一个function。\n"
+        "2) tool arguments必须严格使用该function的参数名，不得新增字段。\n"
+        "3) 显式约束必须提取：区域、户型、价格、地铁距离、通勤、house_id、listing_platform。\n"
+        "4) 若用户显式给出house_id（如HF_67），必须使用该house_id，不能被上下文覆盖。\n"
+        "5) 仅当用户未显式给house_id且出现“这套/第一套/最开始那套”时，才可用上下文focus_house_id/latest_search_house_ids。\n"
+        "6) 对口语抱怨要做需求反推：\n"
+        "   - 采光不好/阴暗 -> 倾向orientation=朝南。\n"
+        "   - 房子太小/住着不舒服 -> 倾向增大min_area。\n"
+        "   - 通勤太长 -> 倾向max_subway_dist更小或commute_to_xierqi_max更小。\n"
+        "7) rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\n"
+        "8) 如果只是打招呼、闲聊、情绪表达且无需工具，禁止tool_calls，直接输出JSON object：\n"
+        '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},"hard":{},"soft":{},"assistant_reply":"...","confidence":0.6}\n'
+        "示例：用户说“找大兴区两居，租金4000以下”，应选择get_houses_by_platform并带district/bedrooms/max_price参数。\n"
+        f"可用operationId：{available_tools}\n"
         f"会话摘要：{summary_text}\n"
         f"上下文事实：{context_json}\n"
         f"用户输入：{message}"
@@ -1215,54 +1221,21 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
 
             output_text = invoke_resp.text
             response_kind = str(invoke_resp.debug.get("response_kind", "chat"))
+            llm_parse = invoke_meta.get("llm_parse") if isinstance(invoke_meta.get("llm_parse"), dict) else {}
             if response_kind == "search" or bool(invoke_resp.candidates):
                 response_payload: dict[str, Any] = {
                     "message": invoke_resp.text,
                     "houses": [item.house_id for item in invoke_resp.candidates],
                 }
             elif response_kind == "chat":
-                try:
-                    llm_messages = (
-                        service.build_llm_fallback_messages(req.session_id, req.message)
-                        if hasattr(service, "build_llm_fallback_messages")
-                        else [{"role": "user", "content": req.message}]
-                    )
-                    llm_prompt_tokens = (
-                        service.rough_token_estimate(json.dumps(llm_messages, ensure_ascii=False))
-                        if hasattr(service, "rough_token_estimate")
-                        else max(1, int(len(req.message) / 2))
-                    )
-                    http_client: httpx.AsyncClient = app.state.http_client
-                    llm_response = await _forward_chat_completion(
-                        http_client,
-                        model_ip=req.model_ip,
-                        messages=llm_messages,
-                        session_id=req.session_id,
-                    )
-                    llm_text = _extract_llm_text_content(llm_response)
-                    if llm_text:
-                        output_text = llm_text
-                        completion_tokens = (
-                            service.rough_token_estimate(llm_text)
-                            if hasattr(service, "rough_token_estimate")
-                            else max(1, int(len(llm_text) / 2))
-                        )
-                        if hasattr(service, "record_llm_fallback_usage"):
-                            service.record_llm_fallback_usage(req.session_id, llm_prompt_tokens + completion_tokens)
-                        log_event(
-                            LOGGER,
-                            "chat.llm_fallback.applied",
-                            step=STEP_LLM_FALLBACK,
-                            prompt_tokens=llm_prompt_tokens,
-                            completion_tokens=completion_tokens,
-                            llm_output=preview_text(llm_text, limit=300),
-                        )
-                except httpx.HTTPError as exc:
+                assistant_reply = llm_parse.get("assistant_reply")
+                if isinstance(assistant_reply, str) and assistant_reply.strip():
+                    output_text = assistant_reply.strip()
                     log_event(
                         LOGGER,
-                        "chat.llm_fallback_failed",
-                        step=STEP_LLM_FALLBACK,
-                        error=str(exc),
+                        "chat.llm_nlu.reply_applied",
+                        step=STEP_LLM_NLU,
+                        llm_output=preview_text(output_text, limit=300),
                     )
                 response_payload = {"message": output_text}
             else:

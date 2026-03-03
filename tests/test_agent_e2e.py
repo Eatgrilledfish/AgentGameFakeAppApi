@@ -175,7 +175,7 @@ def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
             assert headers["Session-ID"] == "sess-llm-nlu"
             assert json["messages"][0]["role"] == "user"
             content = json["messages"][0]["content"]
-            assert "你是租房助手" in content
+            assert "你是租房智能Agent决策器" in content
             assert "用户输入：帮我把第一套租掉" in content
             assert "上轮推荐 HF_1001" in content
             assert isinstance(json["tools"], list) and len(json["tools"]) > 0
@@ -221,7 +221,7 @@ def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
         assert captured["meta"]["llm_parse"]["tool_plan"]["arguments"]["house_id"] == "HF_1001"
 
 
-def test_chat_route_llm_fallback_payload_uses_user_input_content() -> None:
+def test_chat_route_uses_single_llm_call_and_applies_chat_reply_from_nlu() -> None:
     app = create_app()
     captured: dict = {}
 
@@ -246,7 +246,20 @@ def test_chat_route_llm_fallback_payload_uses_user_input_content() -> None:
     class StubHttpClient:
         async def post(self, url, json, headers):
             captured.setdefault("calls", []).append(json)
-            return StubResponse({"choices": [{"message": {"content": "LLM回答"}}]})
+            return StubResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},'
+                                    '"assistant_reply":"收到，我理解你的情况，我来帮你看下更合适的房子。","confidence":0.7}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            )
 
     with TestClient(app) as client:
         app.state.agent_service = StubService()
@@ -257,11 +270,12 @@ def test_chat_route_llm_fallback_payload_uses_user_input_content() -> None:
         )
 
     assert resp.status_code == 200
-    assert len(captured["calls"]) == 2
-    # 第二次调用为chat fallback，必须携带用户原话。
-    fallback_payload = captured["calls"][1]
-    assert fallback_payload["messages"] == [{"role": "user", "content": "用户原话-用于fallback"}]
-    assert isinstance(fallback_payload["tools"], list)
+    assert len(captured["calls"]) == 1
+    first_payload = captured["calls"][0]
+    assert first_payload["messages"][0]["role"] == "user"
+    assert "用户输入：用户原话-用于fallback" in first_payload["messages"][0]["content"]
+    assert isinstance(first_payload["tools"], list) and len(first_payload["tools"]) > 0
+    assert resp.json()["response"]["message"] == "收到，我理解你的情况，我来帮你看下更合适的房子。"
 
 
 def test_chat_route_sanitizes_unknown_tool_operation_from_llm() -> None:
