@@ -22,7 +22,16 @@ from app.agent.state import StateStore
 from app.clients.houses import HousesClient
 from app.clients.landmarks import LandmarksClient
 from app.infra.cache import CacheManager
-from app.infra.logging import bind_log_context, get_log_context, log_event, preview_payload, preview_text, reset_log_context, setup_logging
+from app.infra.logging import (
+    bind_log_context,
+    get_log_context,
+    log_event,
+    log_json_event,
+    preview_payload,
+    preview_text,
+    reset_log_context,
+    setup_logging,
+)
 from app.infra.tool_recorder import begin_tool_recording, get_tool_results, reset_tool_recording
 from app.schemas import CaseType, ChatRequest, ChatResponse, HealthResponse, InvokeRequest, InvokeResponse
 from app.settings import AgentSettings, load_settings
@@ -37,8 +46,7 @@ STEP_LLM_NLU = "STEP-02A-LLM-NLU"
 STEP_FINAL_RESPONSE = "STEP-04-FINAL-RESPONSE"
 STEP_HTTP = "STEP-00-HTTP"
 
-LLM_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=30.0, pool=5.0)
-LLM_RETRYABLE_EXCEPTIONS = (httpx.ConnectTimeout, httpx.ReadTimeout)
+LLM_TIMEOUT = httpx.Timeout(60.0)
 
 
 def _preview_http_body(raw_body: bytes, content_type: str | None, limit: int = 2000) -> str:
@@ -179,97 +187,65 @@ async def _forward_chat_completion(
         model_ip=model_ip,
         payload_preview=preview_payload(payload),
     )
-    HTTP_IO_LOGGER.info(
-        "%s",
-        preview_payload(
-            {
-                **get_log_context(),
-                "event": "http.agent_io.llm.request",
-                "method": "POST",
-                "url": target_url,
-                "session_id": session_id or "-",
-                "headers": headers,
-                "request_content_type": "application/json",
-                "request_body": preview_payload(payload, limit=8000),
-            },
-            limit=8000,
-        ),
+    log_json_event(
+        HTTP_IO_LOGGER,
+        {
+            **get_log_context(),
+            "event": "http.agent_io.llm.request",
+            "method": "POST",
+            "url": target_url,
+            "session_id": session_id or "-",
+            "headers": headers,
+            "request_content_type": "application/json",
+            "request_body": preview_payload(payload, limit=8000),
+        },
     )
 
     data: dict[str, Any]
-    for attempt in range(2):
-        try:
-            resp = await _llm_post(
-                http_client,
-                url=target_url,
-                payload=payload,
-                headers=headers,
-            )
-            response_body = _parse_llm_http_body(resp)
-            HTTP_IO_LOGGER.info(
-                "%s",
-                preview_payload(
-                    {
-                        **get_log_context(),
-                        "event": "http.agent_io.llm.response",
-                        "method": "POST",
-                        "url": target_url,
-                        "session_id": session_id or "-",
-                        "status_code": resp.status_code,
-                        "response_content_type": getattr(resp, "headers", {}).get("content-type", "application/json"),
-                        "response_body": preview_payload(response_body, limit=8000),
-                        "duration_ms": int((time.perf_counter() - started) * 1000),
-                    },
-                    limit=8000,
-                ),
-            )
-            resp.raise_for_status()
-            if isinstance(response_body, dict):
-                data = response_body
-            else:
-                parsed = _extract_json_object(str(response_body))
-                if not parsed:
-                    raise ValueError("LLM response body is not a valid JSON object")
-                data = parsed
-            break
-        except LLM_RETRYABLE_EXCEPTIONS as exc:
-            if attempt == 0:
-                await asyncio.sleep(random.uniform(0.05, 0.15))
-                continue
-            HTTP_IO_LOGGER.info(
-                "%s",
-                preview_payload(
-                    {
-                        **get_log_context(),
-                        "event": "http.agent_io.llm.error",
-                        "method": "POST",
-                        "url": target_url,
-                        "session_id": session_id or "-",
-                        **_normalize_error_payload(exc),
-                        "attempt": attempt + 1,
-                        "duration_ms": int((time.perf_counter() - started) * 1000),
-                    },
-                    limit=8000,
-                ),
-            )
-            raise
-        except Exception as exc:
-            HTTP_IO_LOGGER.info(
-                "%s",
-                preview_payload(
-                    {
-                        **get_log_context(),
-                        "event": "http.agent_io.llm.error",
-                        "method": "POST",
-                        "url": target_url,
-                        "session_id": session_id or "-",
-                        **_normalize_error_payload(exc),
-                        "duration_ms": int((time.perf_counter() - started) * 1000),
-                    },
-                    limit=8000,
-                ),
-            )
-            raise
+    try:
+        resp = await _llm_post(
+            http_client,
+            url=target_url,
+            payload=payload,
+            headers=headers,
+        )
+        response_body = _parse_llm_http_body(resp)
+        log_json_event(
+            HTTP_IO_LOGGER,
+            {
+                **get_log_context(),
+                "event": "http.agent_io.llm.response",
+                "method": "POST",
+                "url": target_url,
+                "session_id": session_id or "-",
+                "status_code": resp.status_code,
+                "response_content_type": getattr(resp, "headers", {}).get("content-type", "application/json"),
+                "response_body": preview_payload(response_body, limit=8000),
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            },
+        )
+        resp.raise_for_status()
+        if isinstance(response_body, dict):
+            data = response_body
+        else:
+            parsed = _extract_json_object(str(response_body))
+            if not parsed:
+                raise ValueError("LLM response body is not a valid JSON object")
+            data = parsed
+    except Exception as exc:
+        log_json_event(
+            HTTP_IO_LOGGER,
+            {
+                **get_log_context(),
+                "event": "http.agent_io.llm.error",
+                "method": "POST",
+                "url": target_url,
+                "session_id": session_id or "-",
+                **_normalize_error_payload(exc),
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            },
+        )
+        raise
     log_event(
         LOGGER,
         "chat.llm.forward.response",
@@ -1039,21 +1015,18 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         http_session_id = _resolve_http_session_id(request, raw_body, req_content_type)
         should_log_http_io = request.method in {"GET", "POST"} and not _is_debug_agent_io_path(request.url.path)
         if should_log_http_io:
-            HTTP_IO_LOGGER.info(
-                "%s",
-                preview_payload(
-                    {
-                        **get_log_context(),
-                        "event": "http.agent_io.request",
-                        "session_id": http_session_id,
-                        "method": request.method,
-                        "path": request.url.path,
-                        "query": str(request.query_params),
-                        "request_content_type": req_content_type or "<unknown>",
-                        "request_body": _preview_http_body(raw_body, req_content_type),
-                    },
-                    limit=8000,
-                ),
+            log_json_event(
+                HTTP_IO_LOGGER,
+                {
+                    **get_log_context(),
+                    "event": "http.agent_io.request",
+                    "session_id": http_session_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "query": str(request.query_params),
+                    "request_content_type": req_content_type or "<unknown>",
+                    "request_body": _preview_http_body(raw_body, req_content_type),
+                },
             )
 
         response = await call_next(request)
@@ -1081,23 +1054,20 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
 
         if should_log_http_io:
             resp_content_type = replay_response.headers.get("content-type")
-            HTTP_IO_LOGGER.info(
-                "%s",
-                preview_payload(
-                    {
-                        **get_log_context(),
-                        "event": "http.agent_io.response",
-                        "session_id": http_session_id,
-                        "method": request.method,
-                        "path": request.url.path,
-                        "query": str(request.query_params),
-                        "status_code": replay_response.status_code,
-                        "response_content_type": resp_content_type or "<unknown>",
-                        "response_body": _preview_http_body(response_body, resp_content_type),
-                        "duration_ms": duration_ms,
-                    },
-                    limit=8000,
-                ),
+            log_json_event(
+                HTTP_IO_LOGGER,
+                {
+                    **get_log_context(),
+                    "event": "http.agent_io.response",
+                    "session_id": http_session_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "query": str(request.query_params),
+                    "status_code": replay_response.status_code,
+                    "response_content_type": resp_content_type or "<unknown>",
+                    "response_body": _preview_http_body(response_body, resp_content_type),
+                    "duration_ms": duration_ms,
+                },
             )
         return replay_response
 

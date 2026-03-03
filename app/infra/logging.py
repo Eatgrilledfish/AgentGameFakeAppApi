@@ -95,6 +95,14 @@ def preview_text(text: str, limit: int = 200) -> str:
     return text[:limit] + "...(truncated)"
 
 
+def log_json_event(logger: logging.Logger, payload: dict[str, Any]) -> None:
+    try:
+        message = json.dumps(payload, ensure_ascii=False, default=str)
+    except TypeError:
+        message = str(payload)
+    logger.info("%s", message)
+
+
 def log_event(logger: logging.Logger, event: str, **fields: Any) -> None:
     seq = _CTX_SEQ.get() + 1
     _CTX_SEQ.set(seq)

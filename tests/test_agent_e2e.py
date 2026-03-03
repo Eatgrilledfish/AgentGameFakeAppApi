@@ -341,7 +341,7 @@ def test_chat_route_sanitizes_unknown_tool_operation_from_llm() -> None:
         assert tool_plan["arguments"] == {}
 
 
-def test_chat_route_llm_nlu_retries_once_on_read_timeout() -> None:
+def test_chat_route_llm_nlu_single_attempt_on_read_timeout() -> None:
     app = create_app()
     captured: dict = {"calls": 0}
 
@@ -389,8 +389,8 @@ def test_chat_route_llm_nlu_retries_once_on_read_timeout() -> None:
         )
 
         assert resp.status_code == 200
-        assert captured["calls"] == 2
-        assert captured["meta"]["llm_parse"]["intent"] == "search"
+        assert captured["calls"] == 1
+        assert "llm_parse" not in captured["meta"]
 
 
 def test_chat_route_always_calls_llm_nlu_even_when_service_policy_disallows() -> None:

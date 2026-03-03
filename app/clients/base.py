@@ -10,7 +10,7 @@ import httpx
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_random
 
 from app.clients.exceptions import DataSourceError
-from app.infra.logging import get_log_context, log_event, preview_payload
+from app.infra.logging import get_log_context, log_event, log_json_event, preview_payload
 from app.infra.tool_recorder import record_tool_result
 
 LOGGER = logging.getLogger(__name__)
@@ -95,19 +95,16 @@ class BaseClient:
             params=params if params is not None else {},
             headers=self._sanitize_headers(headers),
         )
-        HTTP_IO_LOGGER.info(
-            "%s",
-            preview_payload(
-                {
-                    **get_log_context(),
-                    "event": "http.agent_io.api.request",
-                    "method": "GET",
-                    "url": url,
-                    "params": params if params is not None else {},
-                    "headers": self._sanitize_headers(headers),
-                },
-                limit=8000,
-            ),
+        log_json_event(
+            HTTP_IO_LOGGER,
+            {
+                **get_log_context(),
+                "event": "http.agent_io.api.request",
+                "method": "GET",
+                "url": url,
+                "params": params if params is not None else {},
+                "headers": self._sanitize_headers(headers),
+            },
         )
 
         async def request() -> httpx.Response:
@@ -126,19 +123,16 @@ class BaseClient:
                 status_code=response.status_code,
                 body=preview_payload(payload),
             )
-            HTTP_IO_LOGGER.info(
-                "%s",
-                preview_payload(
-                    {
-                        **get_log_context(),
-                        "event": "http.agent_io.api.response",
-                        "method": "GET",
-                        "url": url,
-                        "status_code": response.status_code,
-                        "body": preview_payload(payload, limit=8000),
-                    },
-                    limit=8000,
-                ),
+            log_json_event(
+                HTTP_IO_LOGGER,
+                {
+                    **get_log_context(),
+                    "event": "http.agent_io.api.response",
+                    "method": "GET",
+                    "url": url,
+                    "status_code": response.status_code,
+                    "body": preview_payload(payload, limit=8000),
+                },
             )
             record_tool_result(
                 name=f"GET {path}",
@@ -152,18 +146,15 @@ class BaseClient:
             return payload
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
             log_event(LOGGER, "upstream.error", step=STEP_UPSTREAM_API, method="GET", url=url, error=str(exc))
-            HTTP_IO_LOGGER.info(
-                "%s",
-                preview_payload(
-                    {
-                        **get_log_context(),
-                        "event": "http.agent_io.api.error",
-                        "method": "GET",
-                        "url": url,
-                        "error": str(exc),
-                    },
-                    limit=8000,
-                ),
+            log_json_event(
+                HTTP_IO_LOGGER,
+                {
+                    **get_log_context(),
+                    "event": "http.agent_io.api.error",
+                    "method": "GET",
+                    "url": url,
+                    "error": str(exc),
+                },
             )
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
             record_tool_result(
@@ -199,20 +190,17 @@ class BaseClient:
             json=json if json is not None else None,
             headers=self._sanitize_headers(headers),
         )
-        HTTP_IO_LOGGER.info(
-            "%s",
-            preview_payload(
-                {
-                    **get_log_context(),
-                    "event": "http.agent_io.api.request",
-                    "method": "POST",
-                    "url": url,
-                    "params": params if params is not None else {},
-                    "json": json if json is not None else None,
-                    "headers": self._sanitize_headers(headers),
-                },
-                limit=8000,
-            ),
+        log_json_event(
+            HTTP_IO_LOGGER,
+            {
+                **get_log_context(),
+                "event": "http.agent_io.api.request",
+                "method": "POST",
+                "url": url,
+                "params": params if params is not None else {},
+                "json": json if json is not None else None,
+                "headers": self._sanitize_headers(headers),
+            },
         )
         try:
             kwargs: dict[str, Any] = {"headers": headers}
@@ -236,19 +224,16 @@ class BaseClient:
                 status_code=response.status_code,
                 body=preview_payload(payload),
             )
-            HTTP_IO_LOGGER.info(
-                "%s",
-                preview_payload(
-                    {
-                        **get_log_context(),
-                        "event": "http.agent_io.api.response",
-                        "method": "POST",
-                        "url": url,
-                        "status_code": response.status_code,
-                        "body": preview_payload(payload, limit=8000),
-                    },
-                    limit=8000,
-                ),
+            log_json_event(
+                HTTP_IO_LOGGER,
+                {
+                    **get_log_context(),
+                    "event": "http.agent_io.api.response",
+                    "method": "POST",
+                    "url": url,
+                    "status_code": response.status_code,
+                    "body": preview_payload(payload, limit=8000),
+                },
             )
             record_tool_result(
                 name=f"POST {path}",
@@ -262,18 +247,15 @@ class BaseClient:
             return payload
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
             log_event(LOGGER, "upstream.error", step=STEP_UPSTREAM_API, method="POST", url=url, error=str(exc))
-            HTTP_IO_LOGGER.info(
-                "%s",
-                preview_payload(
-                    {
-                        **get_log_context(),
-                        "event": "http.agent_io.api.error",
-                        "method": "POST",
-                        "url": url,
-                        "error": str(exc),
-                    },
-                    limit=8000,
-                ),
+            log_json_event(
+                HTTP_IO_LOGGER,
+                {
+                    **get_log_context(),
+                    "event": "http.agent_io.api.error",
+                    "method": "POST",
+                    "url": url,
+                    "error": str(exc),
+                },
             )
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
             record_tool_result(
