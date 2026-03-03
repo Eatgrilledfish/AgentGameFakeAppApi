@@ -17,6 +17,7 @@ from fastapi.responses import HTMLResponse, Response
 
 from app.agent.service import AgentService
 from app.agent.state import StateStore
+from app.clients.exceptions import DataSourceError
 from app.clients.houses import HousesClient
 from app.clients.landmarks import LandmarksClient
 from app.infra.cache import CacheManager
@@ -1065,6 +1066,39 @@ async def _polish_detail_reply_with_llm(
     return _extract_llm_assistant_reply(response_data)
 
 
+async def _preload_landmark_catalog(*, cache: CacheManager, landmarks_client: LandmarksClient) -> None:
+    started = time.perf_counter()
+    try:
+        landmarks = await landmarks_client.list_landmarks()
+    except DataSourceError as exc:
+        log_event(
+            LOGGER,
+            "startup.landmarks.preload.failed",
+            error=str(exc),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return
+
+    stats: dict[str, Any] | None = None
+    try:
+        raw_stats = await landmarks_client.stats()
+        if isinstance(raw_stats, dict):
+            stats = raw_stats
+    except DataSourceError:
+        stats = None
+
+    cache.prime_landmark_catalog(landmarks, stats)
+    log_event(
+        LOGGER,
+        "startup.landmarks.preload.done",
+        landmark_count=len(landmarks),
+        landmark_alias_count=len(cache.landmark_name_aliases),
+        district_alias_count=len(cache.landmark_district_aliases),
+        category_count=len(cache.landmark_categories),
+        duration_ms=int((time.perf_counter() - started) * 1000),
+    )
+
+
 def create_app(settings: AgentSettings | None = None) -> FastAPI:
     cfg = settings or load_settings()
     setup_logging(cfg.log_level)
@@ -1089,6 +1123,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         state_store = StateStore(cfg)
         landmarks_client = LandmarksClient(cfg.api_base_url, cfg.default_user_id, http_client)
         houses_client = HousesClient(cfg.api_base_url, cfg.default_user_id, http_client)
+        await _preload_landmark_catalog(cache=cache, landmarks_client=landmarks_client)
         service = AgentService(
             settings=cfg,
             state_store=state_store,

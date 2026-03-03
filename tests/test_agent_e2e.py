@@ -5,9 +5,11 @@ from fastapi.testclient import TestClient
 import httpx
 
 from app.clients.houses import HousesClient
+from app.infra.cache import CacheManager
 from app.infra.tool_recorder import record_tool_result
-from app.main import _build_llm_context_facts, create_app
-from app.schemas import InvokeResponse
+from app.main import _build_llm_context_facts, _preload_landmark_catalog, create_app
+from app.schemas import InvokeResponse, Landmark
+from app.settings import AgentSettings
 
 
 def test_invoke_route_with_stub_service() -> None:
@@ -86,6 +88,30 @@ def test_llm_context_facts_include_soft_preferences() -> None:
     assert facts["confirmed_constraints"]["max_subway_dist"] == 800
     assert facts["soft_preferences"]["orientation"] == "朝南"
     assert facts["soft_preferences"]["prioritize_subway_distance"] is True
+
+
+def test_startup_preload_landmark_catalog_primes_alias_dictionary() -> None:
+    cache = CacheManager(AgentSettings())
+
+    class StubLandmarksClient:
+        async def list_landmarks(self):
+            return [
+                Landmark(id="LM_WJ", name="望京", category="landmark", district="朝阳"),
+                Landmark(id="SS_001", name="车公庄站", category="subway", district="西城"),
+            ]
+
+        async def stats(self):
+            return {
+                "categories": ["company", "landmark", "subway"],
+                "districts": ["朝阳", "西城", "海淀"],
+            }
+
+    asyncio.run(_preload_landmark_catalog(cache=cache, landmarks_client=StubLandmarksClient()))
+    assert "望京" in cache.landmark_name_aliases
+    assert "车公庄站" in cache.landmark_name_aliases
+    assert "车公庄" in cache.landmark_name_aliases
+    assert "朝阳" in cache.landmark_district_aliases
+    assert "subway" in cache.landmark_categories
 
 
 def test_chat_route_accepts_content_field_as_user_input() -> None:

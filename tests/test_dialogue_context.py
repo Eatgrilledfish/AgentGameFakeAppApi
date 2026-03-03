@@ -9,7 +9,7 @@ from app.agent.formatter import OutputFormatter
 from app.agent.nlu import RuleBasedNLU
 from app.agent.state import StateStore
 from app.infra.cache import CacheManager
-from app.schemas import CaseType, HouseLite, HouseViewModel, InvokeRequest, Listing, SessionState, StructuredQuery
+from app.schemas import CaseType, HouseLite, HouseViewModel, InvokeRequest, Landmark, Listing, SessionState, StructuredQuery
 from app.settings import AgentSettings
 
 
@@ -173,11 +173,13 @@ class DummyHousesClient:
 def _build_dialogue(
     planner: DummyPlanner | None = None,
     houses_client: DummyHousesClient | None = None,
+    cache: CacheManager | None = None,
 ) -> tuple[DialogueManager, SessionState, DummyPlanner, DummyHousesClient]:
     settings = AgentSettings()
     state = SessionState(session_id="sess-ctx", user_id="u-1", case_type=CaseType.single)
     planner_impl = planner or DummyPlanner()
     houses_impl = houses_client or DummyHousesClient()
+    cache_impl = cache or CacheManager(settings)
     dialogue = DialogueManager(
         state_store=StateStore(settings),
         nlu=RuleBasedNLU(),
@@ -185,7 +187,7 @@ def _build_dialogue(
         ranker=DummyRanker(),
         formatter=OutputFormatter(),
         houses_client=houses_impl,
-        cache=CacheManager(settings),
+        cache=cache_impl,
         max_output_candidates=5,
     )
     return dialogue, state, planner_impl, houses_impl
@@ -579,6 +581,49 @@ async def test_dialogue_keeps_admin_division_in_district_from_llm_arguments() ->
     assert planner.executed_queries
     assert planner.executed_queries[-1].hard.district == "天河"
     assert planner.executed_queries[-1].hard.area is None
+
+
+@pytest.mark.asyncio
+async def test_dialogue_uses_preloaded_landmark_catalog_to_disambiguate_district_field() -> None:
+    planner = DummyPlanner()
+    houses = DummyHousesClient()
+    cache = CacheManager(AgentSettings())
+    cache.prime_landmark_catalog(
+        [
+            Landmark(id="LM_WJ", name="望京", category="landmark", district="朝阳"),
+            Landmark(id="SS_001", name="车公庄站", category="subway", district="西城"),
+        ],
+        stats={"categories": ["company", "landmark", "subway"], "districts": ["朝阳", "西城", "大兴"]},
+    )
+    dialogue, state, planner, _ = _build_dialogue(planner=planner, houses_client=houses, cache=cache)
+
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="按之前条件继续找房",
+            meta={
+                "llm_parse": {
+                    "tool_plan": {
+                        "operationId": "get_houses_by_platform",
+                        "arguments": {
+                            "district": "望京",
+                            "max_price": 8000,
+                            "bedrooms": "2",
+                        },
+                    },
+                    "confidence": 0.9,
+                }
+            },
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    assert resp.debug["response_kind"] == "search"
+    assert planner.executed_queries
+    assert planner.executed_queries[-1].hard.district is None
+    assert planner.executed_queries[-1].hard.area == "望京"
 
 
 @pytest.mark.asyncio

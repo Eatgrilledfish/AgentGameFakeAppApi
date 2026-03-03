@@ -129,6 +129,7 @@ class DialogueManager:
         self.cache = cache
         self.max_output_candidates = max_output_candidates
         self._known_district_aliases: set[str] | None = None
+        self._known_landmark_aliases: set[str] | None = None
 
     async def handle_turn(self, request: InvokeRequest, state: SessionState, is_new_session: bool) -> InvokeResponse:
         log_event(
@@ -1034,9 +1035,17 @@ class DialogueManager:
             return
 
         known_districts = await self._get_known_district_aliases()
+        known_landmarks = await self._get_known_landmark_aliases()
         normalized = cleaned[:-1] if cleaned.endswith("区") else cleaned
         if normalized in known_districts or cleaned in known_districts:
             query.hard.district = normalized
+            return
+
+        if cleaned in known_landmarks and cleaned not in known_districts:
+            query.hard.area = cleaned
+            query.hard.district = None
+            if query.hard.landmark_name is None:
+                query.hard.landmark_name = cleaned
             return
 
         if cleaned in user_text and not self._contains_explicit_admin_suffix_for(cleaned, user_text):
@@ -1045,6 +1054,11 @@ class DialogueManager:
 
     async def _get_known_district_aliases(self) -> set[str]:
         if self._known_district_aliases is not None:
+            return self._known_district_aliases
+
+        cached_aliases = getattr(self.cache, "landmark_district_aliases", None)
+        if isinstance(cached_aliases, set) and cached_aliases:
+            self._known_district_aliases = set(cached_aliases)
             return self._known_district_aliases
 
         aliases: set[str] = set()
@@ -1067,6 +1081,37 @@ class DialogueManager:
                     aliases.add(cleaned[:-1])
 
         self._known_district_aliases = aliases
+        return aliases
+
+    async def _get_known_landmark_aliases(self) -> set[str]:
+        if self._known_landmark_aliases is not None:
+            return self._known_landmark_aliases
+
+        cached_aliases = getattr(self.cache, "landmark_name_aliases", None)
+        if isinstance(cached_aliases, set) and cached_aliases:
+            self._known_landmark_aliases = set(cached_aliases)
+            return self._known_landmark_aliases
+
+        aliases: set[str] = set()
+        client = self.landmarks_client
+        list_fn = getattr(client, "list_landmarks", None) if client is not None else None
+        if callable(list_fn):
+            try:
+                landmarks = await list_fn()
+            except DataSourceError:
+                landmarks = []
+            for item in landmarks:
+                name = getattr(item, "name", None)
+                if not isinstance(name, str):
+                    continue
+                cleaned = name.strip()
+                if not cleaned:
+                    continue
+                aliases.add(cleaned)
+                if cleaned.endswith("站") and len(cleaned) > 1:
+                    aliases.add(cleaned[:-1])
+
+        self._known_landmark_aliases = aliases
         return aliases
 
     @staticmethod
