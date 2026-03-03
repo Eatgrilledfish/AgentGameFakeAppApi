@@ -67,6 +67,8 @@ async def _forward_chat_completion(
         "messages": messages,
         "stream": False,
     }
+    target_url = f"{_build_model_base_url(model_ip)}/v1/chat/completions"
+    started = time.perf_counter()
     log_event(
         LOGGER,
         "chat.llm.forward.request",
@@ -74,14 +76,46 @@ async def _forward_chat_completion(
         model_ip=model_ip,
         payload_preview=preview_payload(payload),
     )
-
-    resp = await http_client.post(
-        f"{_build_model_base_url(model_ip)}/v1/chat/completions",
-        json=payload,
-        headers=headers,
+    HTTP_IO_LOGGER.info(
+        "%s",
+        preview_payload(
+            {
+                "event": "http.agent_io.llm.request",
+                "method": "POST",
+                "url": target_url,
+                "session_id": session_id or "-",
+                "request_content_type": "application/json",
+                "request_body": preview_payload(payload, limit=8000),
+            },
+            limit=8000,
+        ),
     )
-    resp.raise_for_status()
-    data = resp.json()
+
+    try:
+        resp = await http_client.post(
+            target_url,
+            json=payload,
+            headers=headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        HTTP_IO_LOGGER.info(
+            "%s",
+            preview_payload(
+                {
+                    "event": "http.agent_io.llm.error",
+                    "method": "POST",
+                    "url": target_url,
+                    "session_id": session_id or "-",
+                    "error": str(exc),
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                },
+                limit=8000,
+            ),
+        )
+        raise
+
     log_event(
         LOGGER,
         "chat.llm.forward.response",
@@ -89,6 +123,23 @@ async def _forward_chat_completion(
         status_code=resp.status_code,
         body_preview=preview_payload(data),
     )
+    HTTP_IO_LOGGER.info(
+        "%s",
+        preview_payload(
+            {
+                "event": "http.agent_io.llm.response",
+                "method": "POST",
+                "url": target_url,
+                "session_id": session_id or "-",
+                "status_code": resp.status_code,
+                "response_content_type": getattr(resp, "headers", {}).get("content-type", "application/json"),
+                "response_body": preview_payload(data, limit=8000),
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            },
+            limit=8000,
+        ),
+    )
+
     choices = data.get("choices", [])
     if not choices:
         return None
