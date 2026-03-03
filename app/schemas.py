@@ -147,6 +147,8 @@ class HouseViewModel(BaseModel):
     commute_to_xierqi_min: int | None = None
     available_date: str | None = None
     tags: list[str] = Field(default_factory=list)
+    pet_friendly: bool | None = None
+    amenity_summary: dict[str, Any] = Field(default_factory=dict)
     pros: list[str] = Field(default_factory=list)
     cons: list[str] = Field(default_factory=list)
     score: float | None = None

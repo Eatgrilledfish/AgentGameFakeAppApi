@@ -90,6 +90,42 @@ def test_llm_context_facts_include_soft_preferences() -> None:
     assert facts["soft_preferences"]["prioritize_subway_distance"] is True
 
 
+def test_llm_context_facts_include_compact_top_houses_with_amenities() -> None:
+    class StubHouse:
+        house_id = "HF_2515"
+        district = "朝阳"
+        community = "融创苑8区"
+        layout = "2居1厅1卫"
+        rent = 3000
+        subway_distance = 3635
+        commute_to_xierqi_min = 39
+        pet_friendly = True
+        amenity_summary = {"shopping_count": 3, "nearest_shopping_m": 450, "park_count": 2, "nearest_park_m": 380}
+        tags = ["可养狗", "近公园", "近商超", "网费另付"]
+
+    class StubState:
+        case_type = type("CaseType", (), {"value": "Multi"})()
+        focus_house_id = "HF_2515"
+        focus_listing_platform = None
+        confirmed_constraints = type("Hard", (), {"model_dump": staticmethod(lambda exclude_none=True: {})})()
+        soft_preferences = type(
+            "Soft",
+            (),
+            {"model_dump": staticmethod(lambda exclude_none=True: {"preferred_tags": ["可养狗"], "amenities": ["公园"]})},
+        )()
+        search_history = []
+        recent_turns = []
+        last_top5 = [StubHouse()]
+
+    facts = _build_llm_context_facts(StubState())
+
+    assert "latest_top_houses" in facts
+    assert facts["latest_top_houses"][0]["house_id"] == "HF_2515"
+    assert facts["latest_top_houses"][0]["pet_friendly"] is True
+    assert facts["latest_top_houses"][0]["amenity_summary"]["park_count"] == 2
+    assert "近公园" in facts["latest_top_houses"][0]["key_tags"]
+
+
 def test_startup_preload_landmark_catalog_primes_alias_dictionary() -> None:
     cache = CacheManager(AgentSettings())
 

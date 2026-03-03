@@ -1,7 +1,7 @@
 import pytest
 
 from app.agent.ranker import Ranker
-from app.schemas import HardConstraints, HouseLite, Listing, SoftPreferences, StructuredQuery
+from app.schemas import HardConstraints, HouseLite, Listing, NearbyLandmark, SoftPreferences, StructuredQuery
 from app.settings import RankingWeights
 
 
@@ -272,3 +272,46 @@ async def test_ranker_penalizes_avoid_tags_and_prioritizes_preferred_tags() -> N
     top = await ranker.rank_two_stage(candidates, query, max_output=2)
 
     assert [item.house_id for item in top] == ["HF_SAFE", "HF_RISKY"]
+
+
+@pytest.mark.asyncio
+async def test_ranker_exposes_pet_and_amenity_summary_in_view_model() -> None:
+    class AmenityClient(DummyHousesClient):
+        async def nearby_landmarks(self, community: str, category: str, max_distance_m: int = 3000):
+            _ = community
+            _ = max_distance_m
+            if category == "shopping":
+                return [NearbyLandmark(name="商场A", category="shopping", distance_m=420)]
+            if category == "park":
+                return [
+                    NearbyLandmark(name="公园A", category="park", distance_m=350),
+                    NearbyLandmark(name="公园B", category="park", distance_m=700),
+                ]
+            return []
+
+    ranker = Ranker(houses_client=AmenityClient(), weights=RankingWeights(), enrich_concurrency=2)
+    query = StructuredQuery(
+        hard=HardConstraints(budget_max=7000),
+        soft=SoftPreferences(amenities=["公园"]),
+    )
+    candidates = [
+        HouseLite(
+            house_id="HF_PET",
+            rent=6200,
+            area=68,
+            district="朝阳",
+            community="A",
+            subway_distance=650,
+            commute_to_xierqi_min=36,
+            status="available",
+            layout="2居1厅1卫",
+            tags=["可养狗", "近公园"],
+        )
+    ]
+
+    top = await ranker.rank_two_stage(candidates, query, max_output=1)
+
+    assert len(top) == 1
+    assert top[0].pet_friendly is True
+    assert top[0].amenity_summary.get("park_count") == 2
+    assert top[0].amenity_summary.get("nearest_park_m") == 350.0

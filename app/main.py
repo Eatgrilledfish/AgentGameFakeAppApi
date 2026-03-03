@@ -771,6 +771,8 @@ def _build_llm_context_facts(state: Any) -> dict[str, Any]:
             "elevator",
             "noise_preference",
             "amenities",
+            "preferred_tags",
+            "avoid_tags",
             "value_for_money",
             "prefer_spacious",
             "prioritize_subway_distance",
@@ -804,6 +806,16 @@ def _build_llm_context_facts(state: Any) -> dict[str, Any]:
             facts["recent_searches"] = recent_searches
             facts["latest_search_house_ids"] = recent_searches[-1]["house_ids"]
 
+    last_top5 = getattr(state, "last_top5", None)
+    if isinstance(last_top5, list) and last_top5:
+        compact_houses: list[dict[str, Any]] = []
+        for item in last_top5[:5]:
+            compact = _compact_house_for_llm_context(item)
+            if compact:
+                compact_houses.append(compact)
+        if compact_houses:
+            facts["latest_top_houses"] = compact_houses
+
     recent_turns = getattr(state, "recent_turns", None)
     if isinstance(recent_turns, list) and recent_turns:
         actions: list[dict[str, Any]] = []
@@ -822,6 +834,92 @@ def _build_llm_context_facts(state: Any) -> dict[str, Any]:
             facts["recent_actions"] = actions
 
     return facts
+
+
+def _compact_house_for_llm_context(item: Any) -> dict[str, Any]:
+    house_id = getattr(item, "house_id", None)
+    if not isinstance(house_id, str) or not house_id:
+        return {}
+
+    row: dict[str, Any] = {"house_id": house_id}
+    for key in ("district", "community", "layout", "rent", "subway_distance", "commute_to_xierqi_min"):
+        value = getattr(item, key, None)
+        if value is None:
+            continue
+        row[key] = value
+
+    pet_friendly = getattr(item, "pet_friendly", None)
+    if isinstance(pet_friendly, bool):
+        row["pet_friendly"] = pet_friendly
+    else:
+        tags = getattr(item, "tags", None)
+        inferred = _infer_pet_friendly_from_tags(tags if isinstance(tags, list) else [])
+        if inferred is not None:
+            row["pet_friendly"] = inferred
+
+    amenity_summary = getattr(item, "amenity_summary", None)
+    if isinstance(amenity_summary, dict):
+        compact_amenity: dict[str, Any] = {}
+        for key in ("shopping_count", "nearest_shopping_m", "park_count", "nearest_park_m"):
+            value = amenity_summary.get(key)
+            if isinstance(value, (int, float)) and value >= 0:
+                compact_amenity[key] = value
+        if compact_amenity:
+            row["amenity_summary"] = compact_amenity
+
+    tags = getattr(item, "tags", None)
+    if isinstance(tags, list) and tags:
+        key_tags = _pick_key_tags_for_llm(tags)
+        if key_tags:
+            row["key_tags"] = key_tags
+
+    return row
+
+
+def _infer_pet_friendly_from_tags(tags: list[Any]) -> bool | None:
+    normalized = [str(tag).strip().lower() for tag in tags if isinstance(tag, str) and str(tag).strip()]
+    if not normalized:
+        return None
+    if any(any(token in tag for token in ("不可养宠", "禁止养宠", "不允许养宠")) for tag in normalized):
+        return False
+    if any(any(token in tag for token in ("可养宠", "可养猫", "可养狗", "宠物友好", "仅限小型犬")) for tag in normalized):
+        return True
+    return None
+
+
+def _pick_key_tags_for_llm(tags: list[Any], *, limit: int = 8) -> list[str]:
+    picked: list[str] = []
+    seen: set[str] = set()
+    keywords = (
+        "可养",
+        "宠物",
+        "公园",
+        "商超",
+        "地铁",
+        "通勤",
+        "采光",
+        "朝",
+        "电梯",
+        "安静",
+        "临街",
+        "中介费",
+        "网费",
+        "物业费",
+        "水电费",
+        "取暖费",
+    )
+    for raw in tags:
+        if not isinstance(raw, str):
+            continue
+        tag = raw.strip()
+        if not tag or tag in seen:
+            continue
+        if any(word in tag for word in keywords):
+            seen.add(tag)
+            picked.append(tag)
+        if len(picked) >= limit:
+            break
+    return picked
 
 
 def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str, Any] | None = None) -> list[dict[str, str]]:
@@ -1010,7 +1108,8 @@ def _build_llm_detail_reply_messages(
         "1) 不得编造房源事实（状态、价格、距离、朝向等）。若工具结果缺失，明确说明“当前工具结果未提供该信息”。\n"
         "2) 若是操作类结果（租房/退租/下架），要明确说明是否成功及关键对象（house_id、平台、状态）。\n"
         "3) 语气专业、友善、简洁。\n"
-        "4) 仅输出JSON object，格式必须为：{\"assistant_reply\":\"...\"}，不要输出其他字段。\n"
+        "4) 若上下文提供latest_top_houses中的amenity_summary/key_tags，可作为已知事实引用（这些来自上游工具结果的会话压缩）。\n"
+        "5) 仅输出JSON object，格式必须为：{\"assistant_reply\":\"...\"}，不要输出其他字段。\n"
         f"用户原话：{user_message}\n"
         f"Agent草稿：{draft_reply}\n"
         f"会话上下文(JSON)：{json.dumps(context_facts or {}, ensure_ascii=False)}\n"
@@ -1037,6 +1136,9 @@ def _extract_llm_assistant_reply(data: dict[str, Any]) -> str | None:
         reply = parsed.get("assistant_reply")
         if isinstance(reply, str) and reply.strip():
             return reply.strip()
+        message = parsed.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
     return stripped
 
 

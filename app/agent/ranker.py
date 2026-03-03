@@ -224,6 +224,8 @@ class Ranker:
         listings = ranked.listings
         selected_platform = _choose_best_platform(house, listings)
         score = self._fine_score(house, listings, query, amenities=ranked.amenities)
+        amenity_summary = _summarize_amenities_for_context(ranked.amenities)
+        pet_friendly = _is_pet_friendly_tags(house.tags)
 
         pros: list[str] = []
         cons: list[str] = []
@@ -234,6 +236,15 @@ class Ranker:
             pros.append(f"距地铁约 {house.subway_distance} 米")
         if house.rent is not None:
             pros.append(f"月租 {house.rent} 元")
+        if pet_friendly:
+            pros.append("支持养宠")
+        park_count = amenity_summary.get("park_count")
+        if isinstance(park_count, int) and park_count > 0:
+            nearest_park_m = amenity_summary.get("nearest_park_m")
+            if isinstance(nearest_park_m, (int, float)):
+                pros.append(f"周边公园 {park_count} 个，最近约 {int(nearest_park_m)} 米")
+            else:
+                pros.append(f"周边公园 {park_count} 个")
 
         if any(tag in (house.tags or []) for tag in ["农村房", "农村自建房", "临街"]):
             cons.append("存在潜在居住风险标签，建议实地核验")
@@ -259,6 +270,8 @@ class Ranker:
             commute_to_xierqi_min=house.commute_to_xierqi_min,
             available_date=house.available_date,
             tags=house.tags,
+            pet_friendly=pet_friendly,
+            amenity_summary=amenity_summary,
             pros=pros[:4],
             cons=cons[:3],
             score=round(score, 2),
@@ -472,3 +485,47 @@ def _tag_preference_score(house: HouseLite, query: StructuredQuery) -> float:
     if total <= 0.0:
         return 0.0
     return max(0.0, min(1.0, score / total))
+
+
+def _summarize_amenities_for_context(amenities: dict[str, list[NearbyLandmark]]) -> dict[str, int | float]:
+    if not amenities:
+        return {}
+
+    summary: dict[str, int | float] = {}
+    shopping = amenities.get("shopping", [])
+    parks = amenities.get("park", [])
+
+    if shopping:
+        summary["shopping_count"] = len(shopping)
+        nearest = _nearest_landmark_distance(shopping)
+        if nearest is not None:
+            summary["nearest_shopping_m"] = nearest
+
+    if parks:
+        summary["park_count"] = len(parks)
+        nearest = _nearest_landmark_distance(parks)
+        if nearest is not None:
+            summary["nearest_park_m"] = nearest
+    return summary
+
+
+def _nearest_landmark_distance(items: list[NearbyLandmark]) -> float | None:
+    values = [float(item.distance_m) for item in items if getattr(item, "distance_m", None) is not None]
+    if not values:
+        return None
+    return round(min(values), 1)
+
+
+def _is_pet_friendly_tags(tags: list[str] | None) -> bool | None:
+    if not tags:
+        return None
+
+    normalized = [tag.strip().lower() for tag in tags if isinstance(tag, str) and tag.strip()]
+    if not normalized:
+        return None
+
+    if any(any(token in tag for token in ("不可养宠", "禁止养宠", "不允许养宠")) for tag in normalized):
+        return False
+    if any(any(token in tag for token in ("可养宠", "可养猫", "可养狗", "宠物友好", "仅限小型犬")) for tag in normalized):
+        return True
+    return None
