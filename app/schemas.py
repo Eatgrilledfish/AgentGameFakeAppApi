@@ -44,6 +44,7 @@ class HardConstraints(BaseModel):
     layout: str | None = None
     area_min: float | None = None
     max_subway_dist: int | None = None
+    max_distance: int | None = None
     max_commute_min: int | None = None
     utilities_type: str | None = None
     move_in_date: str | None = None

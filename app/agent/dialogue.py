@@ -56,6 +56,7 @@ _TOOL_ARGUMENT_ALIASES = {
     "available_from_before": "move_in_date",
     "commute_to_xierqi_max": "max_commute_min",
     "landmark_id": "landmark_id",
+    "max_distance": "max_distance",
 }
 
 
@@ -500,7 +501,7 @@ class DialogueManager:
                 if platform is not None:
                     hard.listing_platform = platform
                 continue
-            if key in {"budget_min", "budget_max", "max_subway_dist", "max_commute_min"}:
+            if key in {"budget_min", "budget_max", "max_subway_dist", "max_distance", "max_commute_min"}:
                 parsed = _to_int(value)
                 if parsed is not None:
                     setattr(hard, key, parsed)

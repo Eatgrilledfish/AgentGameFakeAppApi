@@ -438,6 +438,41 @@ async def test_dialogue_prefers_llm_tool_plan_for_search_arguments() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dialogue_preserves_llm_nearby_max_distance_argument() -> None:
+    planner = DummyPlanner()
+    houses = DummyHousesClient()
+    dialogue, state, planner, _ = _build_dialogue(planner=planner, houses_client=houses)
+
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="车公庄站500米内的两居",
+            meta={
+                "llm_parse": {
+                    "tool_plan": {
+                        "operationId": "get_houses_nearby",
+                        "arguments": {
+                            "landmark_id": "车公庄站",
+                            "max_distance": 500,
+                            "bedrooms": "2",
+                        },
+                    },
+                    "confidence": 0.9,
+                }
+            },
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    assert resp.debug["response_kind"] == "search"
+    assert planner.executed_queries[-1].hard.landmark_id == "车公庄站"
+    assert planner.executed_queries[-1].hard.max_distance == 500
+    assert planner.executed_queries[-1].hard.layout == "2居"
+
+
+@pytest.mark.asyncio
 async def test_dialogue_treats_this_one_as_focus_not_first_rank() -> None:
     planner = DummyPlanner()
     houses = DummyHousesClient()

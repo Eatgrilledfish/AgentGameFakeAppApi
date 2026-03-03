@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+from typing import Any
 
 from app.clients.exceptions import DataSourceError
 from app.clients.houses import HousesClient
@@ -67,18 +68,48 @@ class Planner:
     async def execute_plan(self, plan: RetrievalPlan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
         max_pages = self.max_pages_single if case_type == CaseType.single else self.max_pages_multi
         if plan.plan_type == "nearby_landmark" and plan.landmark_id:
-            return await self._fetch_nearby(plan.landmark_id, query, max_pages)
+            primary = await self._fetch_nearby(plan.landmark_id, query, max_pages)
+            if primary:
+                return primary
+
+            degraded_nearby = await self._degrade_nearby_via_fuzzy_landmark(
+                original_landmark=plan.landmark_id,
+                query=query,
+                max_pages=max_pages,
+            )
+            if degraded_nearby:
+                return degraded_nearby
+
+            return await self._degrade_to_by_platform(
+                query=query,
+                max_pages=max_pages,
+                from_route="nearby_landmark",
+                reason="nearby_empty_after_fuzzy",
+            )
         if plan.plan_type == "by_community" and query.hard.community:
-            return await self._fetch_by_community(query, max_pages)
+            primary = await self._fetch_by_community(query, max_pages)
+            if primary:
+                return primary
+            return await self._degrade_to_by_platform(
+                query=query,
+                max_pages=max_pages,
+                from_route="by_community",
+                reason="by_community_empty",
+            )
         return await self._fetch_by_platform(query, max_pages)
 
     async def _fetch_nearby(self, landmark_id: str, query: StructuredQuery, max_pages: int) -> list[HouseLite]:
         merged: dict[str, HouseLite] = {}
+        max_distance = (
+            query.hard.max_distance
+            if query.hard.max_distance is not None
+            else (query.hard.max_subway_dist if query.hard.max_subway_dist is not None else 2000)
+        )
         for page in range(1, max_pages + 1):
             log_event(LOGGER, "planner.fetch.start", source="nearby", page=page, landmark_id=landmark_id)
             resp = await self.houses_client.nearby(
                 landmark_id=landmark_id,
-                max_distance=2000,
+                max_distance=max_distance,
                 listing_platform=query.hard.listing_platform.value if query.hard.listing_platform else None,
                 page=page,
                 page_size=10,
@@ -141,6 +172,94 @@ class Planner:
                 break
         return list(merged.values())
 
+    async def _degrade_nearby_via_fuzzy_landmark(
+        self,
+        *,
+        original_landmark: str,
+        query: StructuredQuery,
+        max_pages: int,
+    ) -> list[HouseLite]:
+        search = getattr(self.landmarks_client, "search", None)
+        if not callable(search):
+            return []
+
+        keywords = _landmark_fuzzy_keywords(
+            original_landmark=original_landmark,
+            landmark_name=query.hard.landmark_name,
+        )
+        if not keywords:
+            return []
+
+        attempted_landmark_ids = {original_landmark}
+        for keyword in keywords:
+            try:
+                candidates = await search(
+                    keyword,
+                    category=query.hard.landmark_category,
+                    district=query.hard.district,
+                )
+            except DataSourceError:
+                log_event(LOGGER, "planner.degrade.landmark.search_failed", keyword=keyword)
+                continue
+
+            if not candidates:
+                log_event(LOGGER, "planner.degrade.landmark.search_empty", keyword=keyword)
+                continue
+
+            picked = next(
+                (item for item in candidates if _has_landmark_id(item) and str(item.id) not in attempted_landmark_ids),
+                None,
+            )
+            if picked is None:
+                continue
+
+            picked_id = str(picked.id)
+            attempted_landmark_ids.add(picked_id)
+            if self.cache is not None:
+                self.cache.landmark_by_name[keyword] = picked
+
+            query.hard.landmark_id = picked_id
+            if not query.hard.landmark_name and _has_landmark_name(picked):
+                query.hard.landmark_name = str(picked.name)
+
+            log_event(
+                LOGGER,
+                "planner.degrade.landmark.retry_nearby",
+                source_landmark=original_landmark,
+                keyword=keyword,
+                resolved_landmark_id=picked_id,
+            )
+            nearby = await self._fetch_nearby(picked_id, query, max_pages)
+            if nearby:
+                log_event(
+                    LOGGER,
+                    "planner.degrade.landmark.retry_hit",
+                    source_landmark=original_landmark,
+                    resolved_landmark_id=picked_id,
+                    item_count=len(nearby),
+                )
+                return nearby
+        return []
+
+    async def _degrade_to_by_platform(
+        self,
+        *,
+        query: StructuredQuery,
+        max_pages: int,
+        from_route: str,
+        reason: str,
+    ) -> list[HouseLite]:
+        by_platform = getattr(self.houses_client, "by_platform", None)
+        if not callable(by_platform):
+            return []
+        log_event(
+            LOGGER,
+            "planner.degrade.by_platform",
+            from_route=from_route,
+            reason=reason,
+        )
+        return await self._fetch_by_platform(query, max_pages)
+
 
 def _layout_to_bedrooms(layout: str | None) -> str | None:
     if not layout:
@@ -150,3 +269,30 @@ def _layout_to_bedrooms(layout: str | None) -> str | None:
         if ch.isdigit():
             return ch
     return None
+
+
+def _landmark_fuzzy_keywords(*, original_landmark: str, landmark_name: str | None) -> list[str]:
+    items: list[str] = []
+    if isinstance(landmark_name, str) and landmark_name.strip():
+        items.append(landmark_name.strip())
+    if isinstance(original_landmark, str) and original_landmark.strip():
+        items.append(original_landmark.strip())
+
+    seen: set[str] = set()
+    keywords: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        keywords.append(item)
+    return keywords
+
+
+def _has_landmark_id(item: Any) -> bool:
+    value = getattr(item, "id", None)
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _has_landmark_name(item: Any) -> bool:
+    value = getattr(item, "name", None)
+    return isinstance(value, str) and bool(value.strip())

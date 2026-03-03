@@ -221,6 +221,75 @@ def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
         assert captured["meta"]["llm_parse"]["tool_plan"]["arguments"]["house_id"] == "HF_1001"
 
 
+def test_chat_route_llm_tool_call_keeps_nearby_max_distance_argument() -> None:
+    app = create_app()
+    captured: dict = {}
+
+    class StubService:
+        async def handle(self, request):
+            captured["meta"] = request.meta
+            return InvokeResponse(text="ok", candidates=[], debug={"response_kind": "search"})
+
+    class StubResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            assert headers["Session-ID"] == "sess-nearby-max-distance"
+            return StubResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "get_houses_nearby",
+                                            "arguments": (
+                                                '{"landmark_id":"车公庄站","max_distance":500,"bedrooms":"2"}'
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={
+                "model_ip": "127.0.0.1",
+                "session_id": "sess-nearby-max-distance",
+                "message": "车公庄站500米内的两居",
+            },
+        )
+
+    assert resp.status_code == 200
+    assert captured["meta"]["llm_parse"]["intent"] == "search"
+    tool_plan = captured["meta"]["llm_parse"]["tool_plan"]
+    assert tool_plan["operationId"] == "get_houses_nearby"
+    assert tool_plan["arguments"]["landmark_id"] == "车公庄站"
+    assert tool_plan["arguments"]["max_distance"] == 500.0
+    assert "bedrooms" not in tool_plan["arguments"]
+
+
 def test_chat_route_uses_single_llm_call_and_applies_chat_reply_from_nlu() -> None:
     app = create_app()
     captured: dict = {}

@@ -732,6 +732,7 @@ def _build_llm_context_facts(state: Any) -> dict[str, Any]:
             "layout",
             "rent_type",
             "max_subway_dist",
+            "max_distance",
             "max_commute_min",
             "utilities_type",
             "listing_platform",
