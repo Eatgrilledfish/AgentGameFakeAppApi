@@ -57,6 +57,13 @@ _AVOID_TAG_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("不要中介费", "不想中介费", "中介费太高", "免中介"), ("收中介费", "中介费一月租", "中介费半月租")),
     (("不要物业费", "免物业费"), ("物业费另付",)),
 )
+_FEE_TAG_PREFERENCES: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...] = (
+    (("网费", "宽带", "网络费"), ("包宽带", "免宽带费", "包网费"), ("网费另付", "网费自付", "网费单独付", "网费需自理")),
+    (("物业费",), ("包物业费", "免物业费"), ("物业费另付", "物业费自付")),
+    (("水电费", "水电"), ("包水电费", "免水电费"), ("水电费另付", "水电费自付")),
+    (("取暖费", "暖气费", "暖气"), ("包取暖费", "免取暖费"), ("取暖费另付", "取暖费自付")),
+    (("车位费", "停车费", "车位"), ("包车位", "免车位费"), ("车位费另付", "车位费自付")),
+)
 
 
 class RuleBasedNLU:
@@ -316,6 +323,9 @@ class RuleBasedNLU:
 
         preferred = _derive_tags_from_rules(text, _PREFERRED_TAG_RULES)
         avoid = _derive_tags_from_rules(text, _AVOID_TAG_RULES)
+        fee_preferred, fee_avoid = _extract_fee_preference_tags(text)
+        preferred.extend(fee_preferred)
+        avoid.extend(fee_avoid)
 
         if soft.elevator is True:
             preferred.extend(["有电梯", "电梯房"])
@@ -493,3 +503,56 @@ def _derive_tags_from_rules(
                 if tag not in found:
                     found.append(tag)
     return found
+
+
+def _extract_fee_preference_tags(text: str) -> tuple[list[str], list[str]]:
+    preferred: list[str] = []
+    avoid: list[str] = []
+
+    for keywords, include_tags, exclude_tags in _FEE_TAG_PREFERENCES:
+        intent = _detect_fee_intent(text, keywords)
+        if intent == "include":
+            for tag in include_tags:
+                if tag not in preferred:
+                    preferred.append(tag)
+            for tag in exclude_tags:
+                if tag not in avoid:
+                    avoid.append(tag)
+        elif intent == "exclude":
+            for tag in exclude_tags:
+                if tag not in preferred:
+                    preferred.append(tag)
+            for tag in include_tags:
+                if tag not in avoid:
+                    avoid.append(tag)
+    return preferred, avoid
+
+
+def _detect_fee_intent(text: str, keywords: tuple[str, ...]) -> str | None:
+    if not any(keyword in text for keyword in keywords):
+        return None
+
+    kw = "|".join(re.escape(item) for item in keywords if item)
+    if not kw:
+        return None
+
+    # "不要网费另付/不想宽带单独付" should be treated as "包含到房租里".
+    if re.search(rf"(不要|不想|别).{{0,4}}(?:{kw}).{{0,4}}(另付|额外|自付|单独)", text):
+        return "include"
+    if re.search(rf"(?:{kw}).{{0,4}}(不要|不想|别).{{0,3}}(另付|额外|自付|单独)", text):
+        return "include"
+
+    include_hit = bool(
+        re.search(rf"(包|包含|含在|免|全包).{{0,4}}(?:{kw})", text)
+        or re.search(rf"(?:{kw}).{{0,6}}(包|包含|含在|免|全包|在房租里|含在房租|包在房租)", text)
+    )
+    exclude_hit = bool(
+        re.search(rf"(不包|不包含).{{0,4}}(?:{kw})", text)
+        or re.search(rf"(?:{kw}).{{0,6}}(另付|额外|自付|单独|需自理|不包|不包含)", text)
+    )
+
+    if include_hit and not exclude_hit:
+        return "include"
+    if exclude_hit and not include_hit:
+        return "exclude"
+    return None

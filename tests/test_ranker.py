@@ -161,6 +161,34 @@ async def test_ranker_prioritizes_subway_distance_when_requested() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ranker_skips_listings_enrichment_by_default() -> None:
+    client = DummyHousesClient()
+    ranker = Ranker(houses_client=client, weights=RankingWeights(), enrich_concurrency=2)
+    query = StructuredQuery(
+        hard=HardConstraints(budget_max=8000, max_subway_dist=1000),
+        soft=SoftPreferences(),
+    )
+    candidates = [
+        HouseLite(
+            house_id="HF_1",
+            rent=6000,
+            area=70,
+            district="海淀",
+            community="西二旗家园",
+            subway_distance=500,
+            commute_to_xierqi_min=20,
+            status="available",
+            layout="2居1厅1卫",
+            tags=["近地铁"],
+        )
+    ]
+
+    await ranker.rank_two_stage(candidates, query, max_output=1)
+
+    assert client.listings_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_ranker_boosts_candidates_with_tags_matching_user_preferences() -> None:
     ranker = Ranker(houses_client=DummyHousesClient(), weights=RankingWeights(), enrich_concurrency=2)
     query = StructuredQuery(

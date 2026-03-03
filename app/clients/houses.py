@@ -229,7 +229,7 @@ def _normalize_area_fields(normalized: dict[str, Any]) -> None:
         normalized["business_area"] = area_value.strip()
         normalized["area"] = None
 
-    for key in ("house_area", "size", "usable_area", "building_area"):
+    for key in ("area_sqm", "house_area", "size", "usable_area", "building_area"):
         parsed = _coerce_area_to_float(normalized.get(key))
         if parsed is not None:
             normalized["area"] = parsed

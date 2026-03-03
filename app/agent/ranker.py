@@ -81,7 +81,14 @@ class Ranker:
         )
         return total
 
-    async def rank_two_stage(self, candidates: list[HouseLite], query: StructuredQuery, max_output: int = 5) -> list[HouseViewModel]:
+    async def rank_two_stage(
+        self,
+        candidates: list[HouseLite],
+        query: StructuredQuery,
+        max_output: int = 5,
+        *,
+        enrich_listings: bool = False,
+    ) -> list[HouseViewModel]:
         filtered = [house for house in candidates if self.hard_filter(house, query)]
         relax_notes: list[str] = []
         if not filtered and query.hard.max_subway_dist == 800:
@@ -108,7 +115,10 @@ class Ranker:
         else:
             coarse_sorted = sorted(filtered, key=lambda h: self._coarse_score(h, query), reverse=True)
         top_n = coarse_sorted[: self.listing_top_n]
-        enriched = await self._enrich_listings(top_n)
+        if enrich_listings:
+            enriched = await self._enrich_listings(top_n)
+        else:
+            enriched = [RankedHouse(house=house, score=0.0, listings=[], amenities={}) for house in top_n]
 
         top_fine = sorted(
             enriched,
@@ -199,7 +209,7 @@ class Ranker:
         amenities: dict[str, list[NearbyLandmark]],
     ) -> float:
         base = self._coarse_score(house, query)
-        listing_consistency = _listing_consistency_score(listings)
+        listing_consistency = _listing_consistency_score(listings) if listings else 0.0
         amenities_score = _amenities_score(amenities, query)
         tag_match_score = _tag_preference_score(house, query)
         return (

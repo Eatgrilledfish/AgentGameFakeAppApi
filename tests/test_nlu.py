@@ -99,3 +99,11 @@ def test_detect_rent_and_terminate_from_short_phrases() -> None:
 
     assert q1.intent.value == "rent"
     assert q2.intent.value == "terminate"
+
+
+def test_extract_fee_included_preference_into_tags() -> None:
+    nlu = RuleBasedNLU()
+    q = nlu.parse("我希望网费包含在房租里，不要网费另付。", _state(), CaseType.single)
+
+    assert "包宽带" in q.soft.preferred_tags or "免宽带费" in q.soft.preferred_tags
+    assert "网费另付" in q.soft.avoid_tags
