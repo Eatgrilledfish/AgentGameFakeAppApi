@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import time
@@ -12,6 +13,7 @@ from uuid import uuid4
 
 import httpx
 from fastapi import Body, FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse, Response
 
 from app.agent.service import AgentService
 from app.agent.state import StateStore
@@ -23,6 +25,7 @@ from app.schemas import CaseType, ChatRequest, ChatResponse, HealthResponse, Inv
 from app.settings import AgentSettings, load_settings
 
 LOGGER = logging.getLogger(__name__)
+HTTP_IO_LOGGER = logging.getLogger("agent.http.io")
 
 STEP_RECV_USER_QUERY = "STEP-01-RECV-USER-QUERY"
 STEP_AGENT_PIPELINE = "STEP-02-AGENT-PIPELINE"
@@ -30,6 +33,60 @@ STEP_LLM_FALLBACK = "STEP-03-LLM-FALLBACK"
 STEP_LLM_NLU = "STEP-02A-LLM-NLU"
 STEP_FINAL_RESPONSE = "STEP-04-FINAL-RESPONSE"
 STEP_HTTP = "STEP-00-HTTP"
+
+
+def _preview_http_body(raw_body: bytes, content_type: str | None, limit: int = 2000) -> str:
+    if not raw_body:
+        return "<empty>"
+
+    text = raw_body.decode("utf-8", errors="replace")
+    if content_type and "application/json" in content_type.lower():
+        parsed = _extract_json_object(text)
+        if parsed is not None:
+            return preview_payload(parsed, limit=limit)
+    return preview_text(text, limit=limit)
+
+def _read_agent_http_io_entries(limit: int = 200) -> list[dict[str, Any]]:
+    log_path = os.getenv("AGENT_HTTP_IO_LOG_PATH", "agent_http_io.log")
+    path = Path(log_path)
+    if not path.exists():
+        return []
+
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    entries: list[dict[str, Any]] = []
+    for line in lines[-limit:]:
+        brace_idx = line.find("{")
+        if brace_idx < 0:
+            continue
+        raw_json = line[brace_idx:]
+        try:
+            payload = json.loads(raw_json)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            entries.append(payload)
+    return entries
+
+
+def _stage_name(entry: dict[str, Any]) -> str:
+    event = str(entry.get("event", ""))
+    path = str(entry.get("path", ""))
+    method = str(entry.get("method", ""))
+
+    if event == "http.agent_io" and method == "POST" and path == "/api/v1/chat":
+        return "agent接收用户输入 + agent最终返回用户"
+    if event == "http.agent_io.llm.request":
+        return "agent发往LLM的输入"
+    if event == "http.agent_io.llm.response":
+        return "LLM返回的输出"
+    if event == "http.agent_io.api.request":
+        return "agent调用API"
+    if event == "http.agent_io.api.response":
+        return "agent得到API输出"
+    if event.endswith(".error"):
+        return "调用错误"
+    return "其他"
+
 
 def _build_model_base_url(model_ip: str) -> str:
     if model_ip.startswith(("http://", "https://")):
@@ -53,6 +110,8 @@ async def _forward_chat_completion(
         "messages": messages,
         "stream": False,
     }
+    target_url = f"{_build_model_base_url(model_ip)}/v1/chat/completions"
+    started = time.perf_counter()
     log_event(
         LOGGER,
         "chat.llm.forward.request",
@@ -60,14 +119,46 @@ async def _forward_chat_completion(
         model_ip=model_ip,
         payload_preview=preview_payload(payload),
     )
-
-    resp = await http_client.post(
-        f"{_build_model_base_url(model_ip)}/v1/chat/completions",
-        json=payload,
-        headers=headers,
+    HTTP_IO_LOGGER.info(
+        "%s",
+        preview_payload(
+            {
+                "event": "http.agent_io.llm.request",
+                "method": "POST",
+                "url": target_url,
+                "session_id": session_id or "-",
+                "request_content_type": "application/json",
+                "request_body": preview_payload(payload, limit=8000),
+            },
+            limit=8000,
+        ),
     )
-    resp.raise_for_status()
-    data = resp.json()
+
+    try:
+        resp = await http_client.post(
+            target_url,
+            json=payload,
+            headers=headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        HTTP_IO_LOGGER.info(
+            "%s",
+            preview_payload(
+                {
+                    "event": "http.agent_io.llm.error",
+                    "method": "POST",
+                    "url": target_url,
+                    "session_id": session_id or "-",
+                    "error": str(exc),
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                },
+                limit=8000,
+            ),
+        )
+        raise
+
     log_event(
         LOGGER,
         "chat.llm.forward.response",
@@ -75,6 +166,23 @@ async def _forward_chat_completion(
         status_code=resp.status_code,
         body_preview=preview_payload(data),
     )
+    HTTP_IO_LOGGER.info(
+        "%s",
+        preview_payload(
+            {
+                "event": "http.agent_io.llm.response",
+                "method": "POST",
+                "url": target_url,
+                "session_id": session_id or "-",
+                "status_code": resp.status_code,
+                "response_content_type": getattr(resp, "headers", {}).get("content-type", "application/json"),
+                "response_body": preview_payload(data, limit=8000),
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            },
+            limit=8000,
+        ),
+    )
+
     choices = data.get("choices", [])
     if not choices:
         return None
@@ -668,6 +776,17 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         )
 
         response = await call_next(request)
+        response_body = b""
+        async for chunk in response.body_iterator:
+            response_body += chunk
+
+        replay_response = Response(
+            content=response_body,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            media_type=response.media_type,
+            background=response.background,
+        )
         duration_ms = int((time.perf_counter() - started) * 1000)
         log_event(
             LOGGER,
@@ -678,7 +797,29 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             status_code=response.status_code,
             duration_ms=duration_ms,
         )
-        return response
+
+        if request.method in {"GET", "POST"}:
+            req_content_type = request.headers.get("content-type")
+            resp_content_type = replay_response.headers.get("content-type")
+            HTTP_IO_LOGGER.info(
+                "%s",
+                preview_payload(
+                    {
+                        "event": "http.agent_io",
+                        "method": request.method,
+                        "path": request.url.path,
+                        "query": str(request.query_params),
+                        "request_content_type": req_content_type or "<unknown>",
+                        "request_body": _preview_http_body(raw_body, req_content_type),
+                        "status_code": replay_response.status_code,
+                        "response_content_type": resp_content_type or "<unknown>",
+                        "response_body": _preview_http_body(response_body, resp_content_type),
+                        "duration_ms": duration_ms,
+                    },
+                    limit=8000,
+                ),
+            )
+        return replay_response
 
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
@@ -945,6 +1086,61 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         )
         response.raise_for_status()
         return response.json()
+
+    @app.get("/debug/agent-io/events")
+    async def debug_agent_io_events(limit: int = 200) -> dict[str, Any]:
+        entries = _read_agent_http_io_entries(limit=max(1, min(limit, 1000)))
+        enriched = [{"stage": _stage_name(item), **item} for item in entries]
+        return {"count": len(enriched), "items": enriched}
+
+    @app.get("/debug/agent-io", response_class=HTMLResponse)
+    async def debug_agent_io_page() -> HTMLResponse:
+        html = """
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent HTTP IO Monitor</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; background: #f7f7f9; }
+    h1 { margin: 0 0 12px; }
+    .hint { color: #555; margin-bottom: 10px; }
+    .card { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 10px; margin-bottom: 8px; }
+    .stage { font-weight: bold; color: #1f4b99; }
+    pre { white-space: pre-wrap; word-break: break-word; margin: 6px 0 0; }
+  </style>
+</head>
+<body>
+  <h1>Agent 交互实时面板</h1>
+  <div class="hint">顺序关注：用户输入 → LLM输入 → LLM输出 → API调用 → API输出 → 最终回复</div>
+  <div id="list"></div>
+  <script>
+    async function load() {
+      const res = await fetch('/debug/agent-io/events?limit=200');
+      const data = await res.json();
+      const list = document.getElementById('list');
+      list.innerHTML = '';
+      for (const item of data.items) {
+        const div = document.createElement('div');
+        div.className = 'card';
+        const stage = document.createElement('div');
+        stage.className = 'stage';
+        stage.textContent = item.stage || '其他';
+        const pre = document.createElement('pre');
+        pre.textContent = JSON.stringify(item, null, 2);
+        div.appendChild(stage);
+        div.appendChild(pre);
+        list.appendChild(div);
+      }
+    }
+    load();
+    setInterval(load, 2000);
+  </script>
+</body>
+</html>
+        """
+        return HTMLResponse(content=html)
 
     @app.post("/v2/chat/completions")
     async def proxy_chat_completions_v2(

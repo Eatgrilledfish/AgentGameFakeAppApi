@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import os
 from typing import Any
 
 _CTX_TRACE_ID: contextvars.ContextVar[str] = contextvars.ContextVar("trace_id", default="-")
@@ -10,6 +11,8 @@ _CTX_SESSION_ID: contextvars.ContextVar[str] = contextvars.ContextVar("session_i
 _CTX_CASE_TYPE: contextvars.ContextVar[str] = contextvars.ContextVar("case_type", default="-")
 _CTX_USER_ID: contextvars.ContextVar[str] = contextvars.ContextVar("user_id", default="-")
 _CTX_SEQ: contextvars.ContextVar[int] = contextvars.ContextVar("log_seq", default=0)
+_HTTP_IO_LOGGER_NAME = "agent.http.io"
+_HTTP_IO_LOG_PATH = "agent_http_io.log"
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -17,11 +20,28 @@ def setup_logging(level: str = "INFO") -> None:
     root_logger = logging.getLogger()
     if root_logger.handlers:
         root_logger.setLevel(resolved_level)
-        return
-    logging.basicConfig(
-        level=resolved_level,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    )
+    else:
+        logging.basicConfig(
+            level=resolved_level,
+            format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        )
+    _ensure_http_io_logger()
+
+
+def _ensure_http_io_logger() -> None:
+    logger = logging.getLogger(_HTTP_IO_LOGGER_NAME)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    log_path = os.getenv("AGENT_HTTP_IO_LOG_PATH", _HTTP_IO_LOG_PATH)
+    abs_log_path = os.path.abspath(log_path)
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler) and handler.baseFilename == abs_log_path:
+            return
+
+    file_handler = logging.FileHandler(abs_log_path, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    logger.addHandler(file_handler)
 
 
 def bind_log_context(
