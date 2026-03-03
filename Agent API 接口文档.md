@@ -41,10 +41,10 @@ curl -X POST http://localhost:8191/api/v1/chat \
 | 字段           | 类型     | 说明       |
 | ------------ | ------ | -------- |
 | session_id   | string | 会话 ID    |
-| response     | string | Agent 回复 |
+| response     | object | Agent 回复对象 |
 | status       | string | 处理状态     |
-| tool_results | array  | 工具调用结果   |
-| timestamp    | int    | 时间戳      |
+| tool_results | array  | 上游 API 调用结果（逐条记录） |
+| timestamp    | int    | Unix 秒级时间戳 |
 | duration_ms  | int    | 处理耗时（毫秒） |
 
 #### 响应示例
@@ -52,13 +52,18 @@ curl -X POST http://localhost:8191/api/v1/chat \
 ```json
 {
   "session_id": "abc123",
-  "response": "为您找到海淀区3套房源...",
+  "response": {
+    "message": "为您找到海淀区3套房源..."
+  },
   "status": "success",
   "tool_results": [
     {
-      "name": "bash",
+      "name": "GET /api/houses/by_platform",
       "success": true,
-      "output": "..."
+      "output": {
+        "items": [{"house_id": "HF_4"}]
+      },
+      "duration_ms": 12
     }
   ],
   "timestamp": 1704067200,
@@ -86,7 +91,9 @@ curl -X POST http://localhost:8191/api/v1/chat \
 ```json
 {
   "session_id": "会话ID",
-  "response": "Agent回复内容",
+  "response": {
+    "message": "Agent回复内容"
+  },
   "status": "success",
   "tool_results": [...],
   "timestamp": 1704067200,
@@ -100,14 +107,14 @@ curl -X POST http://localhost:8191/api/v1/chat \
 
 | 场景      | response 内容 | 示例                                                    |
 | ------- | ----------- | ----------------------------------------------------- |
-| 普通对话    | 自然语言文本      | `"您好，请问有什么可以帮您？"`                                     |
-| 房源查询完成后 | JSON 字符串    | `"{\"message\": \"...\", \"houses\": [\"HF_2101\"]}"` |
+| 普通对话    | JSON object（仅 message） | `{"message":"您好，请问有什么可以帮您？"}` |
+| 房源查询完成后 | JSON object（message + houses） | `{"message":"...","houses":["HF_2101"]}` |
 
 ---
 
 ## 房源查询返回格式
 
-当完成房源查询后，`response` 字段**必须是合法的 JSON 字符串**，包含以下字段：
+当完成房源查询后，`response` 字段为 JSON object，包含以下字段：
 
 | 字段      | 类型     | 说明       |
 | ------- | ------ | -------- |
@@ -127,9 +134,9 @@ curl -X POST http://localhost:8191/api/v1/chat \
 
 ## 关键规则
 
-* **普通对话**：直接输出自然语言文本
-* **房源查询完成后**：`response` 必须是 **JSON 字符串（需转义）**，包含 `message` 和 `houses` 字段
-* **JSON 字符串要求**：必须是合法 JSON，不能包含自然语言前缀
+* **普通对话**：`response = {"message":"..."}`（不包含 `houses`）
+* **房源查询完成后**：`response = {"message":"...","houses":[...]}`  
+* **tool_results**：记录本轮所有上游 API 调用结果，`output` 保持 JSON object
 
 ---
 
@@ -203,4 +210,3 @@ curl -X POST http://localhost:8191/api/v1/chat \
   }
 }
 ```
-

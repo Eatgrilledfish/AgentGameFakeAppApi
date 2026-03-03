@@ -3,6 +3,7 @@ import pytest
 
 from app.clients.houses import HousesClient
 from app.clients.landmarks import LandmarksClient
+from app.infra.tool_recorder import begin_tool_recording, get_tool_results, reset_tool_recording
 
 
 @pytest.mark.asyncio
@@ -91,3 +92,28 @@ async def test_landmarks_client_without_user_header_requirement() -> None:
         client = LandmarksClient("http://test", "u-123", http_client)
         rows = await client.list_landmarks()
         assert rows[0].name == "西二旗"
+
+
+@pytest.mark.asyncio
+async def test_base_client_records_upstream_output_into_tool_results() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": {"items": [{"house_id": "HF_9"}], "total": 1, "page_size": 10}},
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        token = begin_tool_recording()
+        try:
+            client = HousesClient("http://test", "u-123", http_client)
+            await client.by_platform(page=1, page_size=10)
+            tool_results = get_tool_results()
+        finally:
+            reset_tool_recording(token)
+
+    assert len(tool_results) == 1
+    first = tool_results[0]
+    assert first["name"] == "GET /api/houses/by_platform"
+    assert first["success"] is True
+    assert first["output"]["items"][0]["house_id"] == "HF_9"

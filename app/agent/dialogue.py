@@ -36,6 +36,7 @@ _RANK_INDEX_PATTERN = re.compile(r"第\s*([一二两三四五六七八九1234567
 _CH_NUM_TO_INT = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 _REPLACE_SIGNALS = ("换", "改成", "换成", "重新", "重来")
 _HOUSE_REF_WORDS = ("这套", "这一套", "这间", "这个房", "它", "上一套", "刚才那套", "最开始", "最初")
+_EXPLICIT_HOUSE_ID_PATTERN = re.compile(r"([A-Z]{2,4}_?\d{1,8})", re.IGNORECASE)
 _TOOL_OPERATION_TO_INTENT = {
     "get_houses_by_platform": IntentType.search,
     "get_houses_by_community": IntentType.search,
@@ -94,9 +95,13 @@ class DialogueManager:
         query = self._build_query(request, state)
         merged = self._merge_query_with_state(query, state, request.message)
         if merged.intent in {IntentType.house_detail, IntentType.listings, IntentType.rent, IntentType.terminate, IntentType.offline}:
-            resolved_house_id = self._resolve_house_id(request.message, merged, state)
-            if merged.hard.house_id is None and resolved_house_id:
-                merged.hard.house_id = resolved_house_id
+            explicit_house_id = self._extract_explicit_house_id(request.message)
+            if explicit_house_id:
+                merged.hard.house_id = explicit_house_id
+            else:
+                resolved_house_id = self._resolve_house_id(request.message, merged, state)
+                if merged.hard.house_id is None and resolved_house_id:
+                    merged.hard.house_id = resolved_house_id
         log_event(
             LOGGER,
             "dialogue.nlu.done",
@@ -578,6 +583,13 @@ class DialogueManager:
             if latest_ids:
                 return latest_ids[0]
         return None
+
+    @staticmethod
+    def _extract_explicit_house_id(text: str) -> str | None:
+        match = _EXPLICIT_HOUSE_ID_PATTERN.search(text)
+        if not match:
+            return None
+        return match.group(1).upper()
 
     @staticmethod
     def _extract_rank_index(text: str) -> int | None:

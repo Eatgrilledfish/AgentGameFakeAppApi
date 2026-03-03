@@ -210,7 +210,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     session_id: str
-    response: str
+    response: dict[str, Any]
     status: str = "success"
     tool_results: list[dict[str, Any]] = Field(default_factory=list)
     timestamp: int

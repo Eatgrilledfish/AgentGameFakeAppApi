@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -10,6 +11,7 @@ from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt,
 
 from app.clients.exceptions import DataSourceError
 from app.infra.logging import log_event, preview_payload
+from app.infra.tool_recorder import record_tool_result
 
 LOGGER = logging.getLogger(__name__)
 HTTP_IO_LOGGER = logging.getLogger("agent.http.io")
@@ -82,6 +84,7 @@ class BaseClient:
     ) -> Any:
         url = self._build_url(path, params)
         headers = self._headers_houses() if need_user_id else None
+        started = time.perf_counter()
 
         log_event(
             LOGGER,
@@ -135,6 +138,15 @@ class BaseClient:
                     limit=8000,
                 ),
             )
+            record_tool_result(
+                name=f"GET {path}",
+                success=True,
+                output=payload,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                method="GET",
+                url=url,
+                status_code=response.status_code,
+            )
             return payload
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
             log_event(LOGGER, "upstream.error", step=STEP_UPSTREAM_API, method="GET", url=url, error=str(exc))
@@ -150,6 +162,16 @@ class BaseClient:
                     limit=8000,
                 ),
             )
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            record_tool_result(
+                name=f"GET {path}",
+                success=False,
+                output={"error": str(exc), "error_type": type(exc).__name__},
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                method="GET",
+                url=url,
+                status_code=status_code,
+            )
             LOGGER.warning("GET %s failed: %s", url, exc)
             raise DataSourceError(f"GET failed: {url}") from exc
 
@@ -163,6 +185,7 @@ class BaseClient:
     ) -> Any:
         url = self._build_url(path, params)
         headers = self._headers_houses() if need_user_id else None
+        started = time.perf_counter()
         log_event(
             LOGGER,
             "upstream.request",
@@ -222,6 +245,15 @@ class BaseClient:
                     limit=8000,
                 ),
             )
+            record_tool_result(
+                name=f"POST {path}",
+                success=True,
+                output=payload,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                method="POST",
+                url=url,
+                status_code=response.status_code,
+            )
             return payload
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
             log_event(LOGGER, "upstream.error", step=STEP_UPSTREAM_API, method="POST", url=url, error=str(exc))
@@ -236,6 +268,16 @@ class BaseClient:
                     },
                     limit=8000,
                 ),
+            )
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            record_tool_result(
+                name=f"POST {path}",
+                success=False,
+                output={"error": str(exc), "error_type": type(exc).__name__},
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                method="POST",
+                url=url,
+                status_code=status_code,
             )
             LOGGER.warning("POST %s failed: %s", url, exc)
             raise DataSourceError(f"POST failed: {url}") from exc

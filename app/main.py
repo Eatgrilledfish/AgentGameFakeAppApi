@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from functools import lru_cache
 import json
 import logging
 import os
 from pathlib import Path
+import random
 import re
 import time
 from typing import Any
@@ -21,6 +23,7 @@ from app.clients.houses import HousesClient
 from app.clients.landmarks import LandmarksClient
 from app.infra.cache import CacheManager
 from app.infra.logging import bind_log_context, log_event, preview_payload, preview_text, reset_log_context, setup_logging
+from app.infra.tool_recorder import begin_tool_recording, get_tool_results, reset_tool_recording
 from app.schemas import CaseType, ChatRequest, ChatResponse, HealthResponse, InvokeRequest, InvokeResponse
 from app.settings import AgentSettings, load_settings
 
@@ -33,6 +36,9 @@ STEP_LLM_FALLBACK = "STEP-03-LLM-FALLBACK"
 STEP_LLM_NLU = "STEP-02A-LLM-NLU"
 STEP_FINAL_RESPONSE = "STEP-04-FINAL-RESPONSE"
 STEP_HTTP = "STEP-00-HTTP"
+
+LLM_TIMEOUT = httpx.Timeout(connect=1.0, read=6.0, write=2.0, pool=0.5)
+LLM_RETRYABLE_EXCEPTIONS = (httpx.ConnectTimeout, httpx.ReadTimeout)
 
 
 def _preview_http_body(raw_body: bytes, content_type: str | None, limit: int = 2000) -> str:
@@ -112,6 +118,7 @@ async def _forward_chat_completion(
     payload = {
         "model": "",
         "messages": messages,
+        "max_tokens": 256,
         "stream": False,
     }
     target_url = f"{_build_model_base_url(model_ip)}/v1/chat/completions"
@@ -138,31 +145,56 @@ async def _forward_chat_completion(
         ),
     )
 
-    try:
-        resp = await http_client.post(
-            target_url,
-            json=payload,
-            headers=headers,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        HTTP_IO_LOGGER.info(
-            "%s",
-            preview_payload(
-                {
-                    "event": "http.agent_io.llm.error",
-                    "method": "POST",
-                    "url": target_url,
-                    "session_id": session_id or "-",
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
-                    "duration_ms": int((time.perf_counter() - started) * 1000),
-                },
-                limit=8000,
-            ),
-        )
-        raise
+    data: dict[str, Any]
+    for attempt in range(2):
+        try:
+            resp = await _llm_post(
+                http_client,
+                url=target_url,
+                payload=payload,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except LLM_RETRYABLE_EXCEPTIONS as exc:
+            if attempt == 0:
+                await asyncio.sleep(random.uniform(0.05, 0.15))
+                continue
+            HTTP_IO_LOGGER.info(
+                "%s",
+                preview_payload(
+                    {
+                        "event": "http.agent_io.llm.error",
+                        "method": "POST",
+                        "url": target_url,
+                        "session_id": session_id or "-",
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "attempt": attempt + 1,
+                        "duration_ms": int((time.perf_counter() - started) * 1000),
+                    },
+                    limit=8000,
+                ),
+            )
+            raise
+        except Exception as exc:
+            HTTP_IO_LOGGER.info(
+                "%s",
+                preview_payload(
+                    {
+                        "event": "http.agent_io.llm.error",
+                        "method": "POST",
+                        "url": target_url,
+                        "session_id": session_id or "-",
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "duration_ms": int((time.perf_counter() - started) * 1000),
+                    },
+                    limit=8000,
+                ),
+            )
+            raise
 
     log_event(
         LOGGER,
@@ -193,6 +225,31 @@ async def _forward_chat_completion(
         return None
     msg = choices[0].get("message", {})
     return msg.get("content")
+
+
+async def _llm_post(
+    http_client: httpx.AsyncClient,
+    *,
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+) -> httpx.Response:
+    try:
+        return await http_client.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=LLM_TIMEOUT,
+        )
+    except TypeError as exc:
+        # Some unit-test stubs do not accept timeout kwargs.
+        if "timeout" not in str(exc):
+            raise
+        return await http_client.post(
+            url,
+            json=payload,
+            headers=headers,
+        )
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -665,7 +722,8 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
         "intent可选值：chat/search/compare/amenities/house_detail/listings/rent/terminate/offline。\n"
         "你必须基于可用API工具目录判断本轮最匹配的operationId，并抽取调用参数。\n"
         "严格反幻觉：不允许编造 house_id、listing_platform、地标ID 或未提供的硬约束。\n"
-        "当用户说“这套/第一套/最开始那套”时，优先使用 context_facts 中的 focus_house_id 或 latest_search_house_ids。\n"
+        "若用户文本里显式出现 house_id（如 HF_67），必须使用该 house_id，不得被上下文覆盖。\n"
+        "仅当用户未显式给出 house_id 且出现“这套/第一套/最开始那套”时，才可使用 context_facts 中的 focus_house_id 或 latest_search_house_ids。\n"
         "若必填参数未知，不要猜测，保留为空并降低confidence。\n"
         "只返回如下结构："
         '{"intent":"search","tool_plan":{"operationId":"get_houses_by_platform","arguments":{}},"hard":{},"soft":{},"confidence":0.0}。\n'
@@ -780,6 +838,23 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             body=body_preview or "<empty>",
         )
 
+        req_content_type = request.headers.get("content-type")
+        if request.method in {"GET", "POST"}:
+            HTTP_IO_LOGGER.info(
+                "%s",
+                preview_payload(
+                    {
+                        "event": "http.agent_io.request",
+                        "method": request.method,
+                        "path": request.url.path,
+                        "query": str(request.query_params),
+                        "request_content_type": req_content_type or "<unknown>",
+                        "request_body": _preview_http_body(raw_body, req_content_type),
+                    },
+                    limit=8000,
+                ),
+            )
+
         response = await call_next(request)
         response_body = b""
         async for chunk in response.body_iterator:
@@ -804,22 +879,6 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         )
 
         if request.method in {"GET", "POST"}:
-            req_content_type = request.headers.get("content-type")
-            HTTP_IO_LOGGER.info(
-                "%s",
-                preview_payload(
-                    {
-                        "event": "http.agent_io.request",
-                        "method": request.method,
-                        "path": request.url.path,
-                        "query": str(request.query_params),
-                        "request_content_type": req_content_type or "<unknown>",
-                        "request_body": _preview_http_body(raw_body, req_content_type),
-                    },
-                    limit=8000,
-                ),
-            )
-
             resp_content_type = replay_response.headers.get("content-type")
             HTTP_IO_LOGGER.info(
                 "%s",
@@ -889,7 +948,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
 
     @app.post("/api/v1/chat", response_model=ChatResponse)
     async def chat(req: ChatRequest) -> ChatResponse:
-        started_ms = int(time.time() * 1000)
+        started = time.perf_counter()
         trace_id = uuid4().hex[:12]
         tokens = bind_log_context(
             trace_id=trace_id,
@@ -897,6 +956,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             case_type=CaseType.single.value,
             user_id=cfg.default_user_id,
         )
+        tool_recorder_tokens = begin_tool_recording()
         service: AgentService = app.state.agent_service
         try:
             log_event(
@@ -909,60 +969,52 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             app.state.session_model_ip[req.session_id] = req.model_ip
 
             invoke_meta: dict[str, Any] = {"model_ip": req.model_ip}
-            if hasattr(service, "allow_llm_fallback") and hasattr(service, "rough_token_estimate"):
-                try:
-                    allow_llm_nlu_by_policy = True
-                    policy_reason = "service_policy_absent"
-                    if hasattr(service, "should_use_llm_nlu"):
-                        allow_llm_nlu_by_policy, policy_reason = service.should_use_llm_nlu(req.session_id, req.message)
+            state_summary = ""
+            context_facts: dict[str, Any] = {}
+            if hasattr(service, "state_store"):
+                state = service.state_store.get(req.session_id)  # type: ignore[attr-defined]
+                if state is not None and getattr(state, "conversation_summary", ""):
+                    state_summary = state.conversation_summary
+                    context_facts = _build_llm_context_facts(state)
 
-                    state_summary = ""
-                    context_facts: dict[str, Any] = {}
-                    if hasattr(service, "state_store"):
-                        state = service.state_store.get(req.session_id)  # type: ignore[attr-defined]
-                        if state is not None and getattr(state, "conversation_summary", ""):
-                            state_summary = state.conversation_summary
-                            context_facts = _build_llm_context_facts(state)
-
-                    prompt_basis = req.message + state_summary + json.dumps(context_facts, ensure_ascii=False)
-                    prompt_tokens = service.rough_token_estimate(prompt_basis)  # type: ignore[attr-defined]
-                    allow_llm_nlu = service.allow_llm_fallback(req.session_id, prompt_tokens)  # type: ignore[attr-defined]
-                    if allow_llm_nlu and allow_llm_nlu_by_policy:
-                        http_client: httpx.AsyncClient = app.state.http_client
-                        llm_parse = await _analyze_intent_with_llm(
-                            http_client,
-                            model_ip=req.model_ip,
-                            session_id=req.session_id,
-                            message=req.message,
-                            summary=state_summary,
-                            context_facts=context_facts,
-                        )
-                        if llm_parse:
-                            invoke_meta["llm_parse"] = llm_parse
-                            log_event(
-                                LOGGER,
-                                "chat.llm_nlu.applied",
-                                step=STEP_LLM_NLU,
-                                llm_parse=llm_parse,
-                            )
-                            if hasattr(service, "record_llm_fallback_usage"):
-                                completion_tokens = service.rough_token_estimate(json.dumps(llm_parse, ensure_ascii=False))  # type: ignore[attr-defined]
-                                service.record_llm_fallback_usage(req.session_id, prompt_tokens + completion_tokens)  # type: ignore[attr-defined]
-                    else:
-                        log_event(
-                            LOGGER,
-                            "chat.llm_nlu.skipped",
-                            step=STEP_LLM_NLU,
-                            reason="budget_exceeded" if not allow_llm_nlu else policy_reason,
-                            estimated_prompt_tokens=prompt_tokens,
-                        )
-                except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
+            prompt_basis = req.message + state_summary + json.dumps(context_facts, ensure_ascii=False)
+            nlu_prompt_tokens = (
+                service.rough_token_estimate(prompt_basis)
+                if hasattr(service, "rough_token_estimate")
+                else max(1, int(len(prompt_basis) / 2))
+            )
+            try:
+                http_client: httpx.AsyncClient = app.state.http_client
+                llm_parse = await _analyze_intent_with_llm(
+                    http_client,
+                    model_ip=req.model_ip,
+                    session_id=req.session_id,
+                    message=req.message,
+                    summary=state_summary,
+                    context_facts=context_facts,
+                )
+                if llm_parse:
+                    invoke_meta["llm_parse"] = llm_parse
                     log_event(
                         LOGGER,
-                        "chat.llm_nlu.failed",
+                        "chat.llm_nlu.applied",
                         step=STEP_LLM_NLU,
-                        error=str(exc),
+                        llm_parse=llm_parse,
                     )
+                    if hasattr(service, "record_llm_fallback_usage"):
+                        completion_tokens = (
+                            service.rough_token_estimate(json.dumps(llm_parse, ensure_ascii=False))
+                            if hasattr(service, "rough_token_estimate")
+                            else max(1, int(len(json.dumps(llm_parse, ensure_ascii=False)) / 2))
+                        )
+                        service.record_llm_fallback_usage(req.session_id, nlu_prompt_tokens + completion_tokens)
+            except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
+                log_event(
+                    LOGGER,
+                    "chat.llm_nlu.failed",
+                    step=STEP_LLM_NLU,
+                    error=str(exc),
+                )
 
             log_event(
                 LOGGER,
@@ -988,65 +1040,48 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                 debug=invoke_resp.debug,
             )
 
-            output = invoke_resp.text
+            output_text = invoke_resp.text
             response_kind = str(invoke_resp.debug.get("response_kind", "chat"))
             if response_kind == "search" or bool(invoke_resp.candidates):
-                output = json.dumps(
-                    {
-                        "message": invoke_resp.text,
-                        "houses": [item.house_id for item in invoke_resp.candidates],
-                    },
-                    ensure_ascii=False,
-                )
+                response_payload: dict[str, Any] = {
+                    "message": invoke_resp.text,
+                    "houses": [item.house_id for item in invoke_resp.candidates],
+                }
             elif response_kind == "chat":
                 try:
-                    prompt_tokens = (
-                        service.rough_token_estimate(req.message)
+                    llm_messages = (
+                        service.build_llm_fallback_messages(req.session_id, req.message)
+                        if hasattr(service, "build_llm_fallback_messages")
+                        else [{"role": "user", "content": req.message}]
+                    )
+                    llm_prompt_tokens = (
+                        service.rough_token_estimate(json.dumps(llm_messages, ensure_ascii=False))
                         if hasattr(service, "rough_token_estimate")
                         else max(1, int(len(req.message) / 2))
                     )
-                    allow_llm = (
-                        service.allow_llm_fallback(req.session_id, prompt_tokens)
-                        if hasattr(service, "allow_llm_fallback")
-                        else True
+                    http_client: httpx.AsyncClient = app.state.http_client
+                    llm_text = await _forward_chat_completion(
+                        http_client,
+                        model_ip=req.model_ip,
+                        messages=llm_messages,
+                        session_id=req.session_id,
                     )
-                    if allow_llm:
-                        http_client: httpx.AsyncClient = app.state.http_client
-                        llm_messages = (
-                            service.build_llm_fallback_messages(req.session_id, req.message)
-                            if hasattr(service, "build_llm_fallback_messages")
-                            else [{"role": "user", "content": req.message}]
+                    if llm_text:
+                        output_text = llm_text
+                        completion_tokens = (
+                            service.rough_token_estimate(llm_text)
+                            if hasattr(service, "rough_token_estimate")
+                            else max(1, int(len(llm_text) / 2))
                         )
-                        llm_text = await _forward_chat_completion(
-                            http_client,
-                            model_ip=req.model_ip,
-                            messages=llm_messages,
-                            session_id=req.session_id,
-                        )
-                        if llm_text:
-                            output = llm_text
-                            completion_tokens = (
-                                service.rough_token_estimate(llm_text)
-                                if hasattr(service, "rough_token_estimate")
-                                else max(1, int(len(llm_text) / 2))
-                            )
-                            if hasattr(service, "record_llm_fallback_usage"):
-                                service.record_llm_fallback_usage(req.session_id, prompt_tokens + completion_tokens)
-                            log_event(
-                                LOGGER,
-                                "chat.llm_fallback.applied",
-                                step=STEP_LLM_FALLBACK,
-                                prompt_tokens=prompt_tokens,
-                                completion_tokens=completion_tokens,
-                                llm_output=preview_text(llm_text, limit=300),
-                            )
-                    else:
+                        if hasattr(service, "record_llm_fallback_usage"):
+                            service.record_llm_fallback_usage(req.session_id, llm_prompt_tokens + completion_tokens)
                         log_event(
                             LOGGER,
-                            "chat.llm_fallback_skipped",
+                            "chat.llm_fallback.applied",
                             step=STEP_LLM_FALLBACK,
-                            reason="budget_exceeded",
-                            estimated_prompt_tokens=prompt_tokens,
+                            prompt_tokens=llm_prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            llm_output=preview_text(llm_text, limit=300),
                         )
                 except httpx.HTTPError as exc:
                     log_event(
@@ -1055,25 +1090,30 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                         step=STEP_LLM_FALLBACK,
                         error=str(exc),
                     )
+                response_payload = {"message": output_text}
+            else:
+                response_payload = {"message": output_text}
 
-            now_ms = int(time.time() * 1000)
+            timestamp = int(time.time())
+            duration_ms = int((time.perf_counter() - started) * 1000)
             log_event(
                 LOGGER,
                 "chat.completed",
                 step=STEP_FINAL_RESPONSE,
-                duration_ms=now_ms - started_ms,
+                duration_ms=duration_ms,
                 invoke_output=preview_text(invoke_resp.text, limit=300),
-                response=preview_text(output, limit=300),
+                response=preview_payload(response_payload, limit=300),
             )
             return ChatResponse(
                 session_id=req.session_id,
-                response=output,
+                response=response_payload,
                 status="success",
-                tool_results=[invoke_resp.debug] if invoke_resp.debug else [],
-                timestamp=now_ms,
-                duration_ms=now_ms - started_ms,
+                tool_results=get_tool_results(),
+                timestamp=timestamp,
+                duration_ms=duration_ms,
             )
         finally:
+            reset_tool_recording(tool_recorder_tokens)
             reset_log_context(tokens)
 
     @app.post("/vi/chat/completions")

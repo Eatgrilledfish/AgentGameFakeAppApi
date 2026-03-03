@@ -1,6 +1,5 @@
 import logging
 import asyncio
-import json
 from fastapi.testclient import TestClient
 
 import httpx
@@ -58,11 +57,13 @@ def test_chat_route_returns_houses_json_when_candidates_exist() -> None:
         assert resp.status_code == 200
         body = resp.json()
         assert body["session_id"] == "sess-1"
-        assert "HF_2101" in body["response"]
+        assert body["response"]["message"] == "给你筛选好了"
+        assert body["response"]["houses"] == ["HF_2101"]
         assert body["status"] == "success"
+        assert body["timestamp"] < 10_000_000_000
 
 
-def test_chat_route_returns_json_string_for_search_without_candidates() -> None:
+def test_chat_route_returns_response_object_for_search_without_candidates() -> None:
     app = create_app()
 
     class StubService:
@@ -81,7 +82,7 @@ def test_chat_route_returns_json_string_for_search_without_candidates() -> None:
         )
 
         assert resp.status_code == 200
-        payload = json.loads(resp.json()["response"])
+        payload = resp.json()["response"]
         assert payload == {"message": "当前条件无结果", "houses": []}
 
 
@@ -104,7 +105,8 @@ def test_chat_route_keeps_natural_text_for_non_search_reply() -> None:
         )
 
         assert resp.status_code == 200
-        assert resp.json()["response"].startswith("HF_4 各平台挂牌")
+        assert resp.json()["response"]["message"].startswith("HF_4 各平台挂牌")
+        assert "houses" not in resp.json()["response"]
 
 
 def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
@@ -258,7 +260,59 @@ def test_chat_route_sanitizes_unknown_tool_operation_from_llm() -> None:
         assert tool_plan["arguments"] == {}
 
 
-def test_chat_route_skips_llm_nlu_when_service_policy_disallows() -> None:
+def test_chat_route_llm_nlu_retries_once_on_read_timeout() -> None:
+    app = create_app()
+    captured: dict = {"calls": 0}
+
+    class StubService:
+        def rough_token_estimate(self, text: str) -> int:
+            return 10
+
+        async def handle(self, request):
+            captured["meta"] = request.meta
+            return InvokeResponse(text="ok", candidates=[], debug={"response_kind": "action"})
+
+    class StubResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"intent":"search","tool_plan":{"operationId":"get_houses_by_platform","arguments":'
+                                '{"district":"朝阳"}},"confidence":0.8}'
+                            )
+                        }
+                    }
+                ]
+            }
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            captured["calls"] += 1
+            if captured["calls"] == 1:
+                raise httpx.ReadTimeout("timeout", request=httpx.Request("POST", url))
+            return StubResponse()
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-retry", "message": "帮我查朝阳区"},
+        )
+
+        assert resp.status_code == 200
+        assert captured["calls"] == 2
+        assert captured["meta"]["llm_parse"]["intent"] == "search"
+
+
+def test_chat_route_always_calls_llm_nlu_even_when_service_policy_disallows() -> None:
     app = create_app()
     captured: dict = {"http_called": False}
 
@@ -270,10 +324,31 @@ def test_chat_route_skips_llm_nlu_when_service_policy_disallows() -> None:
             captured["meta"] = request.meta
             return InvokeResponse(text="已执行", candidates=[], debug={"response_kind": "action"})
 
+    class StubResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"intent":"search","tool_plan":{"operationId":"get_houses_by_platform","arguments":'
+                                '{"district":"海淀"}},"confidence":0.7}'
+                            )
+                        }
+                    }
+                ]
+            }
+
     class StubHttpClient:
         async def post(self, url, json, headers):
             captured["http_called"] = True
-            raise AssertionError("LLM NLU should be skipped in this test")
+            assert url == "http://127.0.0.1:8888/v1/chat/completions"
+            return StubResponse()
 
     with TestClient(app) as client:
         app.state.agent_service = StubService()
@@ -284,9 +359,9 @@ def test_chat_route_skips_llm_nlu_when_service_policy_disallows() -> None:
         )
 
         assert resp.status_code == 200
-        assert captured["http_called"] is False
+        assert captured["http_called"] is True
         assert captured["meta"]["model_ip"] == "127.0.0.1"
-        assert "llm_parse" not in captured["meta"]
+        assert captured["meta"]["llm_parse"]["intent"] == "search"
 
 
 def test_proxy_chat_completions_route() -> None:

@@ -376,6 +376,31 @@ async def test_dialogue_prefers_llm_tool_plan_for_action() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dialogue_explicit_house_id_overrides_llm_context_reference() -> None:
+    dialogue, state, _, houses = _build_dialogue()
+
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="HF_67这套可以租吗？",
+            meta={
+                "llm_parse": {
+                    "intent": "rent",
+                    "hard": {"house_id": "HF_199", "listing_platform": "安居客"},
+                    "confidence": 0.92,
+                }
+            },
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    assert "已提交租房操作" in resp.text
+    assert houses.rent_calls[-1] == ("HF_67", "安居客")
+
+
+@pytest.mark.asyncio
 async def test_dialogue_prefers_llm_tool_plan_for_search_arguments() -> None:
     planner = DummyPlanner()
     houses = DummyHousesClient()
