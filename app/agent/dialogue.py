@@ -120,6 +120,7 @@ _TOOL_ARGUMENT_ALIASES = {
     "available_from_before": "move_in_date",
     "commute_to_xierqi_max": "max_commute_min",
     "landmark_id": "landmark_id",
+    "subway_distance": "max_subway_dist",
     "max_distance": "max_distance",
 }
 _HOUSE_INTENTS = {
@@ -143,7 +144,6 @@ _TAG_CANCEL_TOPICS: dict[str, tuple[str, ...]] = {
     "电梯": ("电梯",),
 }
 _REJECT_SCORE_PENALTY = 10.0
-_TAG_FILTER_TOPK_THRESHOLD = 3
 _RELEVANT_LEXICON_LIMIT = 60
 _TAG_MATCH_SCORE_THRESHOLD = 0.46
 _TAG_TOPIC_KEYWORDS = (
@@ -251,12 +251,23 @@ class DialogueManager:
         if is_new_session:
             await self._init_session_data(state)
 
+        llm_tag_need_locked = self._llm_parse_has_nonempty_tag_need(request.meta.get("llm_parse"))
         query = self._build_query(request, state)
         merged = self._merge_query_with_state(query, state, request.message)
-        self._augment_tag_preferences_from_context(merged, state, request.message)
+        self._augment_tag_preferences_from_context(
+            merged,
+            state,
+            request.message,
+            preserve_existing_tag_need=llm_tag_need_locked,
+        )
         if merged.intent == IntentType.chat:
             fallback_query = self.nlu.parse(request.message, state, request.case_type)
-            self._augment_tag_preferences_from_context(fallback_query, state, request.message)
+            self._augment_tag_preferences_from_context(
+                fallback_query,
+                state,
+                request.message,
+                preserve_existing_tag_need=llm_tag_need_locked,
+            )
             if self._should_promote_chat_to_search_refinement(request.message, merged, fallback_query, state):
                 log_event(
                     LOGGER,
@@ -373,6 +384,21 @@ class DialogueManager:
     def _llm_parse_has_signal(llm_parse: dict[str, Any]) -> bool:
         for key in ("intent", "params", "tag_need"):
             if key in llm_parse:
+                return True
+        return False
+
+    @staticmethod
+    def _llm_parse_has_nonempty_tag_need(llm_parse: Any) -> bool:
+        if not isinstance(llm_parse, dict):
+            return False
+        tag_need = llm_parse.get("tag_need")
+        if not isinstance(tag_need, dict):
+            return False
+        for key in ("must", "avoid", "prefer"):
+            values = tag_need.get(key)
+            if not isinstance(values, list):
+                continue
+            if any(isinstance(item, str) and item.strip() for item in values):
                 return True
         return False
 
@@ -675,15 +701,20 @@ class DialogueManager:
         state.confirmed_constraints = query.hard
         state.soft_preferences = query.soft
         context_candidates = topk
-        if semantic.get("candidate_filter_ran"):
+        merged_need_payload = semantic.get("merged_tag_need")
+        has_tag_need = False
+        if isinstance(merged_need_payload, dict):
+            has_tag_need = any(
+                isinstance(merged_need_payload.get(key), list) and bool(merged_need_payload.get(key))
+                for key in ("must", "avoid", "prefer")
+            )
+        if has_tag_need:
             selected_set = {
                 house_id
                 for house_id in semantic.get("selected", [])
                 if isinstance(house_id, str) and house_id
             }
-            filtered_for_context = [house for house in topk if house.house_id in selected_set]
-            if filtered_for_context:
-                context_candidates = filtered_for_context
+            context_candidates = [house for house in topk if house.house_id in selected_set]
 
         compact_candidates = self._compress_candidates(context_candidates)
         state.last_candidates = compact_candidates
@@ -973,7 +1004,7 @@ class DialogueManager:
         return "整租"
 
     def _should_run_tag_semantic_filter(self, query: StructuredQuery, state: SessionState, candidates: list[HouseLite]) -> bool:
-        if len(candidates) < _TAG_FILTER_TOPK_THRESHOLD:
+        if not candidates:
             return False
         merged = self._build_merged_tag_need(query, state)
         return bool(merged.must or merged.avoid or merged.prefer)
@@ -1018,14 +1049,15 @@ class DialogueManager:
             limit=_RELEVANT_LEXICON_LIMIT,
         )
         if not relevant_lexicon:
+            fallback = self._filter_candidates_by_raw_tags(candidates, allowlist=allowlist, merged_need=merged_need)
             return {
                 "enabled": True,
-                "candidate_filter_ran": False,
+                "candidate_filter_ran": True,
                 "merged_tag_need": merged_need.model_dump(),
                 "relevant_tag_ids": [],
-                "selected": [house.house_id for house in candidates if house.house_id in allowlist],
-                "must_confirm": [],
-                "rejected": [],
+                "selected": fallback["selected"],
+                "must_confirm": fallback["must_confirm"],
+                "rejected": fallback["rejected"],
             }
 
         selected: list[str] = []
@@ -1038,7 +1070,7 @@ class DialogueManager:
                 continue
             memory = state.houses.get(house.house_id)
             if memory is None:
-                selected.append(house.house_id)
+                must_confirm.append({"house_id": house.house_id, "reason": "标签信息缺失，无法匹配"})
                 continue
             house_tag_ids = [tid for tid in memory.tag_ids if tid in relevant_tag_id_set][:20]
             tag_texts = [relevant_lexicon.get(tid, "") for tid in house_tag_ids if relevant_lexicon.get(tid)]
@@ -1051,6 +1083,11 @@ class DialogueManager:
             must_hit = self._match_any_need(merged_need.must, tag_texts)
             if merged_need.must and must_hit is None:
                 must_confirm.append({"house_id": house.house_id, "reason": "刚需标签未明确标注"})
+                continue
+
+            prefer_hit = self._match_any_need(merged_need.prefer, tag_texts)
+            if not merged_need.must and merged_need.prefer and prefer_hit is None:
+                rejected.append({"house_id": house.house_id, "reason": "偏好标签未命中"})
                 continue
 
             selected.append(house.house_id)
@@ -1070,6 +1107,49 @@ class DialogueManager:
             "must_confirm": sanitized["must_confirm"],
             "rejected": sanitized["rejected"],
         }
+
+    def _filter_candidates_by_raw_tags(
+        self,
+        candidates: list[HouseLite],
+        *,
+        allowlist: set[str],
+        merged_need: TagNeed,
+    ) -> dict[str, Any]:
+        selected: list[str] = []
+        must_confirm: list[dict[str, str]] = []
+        rejected: list[dict[str, str]] = []
+
+        for house in candidates:
+            if house.house_id not in allowlist:
+                continue
+            raw_tags = [tag.strip() for tag in house.tags if isinstance(tag, str) and tag.strip()]
+            if not raw_tags:
+                must_confirm.append({"house_id": house.house_id, "reason": "标签信息缺失，无法匹配"})
+                continue
+
+            avoid_hit = self._match_any_need(merged_need.avoid, raw_tags)
+            if avoid_hit is not None:
+                rejected.append({"house_id": house.house_id, "reason": f"命中避坑标签：{avoid_hit}"})
+                continue
+
+            must_hit = self._match_any_need(merged_need.must, raw_tags)
+            if merged_need.must and must_hit is None:
+                must_confirm.append({"house_id": house.house_id, "reason": "刚需标签未明确标注"})
+                continue
+
+            prefer_hit = self._match_any_need(merged_need.prefer, raw_tags)
+            if not merged_need.must and merged_need.prefer and prefer_hit is None:
+                rejected.append({"house_id": house.house_id, "reason": "偏好标签未命中"})
+                continue
+
+            selected.append(house.house_id)
+
+        return self._sanitize_candidate_filter_output(
+            allowlist=allowlist,
+            selected=selected,
+            must_confirm=must_confirm,
+            rejected=rejected,
+        )
 
     def _build_relevant_lexicon_for_candidate_filter(
         self,
@@ -1650,7 +1730,16 @@ class DialogueManager:
             ]
         )
 
-    def _augment_tag_preferences_from_context(self, query: StructuredQuery, state: SessionState, user_text: str) -> None:
+    def _augment_tag_preferences_from_context(
+        self,
+        query: StructuredQuery,
+        state: SessionState,
+        user_text: str,
+        *,
+        preserve_existing_tag_need: bool = False,
+    ) -> None:
+        if preserve_existing_tag_need:
+            return
         text = user_text.strip()
         if not text:
             return
@@ -2105,7 +2194,9 @@ class DialogueManager:
             max_price = _to_int(params_raw.get("max_price"))
             if max_price is not None:
                 overrides["budget_max"] = max_price
-            max_subway_dist = _to_int(params_raw.get("max_subway_dist"))
+            max_subway_dist = _to_int(params_raw.get("subway_distance"))
+            if max_subway_dist is None:
+                max_subway_dist = _to_int(params_raw.get("max_subway_dist"))
             if max_subway_dist is not None:
                 overrides["max_subway_dist"] = max_subway_dist
             min_area = _to_float(params_raw.get("min_area"))

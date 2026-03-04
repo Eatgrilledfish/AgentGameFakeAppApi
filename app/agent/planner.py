@@ -165,7 +165,7 @@ class Planner:
                 elevator=_to_elevator_param(query.soft.elevator),
                 commute_to_xierqi_max=query.hard.max_commute_min,
                 utilities_type=query.hard.utilities_type,
-                max_subway_dist=query.hard.max_subway_dist,
+                subway_distance=query.hard.max_subway_dist,
                 rental_type=query.hard.rent_type,
                 available_from_before=query.hard.move_in_date,
             )

@@ -93,6 +93,35 @@ async def test_by_platform_normalizes_decoration_to_upstream_allowed_values() ->
 
 
 @pytest.mark.asyncio
+async def test_by_platform_uses_subway_distance_query_param() -> None:
+    seen_subway_distance: list[str | None] = []
+    seen_legacy_key: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen_subway_distance.append(request.url.params.get("subway_distance"))
+        seen_legacy_key.append(request.url.params.get("max_subway_dist"))
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "items": [],
+                    "total": 0,
+                    "page_size": 10,
+                }
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = HousesClient("http://test", "u-123", http_client)
+        await client.by_platform(subway_distance=800, page=1, page_size=10)
+        await client.by_platform(max_subway_dist=900, page=1, page_size=10)
+
+    assert seen_subway_distance == ["800", "900"]
+    assert seen_legacy_key == [None, None]
+
+
+@pytest.mark.asyncio
 async def test_rent_post_uses_query_param_without_json_body() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"

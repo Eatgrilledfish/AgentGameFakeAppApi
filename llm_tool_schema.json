@@ -341,7 +341,7 @@
         "max_area",
         "property_type",
         "subway_line",
-        "max_subway_dist",
+        "subway_distance",
         "subway_station",
         "utilities_type",
         "available_from_before",
@@ -456,11 +456,11 @@
           "description": "地铁线路，如 13号线"
         },
         {
-          "name": "max_subway_dist",
+          "name": "subway_distance",
           "in": "query",
           "type": "integer",
           "required": false,
-          "description": "最大地铁距离（米），近地铁建议 800"
+          "description": "地铁距离上限（米），近地铁建议 800"
         },
         {
           "name": "subway_station",

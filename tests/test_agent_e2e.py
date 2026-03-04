@@ -8,7 +8,7 @@ import httpx
 from app.clients.houses import HousesClient
 from app.infra.cache import CacheManager
 from app.infra.tool_recorder import record_tool_result
-from app.main import _build_llm_context_facts, _preload_landmark_catalog, create_app
+from app.main import _build_llm_context_facts, _load_nlu_tag_catalog, _preload_landmark_catalog, create_app
 from app.schemas import CaseType, HouseLite, HouseViewModel, IntentType, InvokeResponse, Landmark, SearchSnapshot, SessionState, TurnSummary
 from app.settings import AgentSettings
 
@@ -1391,6 +1391,70 @@ def test_chat_route_uses_single_llm_call_and_applies_chat_reply_from_nlu() -> No
     assert "用户输入：用户原话-用于fallback" in first_payload["messages"][0]["content"]
     assert isinstance(first_payload["tools"], list) and len(first_payload["tools"]) > 0
     assert resp.json()["response"]["message"] == "规则回复"
+
+
+def test_chat_route_nlu_prompt_includes_tag_catalog_and_keeps_tag_tokens(tmp_path, monkeypatch) -> None:
+    app = create_app()
+    captured: dict = {}
+
+    tags_file = tmp_path / "tags.txt"
+    tags_file.write_text("可养狗、近公园、月付", encoding="utf-8")
+    monkeypatch.setenv("AGENT_TAGS_PATH", str(tags_file))
+    _load_nlu_tag_catalog.cache_clear()
+
+    class StubService:
+        async def handle(self, request):
+            captured["meta"] = request.meta
+            return InvokeResponse(text="规则回复", candidates=[], debug={"response_kind": "chat"})
+
+    class StubResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            _ = url
+            _ = headers
+            captured["payload"] = json
+            return StubResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "i=search|p=district:朝阳|t=m:;a:;p:可养狗,近公园",
+                            }
+                        }
+                    ]
+                }
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-tag-catalog", "message": "我想找能养狗且近公园的房子"},
+        )
+
+    _load_nlu_tag_catalog.cache_clear()
+
+    assert resp.status_code == 200
+    payload = captured["payload"]
+    prompt = payload["messages"][0]["content"]
+    assert "标签全集：" in prompt
+    assert "可养狗" in prompt
+    assert "近公园" in prompt
+    llm_parse = captured["meta"]["llm_parse"]
+    assert llm_parse["intent"] == "search"
+    assert "可养狗" in llm_parse["tag_need"]["prefer"]
+    assert "近公园" in llm_parse["tag_need"]["prefer"]
 
 
 def test_chat_route_sanitizes_unknown_tool_operation_from_llm() -> None:

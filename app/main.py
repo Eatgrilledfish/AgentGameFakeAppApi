@@ -78,6 +78,7 @@ _LLM_CONTEXT_SOFT_KEYS = ("decoration", "amenities", "preferred_tags", "avoid_ta
 _LLM_CONTEXT_TAG_LIMIT = 80
 _LLM_CONTEXT_HOUSE_LIMIT = 10
 _LLM_CONTEXT_TAG_NEED_LIMIT = 10
+_LLM_NLU_TAG_CATALOG_LIMIT = 240
 _SEARCH_RERANK_HOUSE_CONTEXT_LIMIT = 10
 _SEARCH_RERANK_TAG_LIMIT = 8
 _DEFAULT_SEARCH_RERANK_HOUSE_FIELDS = (
@@ -149,6 +150,7 @@ _TOOL_OPTIONAL_PARAM_PRIORITY = (
     "bedrooms",
     "rental_type",
     "decoration",
+    "subway_distance",
     "max_subway_dist",
     "min_area",
     "commute_to_xierqi_max",
@@ -173,6 +175,7 @@ _LLM_NLU_PARAM_KEY_ALIASES = {
     "max": "max_price",
     "decoration": "decoration",
     "dec": "decoration",
+    "subway_distance": "max_subway_dist",
     "max_subway_dist": "max_subway_dist",
     "sub": "max_subway_dist",
     "rental_type": "rental_type",
@@ -242,7 +245,7 @@ _LLM_COMPACT_TOOLS: list[dict[str, Any]] = [
                     "bedrooms": {"type": "string"},
                     "rental_type": {"type": "string"},
                     "decoration": {"type": "string"},
-                    "max_subway_dist": {"type": "integer"},
+                    "subway_distance": {"type": "integer"},
                     "min_area": {"type": "integer"},
                     "max_distance": {"type": "number"},
                     "max_distance_m": {"type": "number"},
@@ -268,6 +271,68 @@ _LLM_COMPACT_TOOLS: list[dict[str, Any]] = [
         },
     },
 ]
+
+
+def _normalize_catalog_tag_token(value: str) -> str:
+    return " ".join(str(value).strip().split())
+
+
+@lru_cache(maxsize=1)
+def _load_nlu_tag_catalog() -> tuple[str, ...]:
+    candidate_paths: list[Path] = []
+    env_path = os.getenv("AGENT_TAGS_PATH")
+    if isinstance(env_path, str) and env_path.strip():
+        configured = Path(env_path.strip())
+        if not configured.is_absolute():
+            configured = Path.cwd() / configured
+        candidate_paths.append(configured)
+
+    candidate_paths.extend(
+        [
+            Path.cwd() / "tags.txt",
+            Path(__file__).resolve().parents[1] / "tags.txt",
+        ]
+    )
+
+    text = ""
+    for path in candidate_paths:
+        try:
+            if path.exists():
+                text = path.read_text(encoding="utf-8", errors="replace")
+                if text.strip():
+                    break
+        except OSError:
+            continue
+    if not text.strip():
+        return ()
+
+    tags: list[str] = []
+    seen: set[str] = set()
+    for raw in re.split(r"[,\n，、]+", text):
+        token = _normalize_catalog_tag_token(raw)
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        tags.append(token)
+    return tuple(tags)
+
+
+@lru_cache(maxsize=1)
+def _load_nlu_tag_catalog_mapping() -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for tag in _load_nlu_tag_catalog():
+        norm = _normalize_catalog_tag_token(tag)
+        if norm and norm not in mapping:
+            mapping[norm] = tag
+    return mapping
+
+
+def _canonicalize_nlu_tag_token(value: str) -> str:
+    token = _normalize_catalog_tag_token(value)
+    if not token:
+        return ""
+    mapping = _load_nlu_tag_catalog_mapping()
+    return mapping.get(token, token)
 
 
 def _parse_http_body_for_io(raw_body: bytes, content_type: str | None) -> Any:
@@ -1699,10 +1764,16 @@ def _sanitize_plan_params(value: Any) -> dict[str, Any]:
         if normalized_bedrooms:
             params["bedrooms"] = normalized_bedrooms
 
-    for key in ("min_price", "max_price", "max_subway_dist", "min_area"):
+    for key in ("min_price", "max_price", "min_area"):
         parsed = _coerce_int(value.get(key))
         if parsed is not None:
             params[key] = parsed
+
+    subway_distance = _coerce_int(value.get("subway_distance"))
+    if subway_distance is None:
+        subway_distance = _coerce_int(value.get("max_subway_dist"))
+    if subway_distance is not None:
+        params["max_subway_dist"] = subway_distance
 
     decoration = value.get("decoration")
     if isinstance(decoration, str) and decoration.strip():
@@ -1734,7 +1805,7 @@ def _sanitize_plan_tag_need(value: Any) -> dict[str, list[str]]:
         for item in raw:
             if not isinstance(item, str):
                 continue
-            token = item.strip()
+            token = _canonicalize_nlu_tag_token(item)
             if not token or token in seen:
                 continue
             seen.add(token)
@@ -2227,15 +2298,19 @@ def _is_housing_context_inquiry(message: str, state: Any) -> bool:
 def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str, Any] | None = None) -> list[dict[str, str]]:
     summary_text = summary[:220] if summary else ""
     context_text = _format_context_facts_for_prompt(context_facts)
+    tag_catalog = _load_nlu_tag_catalog()
+    tag_catalog_text = "、".join(tag_catalog[:_LLM_NLU_TAG_CATALOG_LIMIT]) if tag_catalog else "-"
     content = (
         "你是租房智能Agent决策器（Plan模块）。\n"
         "只输出1行字符串，不要解释。\n"
         "格式：i=<intent>|p=k:v;k:v|t=m:x,y;a:u,v;p:q,r\n"
         "intent可选：chat/search/compare/house_detail/amenities/listings/rent_check/rent/terminate/offline。\n"
-        "p仅允许键：district,bedrooms,min_price,max_price,decoration,max_subway_dist,rental_type,min_area,elevator。\n"
+        "p仅允许键：district,bedrooms,min_price,max_price,decoration,subway_distance,rental_type,min_area,elevator。\n"
         "t里 m=must, a=avoid, p=prefer；没值留空。\n"
-        "规则：用户问“这套可租吗/我可以租吗/能租吗”时 i=rent_check；预算表达“左右/上下/附近/约/大概”时尽量给 min_price 与 max_price 区间。\n"
-        "示例：i=search|p=district:朝阳;bedrooms:2;max_price:3500|t=m:;a:;p:仅线上VR看房\n"
+        "t 的标签必须从“标签全集”里选择，并保持标签原文，不要改写或造新标签。\n"
+        f"标签全集：{tag_catalog_text}\n"
+        "规则：用户问“这套可租吗/我可以租吗/能租吗”时 i=rent_check；预算表达“左右/上下/附近/约/大概”时尽量给 min_price 与 max_price 区间；提到近地铁时优先给 subway_distance:800。\n"
+        "示例：i=search|p=district:朝阳;bedrooms:2;max_price:3500;subway_distance:800|t=m:;a:;p:仅线上VR看房\n"
         f"会话摘要：{summary_text}\n"
         f"上下文：\n{context_text}\n"
         f"用户输入：{message}"

@@ -178,7 +178,7 @@ def test_planner_by_platform_passes_soft_preferences_to_upstream_params() -> Non
     assert houses.by_platform_calls
     first = houses.by_platform_calls[0]
     assert first["min_area"] == 60
-    assert first["max_subway_dist"] == 800
+    assert first["subway_distance"] == 800
     assert first["orientation"] == "朝南"
     assert first["elevator"] == "true"
     assert first["decoration"] == "精装"
