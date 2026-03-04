@@ -690,6 +690,80 @@ def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
         assert captured["meta"]["llm_parse"]["params"] == {}
 
 
+def test_chat_route_llm_tool_call_is_merged_and_tool_params_take_priority() -> None:
+    app = create_app()
+    captured: dict = {}
+
+    class StubService:
+        async def handle(self, request):
+            captured["meta"] = request.meta
+            return InvokeResponse(text="ok", candidates=[], debug={"response_kind": "search"})
+
+    class StubResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            _ = url
+            _ = json
+            assert headers["Session-ID"] == "sess-tool-priority"
+            return StubResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "i=search|p=district:海淀;max_price:3000|t=m:;a:;p:",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "house_query",
+                                            "arguments": __import__("json").dumps(
+                                                {
+                                                    "op": "by_platform",
+                                                    "district": "朝阳",
+                                                    "bedrooms": "2",
+                                                    "max_price": 3500,
+                                                    "subway_distance": 800,
+                                                },
+                                                ensure_ascii=False,
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-tool-priority", "message": "帮我找朝阳两居"},
+        )
+
+    assert resp.status_code == 200
+    llm_parse = captured["meta"]["llm_parse"]
+    assert llm_parse["intent"] == "search"
+    assert llm_parse["params"]["district"] == "朝阳"
+    assert llm_parse["params"]["bedrooms"] == "2"
+    assert llm_parse["params"]["max_price"] == 3500
+    assert llm_parse["params"]["max_subway_dist"] == 800
+
+
 def test_chat_route_llm_tool_call_keeps_nearby_max_distance_argument() -> None:
     app = create_app()
     captured: dict = {}

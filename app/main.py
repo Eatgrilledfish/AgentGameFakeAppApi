@@ -271,6 +271,29 @@ _LLM_COMPACT_TOOLS: list[dict[str, Any]] = [
         },
     },
 ]
+_COMPACT_TOOL_TO_OPERATION_ID: dict[str, dict[str, str]] = {
+    "landmark": {
+        "list": "get_landmarks",
+        "search": "search_landmarks",
+        "by_id": "get_landmark_by_id",
+        "by_name": "get_landmark_by_name",
+        "stats": "get_landmark_stats",
+    },
+    "house_query": {
+        "get": "get_house_by_id",
+        "listings": "get_house_listings",
+        "by_community": "get_houses_by_community",
+        "by_platform": "get_houses_by_platform",
+        "nearby_landmarks": "get_nearby_landmarks",
+        "nearby_houses": "get_houses_nearby",
+        "stats": "get_house_stats",
+    },
+    "house_action": {
+        "rent": "rent_house",
+        "terminate": "terminate_rental",
+        "offline": "take_offline",
+    },
+}
 
 
 def _normalize_catalog_tag_token(value: str) -> str:
@@ -2389,17 +2412,24 @@ def _extract_llm_tool_plan(data: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(function_node, dict):
         return None
 
-    operation_id = function_node.get("name")
-    if not isinstance(operation_id, str) or not operation_id:
+    function_name = function_node.get("name")
+    if not isinstance(function_name, str) or not function_name:
         return None
 
-    arguments = _parse_llm_tool_arguments(function_node.get("arguments"))
+    raw_arguments = _parse_llm_tool_arguments(function_node.get("arguments"))
+    operation_id, mapped_arguments = _resolve_tool_operation_id(function_name, raw_arguments)
+    if not isinstance(operation_id, str) or not operation_id:
+        return None
+    arguments = _apply_tool_argument_aliases(operation_id, mapped_arguments)
+    arguments = _sanitize_tool_arguments_for_operation(operation_id, arguments)
     parsed: dict[str, Any] = {
         "tool_plan": {
             "operationId": operation_id,
             "arguments": arguments,
         },
         "confidence": 0.9,
+        "params": arguments,
+        "tag_need": {"must": [], "avoid": [], "prefer": []},
     }
     mapped_intent = _load_operation_intents().get(operation_id)
     if isinstance(mapped_intent, str) and mapped_intent:
@@ -2424,6 +2454,45 @@ def _parse_llm_tool_arguments(raw: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return {k: v for k, v in value.items() if isinstance(k, str)}
     return {}
+
+
+def _resolve_tool_operation_id(function_name: str, arguments: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+    normalized_function = function_name.strip()
+    if not normalized_function:
+        return None, {}
+
+    if normalized_function in _COMPACT_TOOL_TO_OPERATION_ID:
+        op_key_name = "action" if normalized_function == "house_action" else "op"
+        raw_key = arguments.get(op_key_name)
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            return None, {}
+        normalized_key = raw_key.strip().lower()
+        operation_id = _COMPACT_TOOL_TO_OPERATION_ID[normalized_function].get(normalized_key)
+        if not operation_id:
+            return None, {}
+        sanitized_arguments = {k: v for k, v in arguments.items() if isinstance(k, str) and k != op_key_name}
+        return operation_id, sanitized_arguments
+
+    return normalized_function, {k: v for k, v in arguments.items() if isinstance(k, str)}
+
+
+def _sanitize_tool_arguments_for_operation(operation_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    specs = _load_tool_argument_specs().get(operation_id, {})
+    if not specs:
+        return arguments
+
+    output: dict[str, Any] = {}
+    for key, value in arguments.items():
+        if not isinstance(key, str):
+            continue
+        spec = specs.get(key)
+        if not isinstance(spec, dict):
+            continue
+        coerced = _coerce_argument_value(value, spec)
+        if coerced is None:
+            continue
+        output[key] = coerced
+    return output
 
 
 def _parse_llm_nlu_payload(raw: str) -> dict[str, Any] | None:
@@ -2568,14 +2637,16 @@ async def _analyze_intent_with_llm(
         step=STEP_LLM_NLU,
         llm_stage="plan",
     )
+    tool_parse = _extract_llm_tool_plan(response_data)
     text_parse: dict[str, Any] | None = None
     llm_text = _extract_llm_text_content(response_data)
     if llm_text:
         parsed = _parse_llm_nlu_payload(llm_text)
         if isinstance(parsed, dict):
             text_parse = parsed
-    if isinstance(text_parse, dict):
-        sanitized = _sanitize_llm_parse(text_parse)
+    merged = _merge_llm_parse_candidates(tool_parse, text_parse)
+    if isinstance(merged, dict):
+        sanitized = _sanitize_llm_parse(merged)
         if sanitized:
             return sanitized
     return None
@@ -2595,6 +2666,12 @@ def _merge_llm_parse_candidates(
     merged = dict(text_parse)
     # Function-call arguments are the most executable form; keep them authoritative.
     merged["tool_plan"] = tool_parse.get("tool_plan", merged.get("tool_plan"))
+    tool_params = tool_parse.get("params")
+    if isinstance(tool_params, dict):
+        text_params = merged.get("params")
+        if not isinstance(text_params, dict):
+            text_params = {}
+        merged["params"] = {**text_params, **tool_params}
     if "intent" not in merged and "intent" in tool_parse:
         merged["intent"] = tool_parse["intent"]
     if "confidence" not in merged and "confidence" in tool_parse:
