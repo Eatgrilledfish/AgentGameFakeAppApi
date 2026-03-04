@@ -57,7 +57,7 @@ class AgentSettings:
     budget_limit_slices: int = 300
     rerank_house_context_fields: str = (
         "house_id,community,district,rent,layout,area,subway_distance,commute_to_xierqi_min,"
-        "status,listing_platform,decoration,elevator,orientation,available_date,tags,nearby_landmarks"
+        "status,listing_platform,decoration,elevator,orientation,hidden_noise_level,available_date,tags,nearby_landmarks"
     )
     rerank_landmark_context_fields: str = "id,name,category,district,type,type_name,distance,nearby_subway"
     rerank_landmark_item_limit: int = 2
@@ -87,7 +87,7 @@ def load_settings() -> AgentSettings:
             "RERANK_HOUSE_CONTEXT_FIELDS",
             (
                 "house_id,community,district,rent,layout,area,subway_distance,commute_to_xierqi_min,"
-                "status,listing_platform,decoration,elevator,orientation,available_date,tags,nearby_landmarks"
+                "status,listing_platform,decoration,elevator,orientation,hidden_noise_level,available_date,tags,nearby_landmarks"
             ),
         ),
         rerank_landmark_context_fields=os.getenv(

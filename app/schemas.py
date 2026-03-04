@@ -118,6 +118,7 @@ class HouseLite(BaseModel):
     distance_to_landmark: float | None = None
     walking_distance: float | None = None
     walking_duration: int | None = None
+    hidden_noise_level: str | None = None
 
 
 class Listing(BaseModel):

@@ -755,6 +755,10 @@ class DialogueManager:
             query.soft.decoration = "精装"
         if query.soft.decoration == "简装修":
             query.soft.decoration = "简装"
+        if query.soft.noise_preference:
+            normalized_noise = _normalize_noise_preference_value(query.soft.noise_preference)
+            if normalized_noise is not None:
+                query.soft.noise_preference = normalized_noise
         query.tag_need = self._normalize_tag_need(query.tag_need, query.soft)
 
     @staticmethod
@@ -930,6 +934,10 @@ class DialogueManager:
                 return False
         if query.soft.elevator is not None and house.elevator is not None:
             if query.soft.elevator != house.elevator:
+                return False
+        if query.soft.noise_preference == "安静":
+            noise_level = house.hidden_noise_level.strip() if isinstance(house.hidden_noise_level, str) else ""
+            if noise_level != "安静":
                 return False
         return True
 
@@ -2215,6 +2223,11 @@ class DialogueManager:
             elevator = _to_bool(params_raw.get("elevator"))
             if elevator is not None:
                 soft_overrides["elevator"] = elevator
+            noise_preference = _normalize_noise_preference_flag(params_raw.get("noise_preference"))
+            if noise_preference is True:
+                soft_overrides["noise_preference"] = "安静"
+            elif noise_preference is False:
+                query.soft.noise_preference = None
             self._apply_soft_overrides(query.soft, soft_overrides)
 
         tag_need_raw = llm_parse.get("tag_need")
@@ -2456,6 +2469,11 @@ class DialogueManager:
                         normalized_decoration = _normalize_decoration_value(cleaned)
                         if normalized_decoration is not None:
                             soft.decoration = normalized_decoration
+                        continue
+                    if key == "noise_preference":
+                        normalized_noise = _normalize_noise_preference_value(cleaned)
+                        if normalized_noise is not None:
+                            soft.noise_preference = normalized_noise
                         continue
                     setattr(soft, key, cleaned)
 
@@ -2795,6 +2813,40 @@ def _normalize_decoration_value(value: str) -> str | None:
         return "精装"
     if cleaned in {"简装", "简装修"}:
         return "简装"
+    return None
+
+
+def _normalize_noise_preference_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    compact = cleaned.replace(" ", "")
+    if compact in {"安静", "中等", "临街", "吵闹"}:
+        return compact
+    if any(token in compact for token in ("安静", "不吵", "静一点", "安静点", "安静些", "隔音")):
+        return "安静"
+    if any(token in compact for token in ("临街", "靠街", "沿街")):
+        return "临街"
+    if any(token in compact for token in ("吵", "噪音大", "太闹", "热闹")):
+        return "吵闹"
+    return None
+
+
+def _normalize_noise_preference_flag(value: Any) -> bool | None:
+    direct = _to_bool(value)
+    if direct is not None:
+        return direct
+    normalized = _normalize_noise_preference_value(value)
+    if normalized == "安静":
+        return True
+    if normalized in {"临街", "吵闹", "中等"}:
+        return False
+    if isinstance(value, str):
+        compact = value.strip().replace(" ", "")
+        if compact in {"不限", "无", "不要求", "一般"}:
+            return False
     return None
 
 

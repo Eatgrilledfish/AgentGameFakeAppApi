@@ -74,7 +74,7 @@ _TOOL_ARGUMENT_KEY_ALIASES: dict[str, dict[str, str]] = {
 }
 _SOFT_BOOL_DEFAULT_FALSE_KEYS = {"prefer_spacious", "prioritize_subway_distance", "prioritize_commute", "value_for_money"}
 _LLM_CONTEXT_HARD_KEYS = ("district", "layout", "budget_min", "budget_max", "max_subway_dist", "rent_type", "area")
-_LLM_CONTEXT_SOFT_KEYS = ("decoration", "amenities", "preferred_tags", "avoid_tags")
+_LLM_CONTEXT_SOFT_KEYS = ("decoration", "noise_preference", "amenities", "preferred_tags", "avoid_tags")
 _LLM_CONTEXT_TAG_LIMIT = 80
 _LLM_CONTEXT_HOUSE_LIMIT = 10
 _LLM_CONTEXT_TAG_NEED_LIMIT = 10
@@ -103,6 +103,7 @@ _DEFAULT_SEARCH_RERANK_HOUSE_FIELDS = (
     "decoration",
     "elevator",
     "orientation",
+    "hidden_noise_level",
     "available_date",
     "available_from",
     "rental_type",
@@ -131,6 +132,7 @@ _HOUSE_CONTEXT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "available_date": ("available_date", "available_from"),
     "subway": ("subway", "nearest_subway"),
     "subway_station": ("subway_station", "nearest_subway"),
+    "hidden_noise_level": ("hidden_noise_level", "noise_level"),
 }
 _SEARCH_RERANK_HOUSE_FIELDS: tuple[str, ...] = _DEFAULT_SEARCH_RERANK_HOUSE_FIELDS
 _SEARCH_RERANK_LANDMARK_FIELDS: tuple[str, ...] = _DEFAULT_SEARCH_RERANK_LANDMARK_FIELDS
@@ -184,6 +186,9 @@ _LLM_NLU_PARAM_KEY_ALIASES = {
     "area": "min_area",
     "elevator": "elevator",
     "el": "elevator",
+    "noise_preference": "noise_preference",
+    "noise": "noise_preference",
+    "quiet": "noise_preference",
 }
 _LLM_NLU_TAG_KEY_ALIASES = {
     "must": "must",
@@ -1568,6 +1573,7 @@ def _house_context_row_to_lite(row: dict[str, Any]) -> HouseLite | None:
         "distance_to_landmark",
         "walking_distance",
         "walking_duration",
+        "hidden_noise_level",
     ):
         value = row.get(key)
         if value is None:
@@ -1772,6 +1778,23 @@ def _normalize_bedrooms_param(value: str) -> str | None:
     return ",".join(unique) if unique else None
 
 
+def _normalize_noise_preference_param(value: Any) -> bool | None:
+    direct = _coerce_bool(value)
+    if direct is not None:
+        return direct
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    compact = cleaned.replace(" ", "")
+    if any(token in compact for token in ("安静", "不吵", "静一点", "安静点", "安静些", "隔音")):
+        return True
+    if compact in {"不限", "无", "不要求", "一般"}:
+        return False
+    return None
+
+
 def _sanitize_plan_params(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -1811,6 +1834,10 @@ def _sanitize_plan_params(value: Any) -> dict[str, Any]:
     elevator = _coerce_bool(value.get("elevator"))
     if elevator is not None:
         params["elevator"] = elevator
+
+    noise_preference = _normalize_noise_preference_param(value.get("noise_preference"))
+    if noise_preference is not None:
+        params["noise_preference"] = noise_preference
 
     return params
 
@@ -2328,13 +2355,13 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
         "只输出1行字符串，不要解释。\n"
         "格式：i=<intent>|p=k:v;k:v|t=m:x,y;a:u,v;p:q,r\n"
         "intent可选：chat/search/compare/house_detail/amenities/listings/rent_check/rent/terminate/offline。\n"
-        "p仅允许键：district,bedrooms,min_price,max_price,decoration,subway_distance,rental_type,min_area,elevator。\n"
+        "p仅允许键：district,bedrooms,min_price,max_price,decoration,subway_distance,rental_type,min_area,elevator,noise_preference。\n"
         "t里 m=must, a=avoid, p=prefer；没值留空。\n"
         "t 的标签必须从“标签全集”里选择，并保持标签原文，不要改写或造新标签。\n"
         "若同一桶（m/a/p）命中多个标签，必须全部返回（去重后逗号分隔），不能只返回一个。\n"
         f"标签全集：{tag_catalog_text}\n"
-        "规则：用户问“这套可租吗/我可以租吗/能租吗”时 i=rent_check；预算表达“左右/上下/附近/约/大概”时尽量给 min_price 与 max_price 区间；提到近地铁时优先给 subway_distance:800。\n"
-        "示例：i=search|p=district:朝阳;bedrooms:2;max_price:3500;subway_distance:800|t=m:可养狗,近公园;a:年付,收中介费;p:月付,房东直租\n"
+        "规则：用户问“这套可租吗/我可以租吗/能租吗”时 i=rent_check；预算表达“左右/上下/附近/约/大概”时尽量给 min_price 与 max_price 区间；提到近地铁时优先给 subway_distance:800；noise_preference 只返回 true/false：用户明确要安静时 true，否则 false。true 表示后续只匹配 hidden_noise_level=安静。\n"
+        "示例：i=search|p=district:朝阳;bedrooms:2;max_price:3500;subway_distance:800;noise_preference:true|t=m:可养狗,近公园;a:年付,收中介费;p:月付,房东直租\n"
         f"会话摘要：{summary_text}\n"
         f"上下文：\n{context_text}\n"
         f"用户输入：{message}"

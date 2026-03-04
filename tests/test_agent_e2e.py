@@ -960,7 +960,7 @@ def test_chat_route_parses_compact_string_nlu_payload() -> None:
                         {
                             "message": {
                                 "content": (
-                                    "i=search|p=d:朝阳;b:2;min:2600;max:3400|"
+                                    "i=search|p=d:朝阳;b:2;min:2600;max:3400;noise_preference:true|"
                                     "t=m:近地铁;a:年付;p:月付,房东直租"
                                 )
                             }
@@ -984,6 +984,7 @@ def test_chat_route_parses_compact_string_nlu_payload() -> None:
     assert llm_parse["params"]["bedrooms"] == "2"
     assert llm_parse["params"]["min_price"] == 2600
     assert llm_parse["params"]["max_price"] == 3400
+    assert llm_parse["params"]["noise_preference"] is True
     assert "近地铁" in llm_parse["tag_need"]["must"]
     assert "年付" in llm_parse["tag_need"]["avoid"]
     assert "月付" in llm_parse["tag_need"]["prefer"]
@@ -1005,7 +1006,14 @@ def test_chat_route_applies_second_llm_rerank_and_persists_top5_context() -> Non
         HouseLite(house_id="HF_7", rent=3000, district="朝阳", layout="2居", subway_distance=500),
         HouseLite(house_id="HF_8", rent=3150, district="朝阳", layout="2居", subway_distance=720),
         HouseLite(house_id="HF_9", rent=3080, district="朝阳", layout="2居", subway_distance=610),
-        HouseLite(house_id="HF_10", rent=3250, district="朝阳", layout="2居", subway_distance=830),
+        HouseLite(
+            house_id="HF_10",
+            rent=3250,
+            district="朝阳",
+            layout="2居",
+            subway_distance=830,
+            hidden_noise_level="吵闹",
+        ),
     ]
     state.last_top5 = [
         HouseViewModel(house_id="HF_1", rent=3200),
@@ -1082,6 +1090,7 @@ def test_chat_route_applies_second_llm_rerank_and_persists_top5_context() -> Non
                 second_content = json["messages"][0]["content"]
                 assert "房源上下文top10(JSON)" in second_content
                 assert "HF_10" in second_content
+                assert '"hidden_noise_level":"吵闹"' in second_content
                 assert "1. HF_1" not in second_content
                 return StubResponse(
                     {

@@ -222,6 +222,135 @@ async def test_dialogue_handles_listing_then_rent_with_context() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dialogue_filters_quiet_houses_by_hidden_noise_level_from_llm_parse() -> None:
+    class NoisePlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            _ = plan
+            _ = case_type
+            self.executed_queries.append(query.model_copy(deep=True))
+            return [
+                HouseLite(
+                    house_id="HF_Q1",
+                    rent=4100,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="静园",
+                    subway_distance=680,
+                    hidden_noise_level="安静",
+                    status="可租",
+                ),
+                HouseLite(
+                    house_id="HF_N1",
+                    rent=3900,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="沿街苑",
+                    subway_distance=620,
+                    hidden_noise_level="吵闹",
+                    status="可租",
+                ),
+                HouseLite(
+                    house_id="HF_N2",
+                    rent=3800,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="临街苑",
+                    subway_distance=640,
+                    tags=["临街"],
+                    status="可租",
+                ),
+            ]
+
+    planner = NoisePlanner()
+    dialogue, state, _, _ = _build_dialogue(planner=planner)
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="想找朝阳两居，最好安静点",
+            meta={
+                "llm_parse": {
+                    "intent": "search",
+                    "params": {"district": "朝阳", "noise_preference": True},
+                    "tag_need": {"must": [], "avoid": [], "prefer": []},
+                }
+            },
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    assert planner.executed_queries
+    assert planner.executed_queries[-1].soft.noise_preference == "安静"
+    assert [item.house_id for item in resp.candidates] == ["HF_Q1"]
+    assert [item.house_id for item in state.house_context_top10] == ["HF_Q1"]
+
+
+@pytest.mark.asyncio
+async def test_dialogue_noise_preference_false_skips_hidden_noise_filter() -> None:
+    class NoisePlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            _ = plan
+            _ = case_type
+            self.executed_queries.append(query.model_copy(deep=True))
+            return [
+                HouseLite(
+                    house_id="HF_Q1",
+                    rent=4100,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="静园",
+                    subway_distance=680,
+                    hidden_noise_level="安静",
+                    status="可租",
+                ),
+                HouseLite(
+                    house_id="HF_N1",
+                    rent=3900,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="沿街苑",
+                    subway_distance=620,
+                    hidden_noise_level="吵闹",
+                    status="可租",
+                ),
+                HouseLite(
+                    house_id="HF_N2",
+                    rent=3800,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="临街苑",
+                    subway_distance=640,
+                    status="可租",
+                ),
+            ]
+
+    planner = NoisePlanner()
+    dialogue, state, _, _ = _build_dialogue(planner=planner)
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="朝阳两居，预算5000",
+            meta={
+                "llm_parse": {
+                    "intent": "search",
+                    "params": {"district": "朝阳", "noise_preference": False},
+                    "tag_need": {"must": [], "avoid": [], "prefer": []},
+                }
+            },
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    assert planner.executed_queries
+    assert planner.executed_queries[-1].soft.noise_preference is None
+    assert {item.house_id for item in resp.candidates} == {"HF_Q1", "HF_N1", "HF_N2"}
+    assert {item.house_id for item in state.house_context_top10} == {"HF_Q1", "HF_N1", "HF_N2"}
+
+
+@pytest.mark.asyncio
 async def test_dialogue_summarizes_top5_subway_distance_for_followup_question() -> None:
     class MultiPlanner(DummyPlanner):
         async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
