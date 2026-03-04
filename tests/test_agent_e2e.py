@@ -650,9 +650,10 @@ def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
             assert "上轮推荐 HF_1001" in content
             assert isinstance(json["tools"], list) and len(json["tools"]) > 0
             tool_names = {item["function"]["name"] for item in json["tools"]}
-            assert "rent_house" in tool_names
-            rent_tool = next(item for item in json["tools"] if item["function"]["name"] == "rent_house")
-            assert "POST /api/houses/{house_id}/rent" in rent_tool["function"]["description"]
+            assert tool_names == {"landmark", "house_query", "house_action"}
+            house_action_tool = next(item for item in json["tools"] if item["function"]["name"] == "house_action")
+            action_schema = house_action_tool["function"]["parameters"]
+            assert action_schema["required"] == ["action", "house_id", "listing_platform"]
             assert json["stream"] is False
             return StubResponse(
                 {

@@ -104,6 +104,84 @@ _TOOL_OPTIONAL_PARAM_PRIORITY = (
 )
 _TOOL_OPTIONAL_PARAM_LIMIT = 10
 
+_LLM_COMPACT_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "landmark",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "enum": ["list", "search", "by_id", "by_name", "stats"]},
+                    "id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "q": {"type": "string"},
+                    "district": {"type": "string"},
+                    "category": {"type": "string"},
+                },
+                "required": ["op"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "house_query",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": [
+                            "get",
+                            "listings",
+                            "by_community",
+                            "by_platform",
+                            "nearby_landmarks",
+                            "nearby_houses",
+                            "stats",
+                        ],
+                    },
+                    "house_id": {"type": "string"},
+                    "landmark_id": {"type": "string"},
+                    "community": {"type": "string"},
+                    "listing_platform": {"type": "string"},
+                    "district": {"type": "string"},
+                    "area": {"type": "string"},
+                    "page": {"type": "integer"},
+                    "page_size": {"type": "integer"},
+                    "min_price": {"type": "integer"},
+                    "max_price": {"type": "integer"},
+                    "bedrooms": {"type": "string"},
+                    "rental_type": {"type": "string"},
+                    "decoration": {"type": "string"},
+                    "max_subway_dist": {"type": "integer"},
+                    "min_area": {"type": "integer"},
+                    "max_distance": {"type": "number"},
+                    "max_distance_m": {"type": "number"},
+                    "type": {"type": "string"},
+                },
+                "required": ["op"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "house_action",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["rent", "terminate", "offline"]},
+                    "house_id": {"type": "string"},
+                    "listing_platform": {"type": "string"},
+                },
+                "required": ["action", "house_id", "listing_platform"],
+            },
+        },
+    },
+]
+
 
 def _parse_http_body_for_io(raw_body: bytes, content_type: str | None) -> Any:
     if not raw_body:
@@ -669,20 +747,8 @@ def _collect_param_defs(item: dict[str, Any]) -> list[dict[str, Any]]:
 
 @lru_cache(maxsize=1)
 def _load_llm_tools() -> list[dict[str, Any]]:
-    tools_path = Path(__file__).resolve().parents[1] / "llm_tools_preset.json"
-    try:
-        payload = json.loads(tools_path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise RuntimeError(f"llm_tools_preset.json not found: {tools_path}") from exc
-    except ValueError as exc:
-        raise RuntimeError(f"llm_tools_preset.json is invalid JSON: {tools_path}") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"llm_tools_preset.json must be a JSON object: {tools_path}")
-    tools = payload.get("tools")
-    if not isinstance(tools, list):
-        raise RuntimeError(f"llm_tools_preset.json missing tools list: {tools_path}")
-    raw_tools = [item for item in tools if isinstance(item, dict)]
-    return _compact_tools_for_llm(raw_tools)
+    # Keep a fixed compact tool schema to control prompt token usage.
+    return _LLM_COMPACT_TOOLS
 
 
 def _compact_tools_for_llm(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
