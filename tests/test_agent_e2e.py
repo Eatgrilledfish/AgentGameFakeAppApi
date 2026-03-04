@@ -2024,3 +2024,96 @@ def test_debug_agent_io_events_keep_large_body_without_truncation(monkeypatch, t
     content = first["request_body"]["messages"][0]["content"]
     assert content == large_prompt
     assert "...(truncated)" not in content
+
+
+def test_debug_agent_io_focus_events_only_keep_user_and_llm(monkeypatch, tmp_path) -> None:
+    log_file = tmp_path / "agent_http_io.log"
+    lines = [
+        {
+            "event": "http.agent_io.request",
+            "method": "POST",
+            "path": "/api/v1/chat",
+            "session_id": "sess-focus",
+            "request_body": {"session_id": "sess-focus", "model_ip": "127.0.0.1", "message": "帮我找安静的两居"},
+        },
+        {
+            "event": "http.agent_io.api.request",
+            "method": "GET",
+            "url": "http://x/api/houses/by_platform",
+            "session_id": "sess-focus",
+        },
+        {
+            "event": "http.agent_io.llm.request",
+            "method": "POST",
+            "url": "http://127.0.0.1:8000/v1/chat/completions",
+            "session_id": "sess-focus",
+            "llm_stage": "plan",
+            "request_body": {
+                "model": "",
+                "messages": [{"role": "user", "content": "安静两居"}],
+                "tools": [
+                    {"type": "function", "function": {"name": "house_query"}},
+                    {"type": "function", "function": {"name": "landmark"}},
+                ],
+                "stream": False,
+            },
+        },
+        {
+            "event": "http.agent_io.llm.response",
+            "method": "POST",
+            "url": "http://127.0.0.1:8000/v1/chat/completions",
+            "session_id": "sess-focus",
+            "llm_stage": "plan",
+            "status_code": 200,
+            "response_body": {
+                "choices": [{"message": {"content": "i=search|p=noise_preference:true|t=m:;a:;p:"}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+            },
+        },
+        {
+            "event": "http.agent_io.response",
+            "method": "POST",
+            "path": "/api/v1/chat",
+            "session_id": "sess-focus",
+            "response_body": {"session_id": "sess-focus", "response": "{\"message\":\"ok\",\"houses\":[]}"},
+        },
+    ]
+    raw = "\n".join(f"2026-03-03 10:00:0{idx} {json.dumps(item, ensure_ascii=False)}" for idx, item in enumerate(lines))
+    log_file.write_text(raw + "\n", encoding="utf-8")
+    monkeypatch.setenv("AGENT_HTTP_IO_LOG_PATH", str(log_file))
+
+    app = create_app()
+    with TestClient(app) as client:
+        resp = client.get("/debug/agent-io/focus/events", params={"session_id": "sess-focus", "limit": 50})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["session_id"] == "sess-focus"
+    assert body["count"] == 4
+    events = [item["event"] for item in body["items"]]
+    assert "http.agent_io.api.request" not in events
+    assert events == [
+        "http.agent_io.request",
+        "http.agent_io.llm.request",
+        "http.agent_io.llm.response",
+        "http.agent_io.response",
+    ]
+
+    llm_input = next(item for item in body["items"] if item["event"] == "http.agent_io.llm.request")
+    assert llm_input["llm_input"]["messages"][0]["content"] == "安静两居"
+    assert llm_input["llm_input"]["tools_count"] == 2
+    assert llm_input["llm_input"]["tool_names"] == ["house_query", "landmark"]
+    assert "tools" not in llm_input["llm_input"]
+
+
+def test_debug_agent_io_focus_page_renders(monkeypatch, tmp_path) -> None:
+    log_file = tmp_path / "agent_http_io.log"
+    log_file.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AGENT_HTTP_IO_LOG_PATH", str(log_file))
+
+    app = create_app()
+    with TestClient(app) as client:
+        resp = client.get("/debug/agent-io/focus")
+
+    assert resp.status_code == 200
+    assert "/debug/agent-io/focus/events" in resp.text

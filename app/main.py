@@ -549,6 +549,154 @@ def _compact_agent_io_entry_for_ui(entry: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
+def _is_agent_io_focus_event(entry: dict[str, Any]) -> bool:
+    event = str(entry.get("event", ""))
+    method = str(entry.get("method", "")).upper()
+    path = str(entry.get("path", ""))
+    if event == "http.agent_io.request" and method == "POST" and path == "/api/v1/chat":
+        return True
+    if event == "http.agent_io.response" and method == "POST" and path == "/api/v1/chat":
+        return True
+    if event in {
+        "http.agent_io.llm.request",
+        "http.agent_io.llm.response",
+        "http.agent_io.llm.retry",
+        "http.agent_io.llm.error",
+    }:
+        return True
+    return False
+
+
+def _extract_llm_tool_names(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function_node = tool.get("function")
+        if not isinstance(function_node, dict):
+            continue
+        name = function_node.get("name")
+        if not isinstance(name, str) or not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def _focus_user_request_payload(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+    focus: dict[str, Any] = {}
+    for key in ("session_id", "model_ip", "message", "content"):
+        if key in payload:
+            focus[key] = payload.get(key)
+    return focus or payload
+
+
+def _focus_user_response_payload(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+    focus: dict[str, Any] = {}
+    for key in ("session_id", "status", "response", "duration_ms", "timestamp"):
+        if key in payload:
+            focus[key] = payload.get(key)
+    return focus or payload
+
+
+def _focus_llm_request_payload(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+    focus: dict[str, Any] = {}
+    model = payload.get("model")
+    if model is not None:
+        focus["model"] = model
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        focus["messages"] = messages
+    stream = payload.get("stream")
+    if isinstance(stream, bool):
+        focus["stream"] = stream
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        focus["tools_count"] = len(tools)
+        tool_names = _extract_llm_tool_names(payload)
+        if tool_names:
+            focus["tool_names"] = tool_names
+    return focus or payload
+
+
+def _focus_llm_response_payload(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+
+    focus: dict[str, Any] = {}
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            message = first.get("message")
+            if isinstance(message, dict):
+                picked: dict[str, Any] = {}
+                content = message.get("content")
+                if content is not None:
+                    picked["content"] = content
+                tool_calls = message.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    picked["tool_calls"] = tool_calls
+                if picked:
+                    focus["assistant"] = picked
+            finish_reason = first.get("finish_reason")
+            if finish_reason is not None:
+                focus["finish_reason"] = finish_reason
+        focus["choices_count"] = len(choices)
+
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        focus["usage"] = usage
+    model = payload.get("model")
+    if model is not None:
+        focus["model"] = model
+    return focus or payload
+
+
+def _compact_agent_io_entry_for_focus(entry: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in (
+        "stage",
+        "event",
+        "session_id",
+        "trace_id",
+        "llm_stage",
+        "method",
+        "path",
+        "url",
+        "status_code",
+        "duration_ms",
+        "attempt",
+        "error",
+        "error_type",
+    ):
+        value = entry.get(key)
+        if value is not None and value != "":
+            compact[key] = value
+
+    event = str(entry.get("event", ""))
+    if event == "http.agent_io.request":
+        compact["user_input"] = _focus_user_request_payload(entry.get("request_body"))
+    elif event == "http.agent_io.response":
+        compact["agent_output"] = _focus_user_response_payload(entry.get("response_body"))
+    elif event == "http.agent_io.llm.request":
+        compact["llm_input"] = _focus_llm_request_payload(entry.get("request_body"))
+    elif event == "http.agent_io.llm.response":
+        compact["llm_output"] = _focus_llm_response_payload(entry.get("response_body"))
+    return compact
+
 def _format_ops_index_for_prompt(ops: list[dict[str, Any]], *, max_ops: int = 30) -> str:
     if not ops:
         return "-"
@@ -3670,6 +3818,35 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             "log_exists": log_path.exists(),
         }
 
+    @app.get("/debug/agent-io/focus/events")
+    async def debug_agent_io_focus_events(
+        limit: int = 200,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        log_path = _resolve_agent_http_io_log_path()
+        requested_limit = max(1, min(limit, 1000))
+        scan_limit = max(400, requested_limit * 3)
+        if session_id:
+            scan_limit = min(5000, max(scan_limit, requested_limit * 20))
+
+        entries = _read_agent_http_io_entries(limit=scan_limit)
+        entries = [item for item in entries if not _is_debug_agent_io_path(str(item.get("path", "")))]
+        if session_id:
+            entries = [item for item in entries if str(item.get("session_id", "")).strip() == session_id]
+        entries = [item for item in entries if _is_agent_io_focus_event(item)]
+        entries = entries[-requested_limit:]
+
+        enriched_raw = [{"stage": _stage_name(item), **item} for item in entries]
+        normalized = [_normalize_agent_io_entry_for_display(item) for item in enriched_raw]
+        focused = [_compact_agent_io_entry_for_focus(item) for item in normalized]
+        return {
+            "count": len(focused),
+            "items": focused,
+            "session_id": session_id or "",
+            "log_path": str(log_path),
+            "log_exists": log_path.exists(),
+        }
+
     @app.get("/debug/agent-io", response_class=HTMLResponse)
     async def debug_agent_io_page() -> HTMLResponse:
         html = """
@@ -3751,6 +3928,149 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
       if (sessionId) params.set('session_id', sessionId);
       var xhr = new XMLHttpRequest();
       xhr.open('GET', '/debug/agent-io/events?' + params.toString(), true);
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState !== 4) return;
+        if (xhr.status < 200 || xhr.status >= 300) {
+          renderError('日志加载失败：HTTP ' + xhr.status);
+          return;
+        }
+        var data;
+        try {
+          data = JSON.parse(xhr.responseText || '{}');
+        } catch (e) {
+          renderError('日志加载失败：JSON解析错误');
+          return;
+        }
+
+        var list = document.getElementById('list');
+        list.innerHTML = '';
+
+        var meta = document.createElement('div');
+        meta.className = 'card';
+        meta.textContent =
+          'count=' + (data.count || 0) +
+          ' | log_path=' + (data.log_path || '-') +
+          ' | log_exists=' + (data.log_exists ? 'yes' : 'no');
+        list.appendChild(meta);
+
+        if (!data.items || !data.items.length) {
+          var emptyTip = document.createElement('div');
+          emptyTip.className = 'card';
+          emptyTip.textContent = '暂无日志。可先发一条 /api/v1/chat 请求，或检查 session_id 过滤、日志路径。';
+          list.appendChild(emptyTip);
+          return;
+        }
+
+        var j;
+        for (j = 0; j < data.items.length; j++) {
+          var item = data.items[j];
+          var div = document.createElement('div');
+          div.className = 'card';
+          var stage = document.createElement('div');
+          stage.className = 'stage';
+          stage.textContent = item.stage || '其他';
+          var pre = document.createElement('pre');
+          pre.textContent = formatValue(item, 0);
+          div.appendChild(stage);
+          div.appendChild(pre);
+          list.appendChild(div);
+        }
+      };
+      xhr.send(null);
+    }
+
+    load();
+    setInterval(load, 4000);
+  </script>
+</body>
+</html>
+        """
+        return HTMLResponse(content=html)
+
+    @app.get("/debug/agent-io/focus", response_class=HTMLResponse)
+    async def debug_agent_io_focus_page() -> HTMLResponse:
+        html = """
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent IO Focus</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; background: #f7f7f9; }
+    h1 { margin: 0 0 12px; }
+    .hint { color: #555; margin-bottom: 10px; }
+    .card { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 10px; margin-bottom: 8px; }
+    .stage { font-weight: bold; color: #1f4b99; }
+    .links { margin-bottom: 10px; }
+    a { color: #1f4b99; text-decoration: none; }
+    pre { white-space: pre-wrap; word-break: break-word; margin: 6px 0 0; }
+  </style>
+</head>
+<body>
+  <h1>Agent Focus 面板</h1>
+  <div class="links"><a href="/debug/agent-io">切回完整面板</a></div>
+  <div class="hint">只展示：用户输入、LLM输入、LLM输出、最终返回用户。可在 URL 上附加 ?session_id=xxx 只看单会话。</div>
+  <div id="list"></div>
+  <script>
+    var query = new URLSearchParams(window.location.search);
+    var sessionId = query.get('session_id');
+
+    function repeatPad(indent) {
+      var pad = '';
+      var i;
+      for (i = 0; i < indent; i++) pad += '  ';
+      return pad;
+    }
+
+    function formatValue(value, indent) {
+      var i;
+      var pad = repeatPad(indent || 0);
+      if (value === null) return 'null';
+      if (Object.prototype.toString.call(value) === '[object Array]') {
+        if (value.length === 0) return '[]';
+        var rows = [];
+        for (i = 0; i < value.length; i++) {
+          rows.push(pad + '  - ' + formatValue(value[i], (indent || 0) + 1));
+        }
+        return '[\\n' + rows.join('\\n') + '\\n' + pad + ']';
+      }
+      if (typeof value === 'object') {
+        var keys = Object.keys(value || {});
+        if (keys.length === 0) return '{}';
+        var objRows = [];
+        for (i = 0; i < keys.length; i++) {
+          var k = keys[i];
+          objRows.push(pad + '  ' + k + ': ' + formatValue(value[k], (indent || 0) + 1));
+        }
+        return '{\\n' + objRows.join('\\n') + '\\n' + pad + '}';
+      }
+      if (typeof value === 'string') {
+        if (value.indexOf('\\n') === -1) return value;
+        var lines = value.split('\\n');
+        var textRows = [];
+        for (i = 0; i < lines.length; i++) {
+          textRows.push(pad + '  ' + lines[i]);
+        }
+        return '|\\n' + textRows.join('\\n');
+      }
+      return String(value);
+    }
+
+    function renderError(message) {
+      var list = document.getElementById('list');
+      list.innerHTML = '';
+      var tip = document.createElement('div');
+      tip.className = 'card';
+      tip.textContent = message;
+      list.appendChild(tip);
+    }
+
+    function load() {
+      var params = new URLSearchParams({ limit: '200' });
+      if (sessionId) params.set('session_id', sessionId);
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/debug/agent-io/focus/events?' + params.toString(), true);
       xhr.onreadystatechange = function () {
         if (xhr.readyState !== 4) return;
         if (xhr.status < 200 || xhr.status >= 300) {
