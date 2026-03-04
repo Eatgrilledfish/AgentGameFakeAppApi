@@ -253,9 +253,41 @@ def _resolve_http_session_id(request: Request, raw_body: bytes, content_type: st
 def _is_debug_agent_io_path(path: str) -> bool:
     return path.startswith("/debug/agent-io")
 
+def _resolve_agent_http_io_log_path() -> Path:
+    env_path = os.getenv("AGENT_HTTP_IO_LOG_PATH")
+    if isinstance(env_path, str) and env_path.strip():
+        configured_path = Path(env_path.strip())
+        if configured_path.is_absolute():
+            return configured_path
+        cwd_path = Path.cwd() / configured_path
+        project_path = Path(__file__).resolve().parents[1] / configured_path
+        if cwd_path.exists():
+            return cwd_path
+        if project_path.exists():
+            return project_path
+        return cwd_path
+
+    logger = logging.getLogger("agent.http.io")
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            filename = getattr(handler, "baseFilename", "")
+            if isinstance(filename, str) and filename:
+                return Path(filename)
+
+    configured_path = Path("agent_http_io.log")
+    if configured_path.is_absolute():
+        return configured_path
+
+    cwd_path = Path.cwd() / configured_path
+    project_path = Path(__file__).resolve().parents[1] / configured_path
+    if cwd_path.exists():
+        return cwd_path
+    if project_path.exists():
+        return project_path
+    return cwd_path
+
 def _read_agent_http_io_entries(limit: int = 200) -> list[dict[str, Any]]:
-    log_path = os.getenv("AGENT_HTTP_IO_LOG_PATH", "agent_http_io.log")
-    path = Path(log_path)
+    path = _resolve_agent_http_io_log_path()
     if not path.exists():
         return []
 
@@ -2585,6 +2617,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         session_id: str | None = None,
         include_debug_endpoints: bool = False,
     ) -> dict[str, Any]:
+        log_path = _resolve_agent_http_io_log_path()
         requested_limit = max(1, min(limit, 1000))
         scan_limit = max(200, requested_limit)
         if session_id:
@@ -2602,6 +2635,8 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             "count": len(enriched),
             "items": enriched,
             "session_id": session_id or "",
+            "log_path": str(log_path),
+            "log_exists": log_path.exists(),
         }
 
     @app.get("/debug/agent-io", response_class=HTMLResponse)
@@ -2653,23 +2688,39 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
     }
 
     async function load() {
-      const params = new URLSearchParams({ limit: '200' });
-      if (sessionId) params.set('session_id', sessionId);
-      const res = await fetch('/debug/agent-io/events?' + params.toString());
-      const data = await res.json();
       const list = document.getElementById('list');
-      list.innerHTML = '';
-      for (const item of data.items) {
-        const div = document.createElement('div');
-        div.className = 'card';
-        const stage = document.createElement('div');
-        stage.className = 'stage';
-        stage.textContent = item.stage || '其他';
-        const pre = document.createElement('pre');
-        pre.textContent = formatValue(item);
-        div.appendChild(stage);
-        div.appendChild(pre);
-        list.appendChild(div);
+      try {
+        const params = new URLSearchParams({ limit: '120' });
+        if (sessionId) params.set('session_id', sessionId);
+        const res = await fetch('/debug/agent-io/events?' + params.toString());
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        list.innerHTML = '';
+        if (!Array.isArray(data.items) || data.items.length === 0) {
+          const tip = document.createElement('div');
+          tip.className = 'card';
+          tip.textContent = '暂无日志。可先发一条 /api/v1/chat 请求，或检查 session_id 过滤、日志路径。';
+          list.appendChild(tip);
+          return;
+        }
+        for (const item of data.items) {
+          const div = document.createElement('div');
+          div.className = 'card';
+          const stage = document.createElement('div');
+          stage.className = 'stage';
+          stage.textContent = item.stage || '其他';
+          const pre = document.createElement('pre');
+          pre.textContent = formatValue(item);
+          div.appendChild(stage);
+          div.appendChild(pre);
+          list.appendChild(div);
+        }
+      } catch (err) {
+        list.innerHTML = '';
+        const tip = document.createElement('div');
+        tip.className = 'card';
+        tip.textContent = '日志加载失败：' + String(err);
+        list.appendChild(tip);
       }
     }
     load();
