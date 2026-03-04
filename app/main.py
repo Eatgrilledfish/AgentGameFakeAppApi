@@ -388,11 +388,11 @@ def _compact_agent_io_entry_for_ui(entry: dict[str, Any]) -> dict[str, Any]:
             compact[key] = value
 
     if "request_body" in entry:
-        compact["request_body_preview"] = preview_payload(entry.get("request_body"), limit=1000)
+        compact["request_body"] = entry.get("request_body")
     if "response_body" in entry:
-        compact["response_body_preview"] = preview_payload(entry.get("response_body"), limit=1000)
+        compact["response_body"] = entry.get("response_body")
     if "body" in entry:
-        compact["body_preview"] = preview_payload(entry.get("body"), limit=700)
+        compact["body"] = entry.get("body")
 
     return compact
 
@@ -2751,7 +2751,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
     }
 
     function load() {
-      var params = new URLSearchParams({ limit: '80', compact: '1' });
+      var params = new URLSearchParams({ limit: '200' });
       if (sessionId) params.set('session_id', sessionId);
       var xhr = new XMLHttpRequest();
       xhr.open('GET', '/debug/agent-io/events?' + params.toString(), true);
