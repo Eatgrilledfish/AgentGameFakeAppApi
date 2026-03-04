@@ -367,6 +367,36 @@ def _normalize_agent_io_entry_for_display(entry: dict[str, Any]) -> dict[str, An
     return normalized if isinstance(normalized, dict) else entry
 
 
+def _compact_agent_io_entry_for_ui(entry: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in (
+        "stage",
+        "event",
+        "session_id",
+        "trace_id",
+        "method",
+        "path",
+        "url",
+        "status_code",
+        "llm_stage",
+        "duration_ms",
+        "error",
+        "error_type",
+    ):
+        value = entry.get(key)
+        if value is not None and value != "":
+            compact[key] = value
+
+    if "request_body" in entry:
+        compact["request_body_preview"] = preview_payload(entry.get("request_body"), limit=1000)
+    if "response_body" in entry:
+        compact["response_body_preview"] = preview_payload(entry.get("response_body"), limit=1000)
+    if "body" in entry:
+        compact["body_preview"] = preview_payload(entry.get("body"), limit=700)
+
+    return compact
+
+
 def _format_ops_index_for_prompt(ops: list[dict[str, Any]], *, max_ops: int = 30) -> str:
     if not ops:
         return "-"
@@ -2616,6 +2646,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         limit: int = 200,
         session_id: str | None = None,
         include_debug_endpoints: bool = False,
+        compact: bool = False,
     ) -> dict[str, Any]:
         log_path = _resolve_agent_http_io_log_path()
         requested_limit = max(1, min(limit, 1000))
@@ -2630,7 +2661,11 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             entries = [item for item in entries if str(item.get("session_id", "")).strip() == session_id]
         entries = entries[-requested_limit:]
 
-        enriched = [_normalize_agent_io_entry_for_display({"stage": _stage_name(item), **item}) for item in entries]
+        enriched_raw = [{"stage": _stage_name(item), **item} for item in entries]
+        if compact:
+            enriched = [_compact_agent_io_entry_for_ui(item) for item in enriched_raw]
+        else:
+            enriched = [_normalize_agent_io_entry_for_display(item) for item in enriched_raw]
         return {
             "count": len(enriched),
             "items": enriched,
@@ -2690,12 +2725,16 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
     async function load() {
       const list = document.getElementById('list');
       try {
-        const params = new URLSearchParams({ limit: '120' });
+        const params = new URLSearchParams({ limit: '80', compact: '1' });
         if (sessionId) params.set('session_id', sessionId);
         const res = await fetch('/debug/agent-io/events?' + params.toString());
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         list.innerHTML = '';
+        const meta = document.createElement('div');
+        meta.className = 'card';
+        meta.textContent = `count=${data.count || 0} | log_path=${data.log_path || '-'} | log_exists=${data.log_exists ? 'yes' : 'no'}`;
+        list.appendChild(meta);
         if (!Array.isArray(data.items) || data.items.length === 0) {
           const tip = document.createElement('div');
           tip.className = 'card';
@@ -2724,7 +2763,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
       }
     }
     load();
-    setInterval(load, 2000);
+    setInterval(load, 4000);
   </script>
 </body>
 </html>
