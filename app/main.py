@@ -48,7 +48,8 @@ STEP_FINAL_RESPONSE = "STEP-04-FINAL-RESPONSE"
 STEP_HTTP = "STEP-00-HTTP"
 STARTUP_LANDMARK_PRELOAD_SESSION_ID = "startup_landmarks_preload"
 
-LLM_TIMEOUT = httpx.Timeout(60.0)
+LLM_TIMEOUT = httpx.Timeout(90.0)
+_LLM_TIMEOUT_RETRY_ATTEMPTS = 2
 _CN_DIGITS = {
     "零": 0,
     "〇": 0,
@@ -667,37 +668,69 @@ async def _forward_chat_completion(
     )
 
     data: dict[str, Any]
+    response_body: Any = {}
+    resp: httpx.Response | None = None
     try:
-        resp = await _llm_post(
-            http_client,
-            url=target_url,
-            payload=payload,
-            headers=headers,
-        )
-        response_body = _parse_llm_http_body(resp)
-        log_json_event(
-            HTTP_IO_LOGGER,
-            {
-                **get_log_context(),
-                "event": "http.agent_io.llm.response",
-                "llm_stage": llm_stage,
-                "method": "POST",
-                "url": target_url,
-                "session_id": session_id or "-",
-                "status_code": resp.status_code,
-                "response_content_type": getattr(resp, "headers", {}).get("content-type", "application/json"),
-                "response_body": response_body,
-                "duration_ms": int((time.perf_counter() - started) * 1000),
-            },
-        )
-        resp.raise_for_status()
-        if isinstance(response_body, dict):
-            data = response_body
-        else:
-            parsed = _extract_json_object(str(response_body))
-            if not parsed:
-                raise ValueError("LLM response body is not a valid JSON object")
-            data = parsed
+        for attempt in range(1, _LLM_TIMEOUT_RETRY_ATTEMPTS + 1):
+            try:
+                resp = await _llm_post(
+                    http_client,
+                    url=target_url,
+                    payload=payload,
+                    headers=headers,
+                )
+                response_body = _parse_llm_http_body(resp)
+                log_json_event(
+                    HTTP_IO_LOGGER,
+                    {
+                        **get_log_context(),
+                        "event": "http.agent_io.llm.response",
+                        "llm_stage": llm_stage,
+                        "method": "POST",
+                        "url": target_url,
+                        "session_id": session_id or "-",
+                        "status_code": resp.status_code,
+                        "response_content_type": getattr(resp, "headers", {}).get("content-type", "application/json"),
+                        "response_body": response_body,
+                        "duration_ms": int((time.perf_counter() - started) * 1000),
+                        "attempt": attempt,
+                    },
+                )
+                resp.raise_for_status()
+                if isinstance(response_body, dict):
+                    data = response_body
+                else:
+                    parsed = _extract_json_object(str(response_body))
+                    if not parsed:
+                        raise ValueError("LLM response body is not a valid JSON object")
+                    data = parsed
+                break
+            except httpx.TimeoutException as exc:
+                if attempt >= _LLM_TIMEOUT_RETRY_ATTEMPTS:
+                    raise
+                log_event(
+                    LOGGER,
+                    "chat.llm.forward.retry",
+                    step=step,
+                    llm_stage=llm_stage,
+                    attempt=attempt,
+                    next_attempt=attempt + 1,
+                    reason=type(exc).__name__,
+                )
+                log_json_event(
+                    HTTP_IO_LOGGER,
+                    {
+                        **get_log_context(),
+                        "event": "http.agent_io.llm.retry",
+                        "llm_stage": llm_stage,
+                        "method": "POST",
+                        "url": target_url,
+                        "session_id": session_id or "-",
+                        "attempt": attempt,
+                        "next_attempt": attempt + 1,
+                        **_normalize_error_payload(exc),
+                    },
+                )
     except Exception as exc:
         log_json_event(
             HTTP_IO_LOGGER,
@@ -718,7 +751,7 @@ async def _forward_chat_completion(
         "chat.llm.forward.response",
         step=step,
         llm_stage=llm_stage,
-        status_code=resp.status_code,
+        status_code=resp.status_code if resp is not None else 0,
         body_preview=preview_payload(data),
     )
 
@@ -2200,10 +2233,9 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
         "格式：i=<intent>|p=k:v;k:v|t=m:x,y;a:u,v;p:q,r\n"
         "intent可选：chat/search/compare/house_detail/amenities/listings/rent_check/rent/terminate/offline。\n"
         "p仅允许键：district,bedrooms,min_price,max_price,decoration,max_subway_dist,rental_type,min_area,elevator。\n"
-        "短键可用：d,b,min,max,dec,sub,rt,area,el。\n"
         "t里 m=must, a=avoid, p=prefer；没值留空。\n"
         "规则：用户问“这套可租吗/我可以租吗/能租吗”时 i=rent_check；预算表达“左右/上下/附近/约/大概”时尽量给 min_price 与 max_price 区间。\n"
-        "示例：i=search|p=d:朝阳;b:2;max:3500|t=m:;a:;p:VR看房\n"
+        "示例：i=search|p=district:朝阳;bedrooms:2;max_price:3500|t=m:;a:;p:仅线上VR看房\n"
         f"会话摘要：{summary_text}\n"
         f"上下文：\n{context_text}\n"
         f"用户输入：{message}"

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import logging
+import os
+from pathlib import Path
 import re
 import time
 from difflib import SequenceMatcher
@@ -95,6 +98,7 @@ _DIRECT_REQUIREMENT_SIGNALS = (
 )
 _STICKY_SOFT_BOOL_FIELDS = {"prefer_spacious", "prioritize_subway_distance", "prioritize_commute"}
 _NEGATION_TOKENS = ("不", "不要", "不想", "不用", "别", "避免", "拒绝", "不希望", "不能")
+_MUST_TOKENS = ("必须", "一定", "务必", "刚需", "只能", "只要", "得", "得要", "必要", "必须要", "一定要")
 _TAG_TEXT_STOPWORDS = ("仅", "可", "需", "看房", "房", "租", "费用", "费", "押", "付", "支持")
 _POSITIVE_TOKENS = ("要", "想", "希望", "能", "可以", "必须", "优先", "倾向")
 _TOOL_OPERATION_TO_INTENT = {
@@ -141,6 +145,7 @@ _TAG_CANCEL_TOPICS: dict[str, tuple[str, ...]] = {
 _REJECT_SCORE_PENALTY = 10.0
 _TAG_FILTER_TOPK_THRESHOLD = 3
 _RELEVANT_LEXICON_LIMIT = 60
+_TAG_MATCH_SCORE_THRESHOLD = 0.46
 _TAG_TOPIC_KEYWORDS = (
     "宽带",
     "物业",
@@ -168,6 +173,46 @@ _TAG_TOPIC_KEYWORDS = (
 )
 
 
+@lru_cache(maxsize=1)
+def _load_global_tag_catalog() -> tuple[str, ...]:
+    candidate_paths: list[Path] = []
+    env_path = os.getenv("AGENT_TAGS_PATH")
+    if isinstance(env_path, str) and env_path.strip():
+        configured = Path(env_path.strip())
+        if not configured.is_absolute():
+            configured = Path.cwd() / configured
+        candidate_paths.append(configured)
+
+    candidate_paths.extend(
+        [
+            Path.cwd() / "tags.txt",
+            Path(__file__).resolve().parents[2] / "tags.txt",
+        ]
+    )
+
+    text = ""
+    for path in candidate_paths:
+        try:
+            if path.exists():
+                text = path.read_text(encoding="utf-8", errors="replace")
+                if text.strip():
+                    break
+        except OSError:
+            continue
+    if not text.strip():
+        return ()
+
+    tags: list[str] = []
+    seen: set[str] = set()
+    for raw in re.split(r"[,\n，、]+", text):
+        token = " ".join(raw.strip().split())
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        tags.append(token)
+    return tuple(tags)
+
+
 class DialogueManager:
     def __init__(
         self,
@@ -193,6 +238,7 @@ class DialogueManager:
         self.max_output_candidates = max_output_candidates
         self._known_district_aliases: set[str] | None = None
         self._known_landmark_aliases: set[str] | None = None
+        self._global_tag_catalog: list[str] = list(_load_global_tag_catalog())
 
     async def handle_turn(self, request: InvokeRequest, state: SessionState, is_new_session: bool) -> InvokeResponse:
         log_event(
@@ -628,7 +674,18 @@ class DialogueManager:
         state.phase = SessionPhase.presenting
         state.confirmed_constraints = query.hard
         state.soft_preferences = query.soft
-        compact_candidates = self._compress_candidates(topk)
+        context_candidates = topk
+        if semantic.get("candidate_filter_ran"):
+            selected_set = {
+                house_id
+                for house_id in semantic.get("selected", [])
+                if isinstance(house_id, str) and house_id
+            }
+            filtered_for_context = [house for house in topk if house.house_id in selected_set]
+            if filtered_for_context:
+                context_candidates = filtered_for_context
+
+        compact_candidates = self._compress_candidates(context_candidates)
         state.last_candidates = compact_candidates
         state.house_context_top10 = compact_candidates[:10]
         state.last_top5 = top
@@ -644,6 +701,7 @@ class DialogueManager:
                 "candidate_count": len(candidates),
                 "filtered_count": len(filtered),
                 "topk_count": len(topk),
+                "context_candidate_count": len(context_candidates),
                 "semantic_filter": semantic,
                 "semantic_fusion": semantic_fusion,
             },
@@ -657,7 +715,7 @@ class DialogueManager:
             hard.layout = self._normalize_layout_value(hard.layout)
         if hard.budget_min is not None and hard.budget_max is not None and hard.budget_min > hard.budget_max:
             hard.budget_min, hard.budget_max = hard.budget_max, hard.budget_min
-        if hard.budget_max is not None and hard.budget_min is None and any(token in user_text for token in ("左右", "上下", "附近", "约", "大概")):
+        if hard.budget_max is not None and hard.budget_min is None and self._text_implies_budget_range(user_text):
             hard.budget_min = int(max(0, round(hard.budget_max * 0.9)))
             hard.budget_max = int(round(hard.budget_max * 1.1))
         if hard.max_subway_dist is None and any(token in user_text for token in ("近地铁", "离地铁近", "靠近地铁")):
@@ -688,6 +746,18 @@ class DialogueManager:
         if not normalized:
             return None
         return ",".join(normalized)
+
+    @staticmethod
+    def _text_implies_budget_range(text: str) -> bool:
+        if any(token in text for token in ("左右", "上下", "约", "大概")):
+            return True
+        if "附近" not in text:
+            return False
+        if re.search(r"(预算|价格|租金|房租).{0,6}附近", text):
+            return True
+        if re.search(r"\d+\s*(?:k|K|千|元|块).{0,3}附近", text):
+            return True
+        return False
 
     @staticmethod
     def _normalize_layout_value(value: str) -> str:
@@ -1166,6 +1236,8 @@ class DialogueManager:
         right = re.sub(r"[^\w\u4e00-\u9fa5]+", "", tag.lower())
         if not left or not right:
             return False
+        if DialogueManager._has_tag_polarity_conflict(left, right):
+            return False
         if left in right or right in left:
             return True
         # Prefer explicit topic overlap to avoid fuzzy-ratio misses such as "宽带包含" vs "宽带标签X".
@@ -1173,6 +1245,23 @@ class DialogueManager:
             if keyword in left and keyword in right:
                 return True
         return SequenceMatcher(None, left, right).ratio() >= 0.54
+
+    @staticmethod
+    def _has_tag_polarity_conflict(left: str, right: str) -> bool:
+        dog_tokens = ("养狗", "小型犬")
+        cat_tokens = ("养猫",)
+        if any(token in left for token in dog_tokens) and any(token in right for token in cat_tokens):
+            return True
+        if any(token in left for token in cat_tokens) and any(token in right for token in dog_tokens):
+            return True
+
+        allow_pet_tokens = ("可养宠", "可养狗", "可养猫", "宠物友好", "仅限小型犬")
+        deny_pet_tokens = ("不可养宠", "禁止养宠", "不允许养宠", "不可养宠物")
+        if any(token in left for token in allow_pet_tokens) and any(token in right for token in deny_pet_tokens):
+            return True
+        if any(token in left for token in deny_pet_tokens) and any(token in right for token in allow_pet_tokens):
+            return True
+        return False
 
     async def _init_session_data(self, state: SessionState) -> None:
         try:
@@ -1566,24 +1655,73 @@ class DialogueManager:
         if not text:
             return
 
-        tag_pool = self._collect_context_tags(state)
+        tag_pool = self._collect_tag_pool_for_inference(state)
         if not tag_pool:
             return
 
-        preferred_tags, avoid_tags = self._infer_tag_preferences_from_text(text, tag_pool)
-        if not preferred_tags and not avoid_tags:
+        must_tags, preferred_tags, avoid_tags = self._infer_tag_need_from_text(text, tag_pool)
+        if not must_tags and not preferred_tags and not avoid_tags:
             return
 
-        merged_preferred = sorted(set(query.soft.preferred_tags + preferred_tags))
-        merged_avoid = sorted(set(query.soft.avoid_tags + avoid_tags))
-        query.soft.preferred_tags = merged_preferred
-        query.soft.avoid_tags = merged_avoid
+        def merge_unique(base: list[str], extra: list[str], *, limit: int) -> list[str]:
+            merged: list[str] = []
+            seen: set[str] = set()
+            for raw in [*base, *extra]:
+                if not isinstance(raw, str):
+                    continue
+                item = raw.strip()
+                if not item or item in seen:
+                    continue
+                seen.add(item)
+                merged.append(item)
+                if len(merged) >= limit:
+                    break
+            return merged
+
+        merged_must = merge_unique(query.tag_need.must, must_tags, limit=20)
+        merged_avoid = merge_unique(query.tag_need.avoid, avoid_tags, limit=20)
+        merged_prefer = merge_unique(query.tag_need.prefer, preferred_tags, limit=20)
+        merged_prefer = [item for item in merged_prefer if item not in merged_must and item not in merged_avoid]
+        query.tag_need = TagNeed(must=merged_must, avoid=merged_avoid, prefer=merged_prefer[:20])
+
+        merged_soft_avoid = merge_unique(query.soft.avoid_tags, merged_avoid, limit=20)
+        merged_soft_preferred = merge_unique(query.soft.preferred_tags, [*merged_must, *merged_prefer], limit=20)
+        merged_soft_preferred = [item for item in merged_soft_preferred if item not in merged_soft_avoid]
+        query.soft.preferred_tags = merged_soft_preferred[:20]
+        query.soft.avoid_tags = merged_soft_avoid[:20]
         log_event(
             LOGGER,
             "dialogue.tag_preferences.augmented",
-            preferred_tags=merged_preferred[:8],
-            avoid_tags=merged_avoid[:8],
+            must_tags=query.tag_need.must[:8],
+            preferred_tags=query.tag_need.prefer[:8],
+            avoid_tags=query.tag_need.avoid[:8],
         )
+
+    def _collect_tag_pool_for_inference(self, state: SessionState, *, max_tags: int = 400) -> list[str]:
+        tags: list[str] = []
+        seen: set[str] = set()
+        for raw in self._global_tag_catalog:
+            if not isinstance(raw, str):
+                continue
+            item = raw.strip()
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            tags.append(item)
+            if len(tags) >= max_tags:
+                return tags
+
+        for raw in self._collect_context_tags(state, max_tags=max_tags):
+            if not isinstance(raw, str):
+                continue
+            item = raw.strip()
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            tags.append(item)
+            if len(tags) >= max_tags:
+                break
+        return tags
 
     @staticmethod
     def _collect_context_tags(state: SessionState, *, max_tags: int = 200) -> list[str]:
@@ -1604,6 +1742,10 @@ class DialogueManager:
                 if len(tags) >= max_tags:
                     return
 
+        for house in state.house_context_top10[:40]:
+            collect(getattr(house, "tags", []))
+            if len(tags) >= max_tags:
+                return tags
         for house in state.last_candidates[:40]:
             collect(getattr(house, "tags", []))
             if len(tags) >= max_tags:
@@ -1615,29 +1757,34 @@ class DialogueManager:
         return tags
 
     @staticmethod
-    def _infer_tag_preferences_from_text(text: str, tag_pool: list[str]) -> tuple[list[str], list[str]]:
+    def _infer_tag_need_from_text(text: str, tag_pool: list[str]) -> tuple[list[str], list[str], list[str]]:
         normalized_text = DialogueManager._normalize_tag_text(text)
         if not normalized_text:
-            return [], []
+            return [], [], []
 
+        must: list[str] = []
         preferred: list[str] = []
         avoid: list[str] = []
 
         for tag in tag_pool:
             score, matched_signals = DialogueManager._match_tag_signal_score(normalized_text, tag)
-            if score < 0.46:
+            if score < _TAG_MATCH_SCORE_THRESHOLD:
                 continue
 
             if DialogueManager._is_negative_intent_for_tag(normalized_text, tag, matched_signals):
                 if tag not in avoid:
                     avoid.append(tag)
+            elif DialogueManager._is_must_intent_for_tag(normalized_text, tag, matched_signals):
+                if tag not in must:
+                    must.append(tag)
             else:
                 if tag not in preferred:
                     preferred.append(tag)
 
         # If both sides include same tag, keep explicit avoid only.
-        preferred = [tag for tag in preferred if tag not in avoid]
-        return preferred[:10], avoid[:10]
+        must = [tag for tag in must if tag not in avoid]
+        preferred = [tag for tag in preferred if tag not in avoid and tag not in must]
+        return must[:10], preferred[:12], avoid[:12]
 
     @staticmethod
     def _match_tag_signal_score(text: str, tag: str) -> tuple[float, list[str]]:
@@ -1664,6 +1811,7 @@ class DialogueManager:
 
         signals = matched_signals or [sig for sig in DialogueManager._extract_tag_signals(tag) if len(sig) >= 2]
         has_positive = False
+        question_markers = ("能不能", "可不可以", "能否", "是否可以", "行不行")
         for signal in signals:
             start = text.find(signal)
             if start == -1:
@@ -1672,6 +1820,9 @@ class DialogueManager:
             right = text[start + len(signal) : start + len(signal) + 4]
             if any(pos in left or pos in right for pos in _POSITIVE_TOKENS):
                 has_positive = True
+            if any(marker + signal in text for marker in question_markers):
+                has_positive = True
+                continue
             if any(f"{neg}{signal}" in text or f"{signal}{neg}" in text for neg in _NEGATION_TOKENS):
                 return True
 
@@ -1687,6 +1838,29 @@ class DialogueManager:
             return False
         if "线上" in tag_norm and any(token in text for token in ("不要线上", "不想线上")):
             return True
+        return False
+
+    @staticmethod
+    def _is_must_intent_for_tag(text: str, tag: str, matched_signals: list[str]) -> bool:
+        tag_norm = DialogueManager._normalize_tag_text(tag)
+        if not tag_norm:
+            return False
+        if any(token in text for token in ("不一定", "不是必须", "非必须")):
+            return False
+
+        signals = matched_signals or [sig for sig in DialogueManager._extract_tag_signals(tag) if len(sig) >= 2]
+        for signal in signals:
+            if signal not in text:
+                continue
+            start = text.find(signal)
+            if start >= 0:
+                left = text[max(0, start - 8) : start]
+                right = text[start + len(signal) : start + len(signal) + 8]
+                if any(token in left or token in right for token in _MUST_TOKENS):
+                    return True
+            if any(f"{token}{signal}" in text or f"{signal}{token}" in text for token in _MUST_TOKENS):
+                return True
+
         return False
 
     @staticmethod
@@ -1717,7 +1891,7 @@ class DialogueManager:
             if len(chunk) >= 2 and chunk not in seen:
                 seen.add(chunk)
                 signals.append(chunk)
-            if len(chunk) >= 4:
+            if len(chunk) >= 3:
                 for i in range(len(chunk) - 1):
                     part = chunk[i : i + 2]
                     if part in _TAG_TEXT_STOPWORDS or part in seen:

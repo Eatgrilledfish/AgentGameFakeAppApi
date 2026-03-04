@@ -1313,3 +1313,154 @@ async def test_dialogue_tag_need_accumulated_supports_revocation() -> None:
         is_new_session=False,
     )
     assert not any("物业" in item for item in state.req.soft.tag_need_accumulated.avoid)
+
+
+@pytest.mark.asyncio
+async def test_dialogue_uses_global_tags_to_extract_must_need_on_first_search() -> None:
+    class PetPlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            self.executed_queries.append(query.model_copy(deep=True))
+            _ = plan
+            _ = case_type
+            return [
+                HouseLite(
+                    house_id="HF_DOG_PARK",
+                    rent=3600,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="朝阳小区A",
+                    subway_distance=520,
+                    commute_to_xierqi_min=45,
+                    status="可租",
+                    tags=["可养狗", "近公园", "月付"],
+                ),
+                HouseLite(
+                    house_id="HF_DOG_OTHER",
+                    rent=3500,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="朝阳小区B",
+                    subway_distance=580,
+                    commute_to_xierqi_min=50,
+                    status="可租",
+                    tags=["可养狗", "近商超"],
+                ),
+                HouseLite(
+                    house_id="HF_NOPET",
+                    rent=3400,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="朝阳小区C",
+                    subway_distance=500,
+                    commute_to_xierqi_min=44,
+                    status="可租",
+                    tags=["不可养宠物", "近公园"],
+                ),
+            ]
+
+    dialogue, state, planner, _ = _build_dialogue(planner=PetPlanner(), houses_client=DummyHousesClient())
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-global-tags",
+            case_type=CaseType.single,
+            message="帮我找房，我养了一只金毛，必须要养狗的房子，另外希望附近有公园可以遛狗",
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    assert resp.debug["response_kind"] == "search"
+    assert planner.executed_queries
+    refined_query = planner.executed_queries[-1]
+    assert any("养狗" in item for item in refined_query.tag_need.must)
+    assert any("公园" in item for item in refined_query.tag_need.prefer)
+
+    context_ids = [item.house_id for item in state.house_context_top10]
+    assert "HF_DOG_PARK" in context_ids
+    assert "HF_DOG_OTHER" in context_ids
+    assert "HF_NOPET" not in context_ids
+    assert all(any("养狗" in tag for tag in house.tags) for house in state.house_context_top10)
+
+
+@pytest.mark.asyncio
+async def test_dialogue_followup_tag_refinement_filters_context_by_must_tags() -> None:
+    class PetPlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            self.executed_queries.append(query.model_copy(deep=True))
+            _ = plan
+            _ = case_type
+            return [
+                HouseLite(
+                    house_id="HF_DOG_PARK",
+                    rent=3600,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="朝阳小区A",
+                    subway_distance=520,
+                    commute_to_xierqi_min=45,
+                    status="可租",
+                    tags=["可养狗", "近公园", "月付"],
+                ),
+                HouseLite(
+                    house_id="HF_DOG_OTHER",
+                    rent=3500,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="朝阳小区B",
+                    subway_distance=580,
+                    commute_to_xierqi_min=50,
+                    status="可租",
+                    tags=["可养狗", "近商超"],
+                ),
+                HouseLite(
+                    house_id="HF_CAT",
+                    rent=3400,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="朝阳小区C",
+                    subway_distance=500,
+                    commute_to_xierqi_min=44,
+                    status="可租",
+                    tags=["可养猫", "近公园"],
+                ),
+            ]
+
+    dialogue, state, planner, _ = _build_dialogue(planner=PetPlanner(), houses_client=DummyHousesClient())
+    first = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-followup-tags",
+            case_type=CaseType.single,
+            message="帮我找朝阳区两居，预算4000以内",
+        ),
+        state,
+        is_new_session=True,
+    )
+    assert first.debug["response_kind"] == "search"
+
+    second = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-followup-tags",
+            case_type=CaseType.single,
+            message="我养了一只金毛，必须要养狗的房子，另外希望附近有公园可以遛狗",
+            meta={
+                "llm_parse": {
+                    "intent": "chat",
+                    "tool_plan": {"operationId": "none", "arguments": {}},
+                    "assistant_reply": "收到",
+                    "confidence": 0.9,
+                }
+            },
+        ),
+        state,
+        is_new_session=False,
+    )
+
+    assert second.debug["response_kind"] == "search"
+    assert len(planner.executed_queries) >= 2
+    refined_query = planner.executed_queries[-1]
+    assert any("养狗" in item for item in refined_query.tag_need.must)
+
+    context_ids = [item.house_id for item in state.house_context_top10]
+    assert "HF_DOG_PARK" in context_ids
+    assert "HF_DOG_OTHER" in context_ids
+    assert "HF_CAT" not in context_ids
