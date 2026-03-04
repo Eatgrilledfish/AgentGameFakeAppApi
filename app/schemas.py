@@ -213,6 +213,7 @@ class SessionState(BaseModel):
     unresolved_slots: list[str] = Field(default_factory=list)
     last_query_hash: str | None = None
     last_candidates: list[HouseLite] = Field(default_factory=list)
+    house_context_top10: list[HouseLite] = Field(default_factory=list)
     last_top5: list[HouseViewModel] = Field(default_factory=list)
     search_history: list[SearchSnapshot] = Field(default_factory=list)
     focus_house_id: str | None = None

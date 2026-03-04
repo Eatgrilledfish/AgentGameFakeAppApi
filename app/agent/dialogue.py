@@ -628,7 +628,9 @@ class DialogueManager:
         state.phase = SessionPhase.presenting
         state.confirmed_constraints = query.hard
         state.soft_preferences = query.soft
-        state.last_candidates = self._compress_candidates(topk)
+        compact_candidates = self._compress_candidates(topk)
+        state.last_candidates = compact_candidates
+        state.house_context_top10 = compact_candidates[:10]
         state.last_top5 = top
         self._remember_search_snapshot(state, request.message, query)
 

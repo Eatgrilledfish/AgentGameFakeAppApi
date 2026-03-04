@@ -32,7 +32,7 @@ from app.infra.logging import (
     setup_logging,
 )
 from app.infra.tool_recorder import begin_tool_recording, get_tool_results, reset_tool_recording
-from app.schemas import CaseType, ChatRequest, ChatResponse, HealthResponse, InvokeRequest, InvokeResponse
+from app.schemas import CaseType, ChatRequest, ChatResponse, HealthResponse, HouseLite, HouseViewModel, InvokeRequest, InvokeResponse
 from app.settings import AgentSettings, load_settings
 
 LOGGER = logging.getLogger(__name__)
@@ -42,6 +42,7 @@ STEP_RECV_USER_QUERY = "STEP-01-RECV-USER-QUERY"
 STEP_AGENT_PIPELINE = "STEP-02-AGENT-PIPELINE"
 STEP_LLM_FALLBACK = "STEP-03-LLM-FALLBACK"
 STEP_LLM_NLU = "STEP-02A-LLM-NLU"
+STEP_LLM_SEARCH_RERANK = "STEP-02B-LLM-SEARCH-RERANK"
 STEP_LLM_RESPOND = "STEP-03-LLM-RESPOND"
 STEP_FINAL_RESPONSE = "STEP-04-FINAL-RESPONSE"
 STEP_HTTP = "STEP-00-HTTP"
@@ -74,8 +75,64 @@ _SOFT_BOOL_DEFAULT_FALSE_KEYS = {"prefer_spacious", "prioritize_subway_distance"
 _LLM_CONTEXT_HARD_KEYS = ("district", "layout", "budget_min", "budget_max", "max_subway_dist", "rent_type", "area")
 _LLM_CONTEXT_SOFT_KEYS = ("decoration", "amenities", "preferred_tags", "avoid_tags")
 _LLM_CONTEXT_TAG_LIMIT = 80
-_LLM_CONTEXT_HOUSE_LIMIT = 5
+_LLM_CONTEXT_HOUSE_LIMIT = 10
 _LLM_CONTEXT_TAG_NEED_LIMIT = 10
+_SEARCH_RERANK_HOUSE_CONTEXT_LIMIT = 10
+_SEARCH_RERANK_TAG_LIMIT = 8
+_DEFAULT_SEARCH_RERANK_HOUSE_FIELDS = (
+    "house_id",
+    "community",
+    "district",
+    "rent",
+    "price",
+    "layout",
+    "bedrooms",
+    "livingrooms",
+    "bathrooms",
+    "area",
+    "area_sqm",
+    "subway",
+    "subway_station",
+    "subway_distance",
+    "commute_to_xierqi_min",
+    "commute_to_xierqi",
+    "status",
+    "listing_platform",
+    "decoration",
+    "elevator",
+    "orientation",
+    "available_date",
+    "available_from",
+    "rental_type",
+    "utilities_type",
+    "tags",
+    "nearby_landmarks",
+)
+_DEFAULT_SEARCH_RERANK_LANDMARK_FIELDS = (
+    "id",
+    "name",
+    "category",
+    "district",
+    "type",
+    "type_name",
+    "distance",
+    "nearby_subway",
+)
+_HOUSE_CONTEXT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "price": ("price", "rent"),
+    "rent": ("rent", "price"),
+    "area_sqm": ("area_sqm", "area"),
+    "area": ("area", "area_sqm"),
+    "commute_to_xierqi": ("commute_to_xierqi", "commute_to_xierqi_min"),
+    "commute_to_xierqi_min": ("commute_to_xierqi_min", "commute_to_xierqi"),
+    "available_from": ("available_from", "available_date"),
+    "available_date": ("available_date", "available_from"),
+    "subway": ("subway", "nearest_subway"),
+    "subway_station": ("subway_station", "nearest_subway"),
+}
+_SEARCH_RERANK_HOUSE_FIELDS: tuple[str, ...] = _DEFAULT_SEARCH_RERANK_HOUSE_FIELDS
+_SEARCH_RERANK_LANDMARK_FIELDS: tuple[str, ...] = _DEFAULT_SEARCH_RERANK_LANDMARK_FIELDS
+_SEARCH_RERANK_LANDMARK_ITEM_LIMIT = 2
 _TOOL_OPTIONAL_PARAM_PRIORITY = (
     "house_id",
     "listing_platform",
@@ -103,6 +160,7 @@ _TOOL_OPTIONAL_PARAM_PRIORITY = (
     "type",
 )
 _TOOL_OPTIONAL_PARAM_LIMIT = 10
+_HOUSE_ID_EXTRACT_PATTERN = re.compile(r"[A-Z]{2,4}_?\d{1,8}", re.IGNORECASE)
 _LLM_NLU_PARAM_KEY_ALIASES = {
     "district": "district",
     "d": "district",
@@ -489,6 +547,49 @@ def _format_tool_results_for_prompt(
             break
 
     return "\n".join(lines) if lines else "-"
+
+
+def _parse_csv_tokens(raw: Any, *, fallback: tuple[str, ...]) -> tuple[str, ...]:
+    if not isinstance(raw, str):
+        return fallback
+    parts = [token.strip() for token in raw.split(",")]
+    output: list[str] = []
+    seen: set[str] = set()
+    for token in parts:
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        output.append(token)
+    return tuple(output) if output else fallback
+
+
+def _clamp_positive_int(value: Any, *, fallback: int, min_value: int = 1, max_value: int = 10) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return max(min_value, min(max_value, parsed))
+
+
+def _configure_search_rerank_context_settings(cfg: AgentSettings) -> None:
+    global _SEARCH_RERANK_HOUSE_FIELDS
+    global _SEARCH_RERANK_LANDMARK_FIELDS
+    global _SEARCH_RERANK_LANDMARK_ITEM_LIMIT
+
+    _SEARCH_RERANK_HOUSE_FIELDS = _parse_csv_tokens(
+        getattr(cfg, "rerank_house_context_fields", ""),
+        fallback=_DEFAULT_SEARCH_RERANK_HOUSE_FIELDS,
+    )
+    _SEARCH_RERANK_LANDMARK_FIELDS = _parse_csv_tokens(
+        getattr(cfg, "rerank_landmark_context_fields", ""),
+        fallback=_DEFAULT_SEARCH_RERANK_LANDMARK_FIELDS,
+    )
+    _SEARCH_RERANK_LANDMARK_ITEM_LIMIT = _clamp_positive_int(
+        getattr(cfg, "rerank_landmark_item_limit", 2),
+        fallback=2,
+        min_value=1,
+        max_value=10,
+    )
 
 
 def _build_model_base_url(model_ip: str) -> str:
@@ -1122,6 +1223,301 @@ def _compact_tag_need_payload(value: Any) -> dict[str, list[str]]:
     return result
 
 
+def _value_from_item(item: Any, key: str) -> Any:
+    if isinstance(item, dict):
+        return item.get(key)
+    return getattr(item, key, None)
+
+
+def _round_float_for_context(value: Any) -> Any:
+    if isinstance(value, float):
+        return round(value, 2)
+    return value
+
+
+def _normalize_house_context_value(field: str, value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return _round_float_for_context(value)
+    if isinstance(value, list):
+        if field == "tags":
+            return [str(item).strip() for item in value if isinstance(item, str) and str(item).strip()][: _SEARCH_RERANK_TAG_LIMIT]
+        if field in {"pros", "cons"}:
+            return [str(item).strip() for item in value if isinstance(item, str) and str(item).strip()][:5]
+        cleaned: list[Any] = []
+        for item in value:
+            if item is None:
+                continue
+            if isinstance(item, (bool, int, str)):
+                cleaned.append(item)
+            elif isinstance(item, float):
+                cleaned.append(_round_float_for_context(item))
+            elif isinstance(item, dict) and item:
+                cleaned.append(item)
+            if len(cleaned) >= 6:
+                break
+        return cleaned or None
+    if isinstance(value, dict):
+        compact: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or item is None:
+                continue
+            if isinstance(item, (bool, int, str)):
+                compact[key] = item
+            elif isinstance(item, float):
+                compact[key] = _round_float_for_context(item)
+            if len(compact) >= 8:
+                break
+        return compact or None
+    return str(value)
+
+
+def _house_context_field_value(item: Any, key: str) -> Any:
+    aliases = _HOUSE_CONTEXT_FIELD_ALIASES.get(key, (key,))
+    for alias in aliases:
+        value = _value_from_item(item, alias)
+        if value is not None:
+            return value
+    return None
+
+
+def _landmark_context_field_value(
+    *,
+    field: str,
+    item: dict[str, Any],
+    landmark: dict[str, Any],
+    details: dict[str, Any],
+    output: dict[str, Any],
+) -> Any:
+    if field == "distance":
+        return item.get("distance")
+    if field == "type":
+        return output.get("type") or details.get("type")
+    if field == "type_name":
+        return details.get("type_name")
+    if field == "nearby_subway":
+        return details.get("nearby_subway")
+    if field == "landmark_id":
+        return details.get("landmark_id") or landmark.get("id")
+
+    if field in item and item.get(field) is not None:
+        return item.get(field)
+    if field in landmark and landmark.get(field) is not None:
+        return landmark.get(field)
+    if field in details and details.get(field) is not None:
+        return details.get(field)
+    if field in output and output.get(field) is not None:
+        return output.get(field)
+    return None
+
+
+def _collect_nearby_landmarks_context(tool_results: list[dict[str, Any]] | None) -> dict[str, list[dict[str, Any]]]:
+    if not isinstance(tool_results, list) or not tool_results:
+        return {}
+
+    fields = _SEARCH_RERANK_LANDMARK_FIELDS or _DEFAULT_SEARCH_RERANK_LANDMARK_FIELDS
+    item_limit = max(1, _SEARCH_RERANK_LANDMARK_ITEM_LIMIT)
+    by_community: dict[str, list[dict[str, Any]]] = {}
+    seen_keys: dict[str, set[str]] = {}
+
+    for row in tool_results:
+        if not isinstance(row, dict) or row.get("success") is not True:
+            continue
+        name = str(row.get("name", ""))
+        url = str(row.get("url", ""))
+        if "nearby_landmarks" not in name and "/nearby_landmarks" not in url:
+            continue
+
+        output = row.get("output")
+        if not isinstance(output, dict):
+            continue
+        community = output.get("community")
+        if not isinstance(community, str) or not community.strip():
+            continue
+        items = output.get("items")
+        if not isinstance(items, list) or not items:
+            continue
+
+        bucket = by_community.setdefault(community, [])
+        seen = seen_keys.setdefault(community, set())
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            landmark = raw.get("landmark")
+            if not isinstance(landmark, dict):
+                continue
+            details = landmark.get("details")
+            if not isinstance(details, dict):
+                details = {}
+
+            compact: dict[str, Any] = {}
+            for field in fields:
+                value = _landmark_context_field_value(
+                    field=field,
+                    item=raw,
+                    landmark=landmark,
+                    details=details,
+                    output=output,
+                )
+                normalized = _normalize_house_context_value(field, value)
+                if normalized is not None:
+                    compact[field] = normalized
+
+            if not compact:
+                continue
+            marker = str(compact.get("id") or compact.get("name") or compact)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            bucket.append(compact)
+            if len(bucket) >= item_limit:
+                break
+
+    return by_community
+
+
+def _house_context_row(item: Any, *, nearby_landmarks_by_community: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
+    house_id = _value_from_item(item, "house_id")
+    if not isinstance(house_id, str) or not house_id:
+        return {}
+
+    row: dict[str, Any] = {"house_id": house_id}
+
+    fields = _SEARCH_RERANK_HOUSE_FIELDS or _DEFAULT_SEARCH_RERANK_HOUSE_FIELDS
+    for key in fields:
+        if key == "house_id":
+            continue
+        if key == "nearby_landmarks":
+            if isinstance(nearby_landmarks_by_community, dict) and nearby_landmarks_by_community:
+                community = _house_context_field_value(item, "community")
+                if isinstance(community, str) and community:
+                    landmark_rows = nearby_landmarks_by_community.get(community)
+                    if isinstance(landmark_rows, list) and landmark_rows:
+                        row["nearby_landmarks"] = landmark_rows[: max(1, _SEARCH_RERANK_LANDMARK_ITEM_LIMIT)]
+            continue
+
+        value = _house_context_field_value(item, key)
+        normalized = _normalize_house_context_value(key, value)
+        if normalized is not None:
+            row[key] = normalized
+
+    return row
+
+
+def _house_context_row_to_lite(row: dict[str, Any]) -> HouseLite | None:
+    if not isinstance(row, dict):
+        return None
+    house_id = row.get("house_id")
+    if not isinstance(house_id, str) or not house_id:
+        return None
+
+    payload: dict[str, Any] = {"house_id": house_id}
+    if row.get("rent") is not None:
+        payload["rent"] = row.get("rent")
+    elif row.get("price") is not None:
+        payload["rent"] = row.get("price")
+    if row.get("area") is not None:
+        payload["area"] = row.get("area")
+    elif row.get("area_sqm") is not None:
+        payload["area"] = row.get("area_sqm")
+    if row.get("commute_to_xierqi_min") is not None:
+        payload["commute_to_xierqi_min"] = row.get("commute_to_xierqi_min")
+    elif row.get("commute_to_xierqi") is not None:
+        payload["commute_to_xierqi_min"] = row.get("commute_to_xierqi")
+    if row.get("available_date") is not None:
+        payload["available_date"] = row.get("available_date")
+    elif row.get("available_from") is not None:
+        payload["available_date"] = row.get("available_from")
+
+    for key in (
+        "layout",
+        "business_area",
+        "district",
+        "community",
+        "subway_distance",
+        "status",
+        "tags",
+        "decoration",
+        "elevator",
+        "orientation",
+        "listing_platform",
+        "distance_to_landmark",
+        "walking_distance",
+        "walking_duration",
+    ):
+        value = row.get(key)
+        if value is None:
+            continue
+        payload[key] = value
+
+    try:
+        return HouseLite.model_validate(payload)
+    except Exception:
+        return None
+
+
+def _set_state_house_context_top10(state: Any, rows: list[dict[str, Any]], *, limit: int = _SEARCH_RERANK_HOUSE_CONTEXT_LIMIT) -> None:
+    if state is None:
+        return
+    compact: list[HouseLite] = []
+    seen_house_ids: set[str] = set()
+    for row in rows[:limit]:
+        house = _house_context_row_to_lite(row)
+        if house is None or house.house_id in seen_house_ids:
+            continue
+        seen_house_ids.add(house.house_id)
+        compact.append(house)
+        if len(compact) >= limit:
+            break
+    setattr(state, "house_context_top10", compact)
+
+
+def _build_house_context_top10_rows(
+    state: Any,
+    fallback_candidates: list[Any] | None,
+    *,
+    tool_results: list[dict[str, Any]] | None = None,
+    limit: int = _SEARCH_RERANK_HOUSE_CONTEXT_LIMIT,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen_house_ids: set[str] = set()
+    nearby_landmarks_by_community = _collect_nearby_landmarks_context(tool_results)
+
+    def append_item(item: Any) -> bool:
+        row = _house_context_row(item, nearby_landmarks_by_community=nearby_landmarks_by_community)
+        house_id = row.get("house_id")
+        if not isinstance(house_id, str) or not house_id or house_id in seen_house_ids:
+            return False
+        seen_house_ids.add(house_id)
+        rows.append(row)
+        return len(rows) >= limit
+
+    sources: list[list[Any]] = []
+    house_context_top10 = getattr(state, "house_context_top10", None)
+    if isinstance(house_context_top10, list) and house_context_top10:
+        sources.append(house_context_top10)
+
+    last_candidates = getattr(state, "last_candidates", None)
+    if isinstance(last_candidates, list) and last_candidates:
+        sources.append(last_candidates)
+
+    if isinstance(fallback_candidates, list) and fallback_candidates:
+        sources.append(fallback_candidates)
+
+    last_top5 = getattr(state, "last_top5", None)
+    if isinstance(last_top5, list) and last_top5:
+        sources.append(last_top5)
+
+    for source in sources:
+        for item in source:
+            if append_item(item):
+                return rows
+    return rows
+
+
 def _build_llm_compact_context_facts(state: Any, *, include_candidate_tags: bool) -> dict[str, Any]:
     if state is None:
         return {}
@@ -1202,29 +1598,9 @@ def _build_llm_compact_context_facts(state: Any, *, include_candidate_tags: bool
         facts["latest_house_ids"] = candidate_ids
 
     if include_candidate_tags:
-        houses_memory = getattr(state, "houses", None)
-        tag_lexicon = getattr(state, "tag_lexicon", None)
-        if isinstance(houses_memory, dict) and isinstance(tag_lexicon, dict) and candidate_ids:
-            house_tag_rows: list[dict[str, Any]] = []
-            tag_freq: dict[str, int] = {}
-            for house_id in candidate_ids:
-                memory = houses_memory.get(house_id)
-                tag_ids = getattr(memory, "tag_ids", None)
-                if not isinstance(tag_ids, list):
-                    continue
-                cleaned_ids: list[str] = []
-                for tag_id in tag_ids[:20]:
-                    if not isinstance(tag_id, str) or tag_id not in tag_lexicon:
-                        continue
-                    cleaned_ids.append(tag_id)
-                    tag_freq[tag_id] = tag_freq.get(tag_id, 0) + 1
-                if cleaned_ids:
-                    house_tag_rows.append({"house_id": house_id, "tag_ids": cleaned_ids})
-            if house_tag_rows and tag_freq:
-                ranked_tag_ids = sorted(tag_freq.keys(), key=lambda tid: (-tag_freq[tid], tid))[:_LLM_CONTEXT_TAG_LIMIT]
-                compact_lexicon = {tid: tag_lexicon[tid] for tid in ranked_tag_ids if isinstance(tag_lexicon.get(tid), str)}
-                if compact_lexicon:
-                    facts["candidate_tags"] = {"houses": house_tag_rows, "tag_lexicon": compact_lexicon}
+        house_context_top10 = _build_house_context_top10_rows(state, [], limit=_SEARCH_RERANK_HOUSE_CONTEXT_LIMIT)
+        if house_context_top10:
+            facts["house_context_top10"] = house_context_top10
 
     pruned = _prune_empty_for_llm(facts, drop_false_keys=_SOFT_BOOL_DEFAULT_FALSE_KEYS)
     return pruned if isinstance(pruned, dict) else {}
@@ -1754,6 +2130,15 @@ def _collect_house_ids_from_state(state: Any) -> set[str]:
                 house_ids.add(house_id)
         return house_ids
 
+    house_context_top10 = getattr(state, "house_context_top10", None)
+    if isinstance(house_context_top10, list):
+        for item in house_context_top10[:_SEARCH_RERANK_HOUSE_CONTEXT_LIMIT]:
+            house_id = _value_from_item(item, "house_id")
+            if isinstance(house_id, str) and house_id:
+                house_ids.add(house_id)
+        if house_ids:
+            return house_ids
+
     last_top5 = getattr(state, "last_top5", None)
     if isinstance(last_top5, list):
         for item in last_top5[:5]:
@@ -2109,6 +2494,310 @@ def _merge_llm_parse_candidates(
     return merged
 
 
+def _build_search_rerank_house_context_top10(
+    state: Any,
+    fallback_candidates: list[Any],
+    *,
+    tool_results: list[dict[str, Any]] | None = None,
+    limit: int = _SEARCH_RERANK_HOUSE_CONTEXT_LIMIT,
+) -> list[dict[str, Any]]:
+    rows = _build_house_context_top10_rows(
+        state,
+        fallback_candidates,
+        tool_results=tool_results,
+        limit=limit,
+    )
+    if state is not None and rows:
+        _set_state_house_context_top10(state, rows, limit=limit)
+    return rows
+
+
+def _build_llm_search_rerank_messages(
+    *,
+    user_message: str,
+    draft_reply: str,
+    context_facts: dict[str, Any] | None,
+    house_context_top10: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    context_text = _format_context_facts_for_prompt(context_facts)
+    house_context_json = (
+        json.dumps(house_context_top10[:_SEARCH_RERANK_HOUSE_CONTEXT_LIMIT], ensure_ascii=False, separators=(",", ":"))
+        if house_context_top10
+        else "[]"
+    )
+    content = (
+        "你是租房结果重排器。\n"
+        "输入包含房源上下文（最多10套）。请根据用户输入和上下文筛出最相关5套。\n"
+        "只输出1行字符串：m=<中文结论>|h=<house_id1,house_id2,house_id3,house_id4,house_id5>\n"
+        "规则：\n"
+        "1) h 里的 house_id 必须全部来自房源上下文。\n"
+        "2) h 最多5个，按推荐优先级排序。\n"
+        "3) m 直接对用户说结论，中文，简洁。\n"
+        "4) 只输出一行，不要JSON、不要多余解释。\n"
+        f"用户输入：{user_message}\n"
+        f"当前草稿回复：{draft_reply}\n"
+        f"上下文：\n{context_text}\n"
+        f"房源上下文top10(JSON)：{house_context_json}"
+    )
+    return [{"role": "user", "content": content}]
+
+
+def _extract_house_ids_from_any(value: Any, *, max_count: int = 5) -> list[str]:
+    items: list[str] = []
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, str):
+                items.append(item)
+            elif item is not None:
+                items.append(str(item))
+    elif isinstance(value, str):
+        items.append(value)
+    elif value is not None:
+        items.append(str(value))
+
+    extracted: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        for match in _HOUSE_ID_EXTRACT_PATTERN.findall(item):
+            normalized = match.upper()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            extracted.append(normalized)
+            if len(extracted) >= max_count:
+                return extracted
+    return extracted
+
+
+def _parse_llm_search_rerank_compact_payload(content: str) -> tuple[str | None, list[str]] | None:
+    text = content.strip()
+    if not text:
+        return None
+
+    message: str | None = None
+    house_ids: list[str] = []
+    for segment in text.split("|"):
+        if "=" not in segment:
+            continue
+        key, raw_value = segment.split("=", 1)
+        normalized_key = key.strip().lower()
+        value = raw_value.strip()
+        if normalized_key in {"m", "message"}:
+            message = value or None
+            continue
+        if normalized_key in {"h", "houses", "ids", "house_ids"}:
+            house_ids = _extract_house_ids_from_any(value, max_count=5)
+    if message is None and not house_ids:
+        return None
+    return message, house_ids
+
+
+def _extract_llm_search_rerank_result(data: dict[str, Any]) -> tuple[str | None, list[str]]:
+    content = _extract_llm_text_content(data)
+    if not isinstance(content, str) or not content.strip():
+        return None, []
+    stripped = content.strip()
+    parsed = _extract_json_object(stripped)
+    if isinstance(parsed, dict):
+        raw_message = parsed.get("message")
+        message = raw_message.strip() if isinstance(raw_message, str) and raw_message.strip() else None
+        house_ids = _extract_house_ids_from_any(parsed.get("houses"), max_count=5)
+        if not house_ids:
+            house_ids = _extract_house_ids_from_any(parsed.get("house_ids"), max_count=5)
+        if not house_ids:
+            house_ids = _extract_house_ids_from_any(parsed.get("ids"), max_count=5)
+        return message, house_ids
+
+    compact = _parse_llm_search_rerank_compact_payload(stripped)
+    if compact is not None:
+        return compact
+
+    house_ids = _extract_house_ids_from_any(stripped, max_count=5)
+    return (stripped if stripped else None), house_ids
+
+
+def _house_lite_to_view_model(item: HouseLite) -> HouseViewModel:
+    return HouseViewModel(
+        house_id=item.house_id,
+        listing_platform=item.listing_platform,
+        rent=item.rent,
+        layout=item.layout,
+        area=item.area,
+        district=item.district,
+        community=item.community,
+        subway_distance=item.subway_distance,
+        commute_to_xierqi_min=item.commute_to_xierqi_min,
+        available_date=item.available_date,
+        tags=item.tags,
+    )
+
+
+def _build_reranked_house_views(
+    *,
+    selected_house_ids: list[str],
+    state: Any,
+    fallback_views: list[HouseViewModel],
+    limit: int = 5,
+) -> list[HouseViewModel]:
+    view_map: dict[str, HouseViewModel] = {}
+    for view in fallback_views:
+        if isinstance(view, HouseViewModel):
+            view_map[view.house_id] = view
+
+    lite_map: dict[str, HouseLite] = {}
+
+    def remember_lite(item: Any) -> None:
+        if isinstance(item, HouseLite):
+            lite_map[item.house_id] = item
+            return
+        row = _house_context_row(item)
+        lite = _house_context_row_to_lite(row)
+        if isinstance(lite, HouseLite):
+            lite_map[lite.house_id] = lite
+
+    house_context_top10 = getattr(state, "house_context_top10", None)
+    if isinstance(house_context_top10, list):
+        for item in house_context_top10:
+            remember_lite(item)
+
+    last_candidates = getattr(state, "last_candidates", None)
+    if isinstance(last_candidates, list):
+        for item in last_candidates:
+            remember_lite(item)
+
+    output: list[HouseViewModel] = []
+    seen: set[str] = set()
+
+    def append_house(house_id: str) -> None:
+        if house_id in seen:
+            return
+        seen.add(house_id)
+        if house_id in view_map:
+            output.append(view_map[house_id])
+            return
+        lite = lite_map.get(house_id)
+        if isinstance(lite, HouseLite):
+            output.append(_house_lite_to_view_model(lite))
+
+    for house_id in selected_house_ids:
+        append_house(house_id)
+        if len(output) >= limit:
+            return output[:limit]
+
+    for view in fallback_views:
+        if isinstance(view, HouseViewModel):
+            append_house(view.house_id)
+        if len(output) >= limit:
+            return output[:limit]
+    return output[:limit]
+
+
+def _merge_referenced_house_ids(debug: dict[str, Any], house_ids: list[str]) -> None:
+    existing = debug.get("referenced_house_ids")
+    merged: list[str] = []
+    seen: set[str] = set()
+    if isinstance(existing, list):
+        for item in existing:
+            if isinstance(item, str) and item and item not in seen:
+                seen.add(item)
+                merged.append(item)
+    for item in house_ids:
+        if isinstance(item, str) and item and item not in seen:
+            seen.add(item)
+            merged.append(item)
+    if merged:
+        debug["referenced_house_ids"] = merged[:10]
+
+
+def _apply_search_rerank_to_state(
+    state: Any,
+    *,
+    reranked_views: list[HouseViewModel],
+    assistant_text: str,
+    dialogue_manager: Any = None,
+) -> None:
+    if not reranked_views:
+        return
+    house_ids = [item.house_id for item in reranked_views if isinstance(item.house_id, str) and item.house_id]
+    if not house_ids:
+        return
+
+    setattr(state, "last_top5", reranked_views[:5])
+    candidate_state = getattr(state, "candidate_state", None)
+    if candidate_state is not None:
+        setattr(candidate_state, "latest_house_ids", house_ids[:5])
+        setattr(candidate_state, "focus_house_id", house_ids[0])
+    setattr(state, "focus_house_id", house_ids[0])
+
+    context_rows = _build_house_context_top10_rows(state, reranked_views, limit=_SEARCH_RERANK_HOUSE_CONTEXT_LIMIT)
+    if context_rows:
+        row_map = {row.get("house_id"): row for row in context_rows if isinstance(row.get("house_id"), str)}
+        reordered_rows: list[dict[str, Any]] = []
+        seen_house_ids: set[str] = set()
+        for house_id in house_ids[:5]:
+            row = row_map.get(house_id)
+            if isinstance(row, dict) and house_id not in seen_house_ids:
+                seen_house_ids.add(house_id)
+                reordered_rows.append(row)
+        for row in context_rows:
+            row_house_id = row.get("house_id")
+            if not isinstance(row_house_id, str) or row_house_id in seen_house_ids:
+                continue
+            seen_house_ids.add(row_house_id)
+            reordered_rows.append(row)
+            if len(reordered_rows) >= _SEARCH_RERANK_HOUSE_CONTEXT_LIMIT:
+                break
+        _set_state_house_context_top10(state, reordered_rows, limit=_SEARCH_RERANK_HOUSE_CONTEXT_LIMIT)
+
+    search_history = getattr(state, "search_history", None)
+    if isinstance(search_history, list) and search_history:
+        snapshot = search_history[-1]
+        if hasattr(snapshot, "house_ids"):
+            snapshot.house_ids = house_ids[:5]
+
+    recent_turns = getattr(state, "recent_turns", None)
+    if isinstance(recent_turns, list) and recent_turns:
+        recent_turns[-1].house_ids = house_ids[:5]
+        recent_turns[-1].assistant = preview_text(assistant_text, limit=180)
+
+    if dialogue_manager is not None:
+        platform_parser = getattr(dialogue_manager, "_platform_from_text", None)
+        if callable(platform_parser):
+            parsed_platform = platform_parser(reranked_views[0].listing_platform)
+            if parsed_platform is not None:
+                setattr(state, "focus_listing_platform", parsed_platform)
+        summary_builder = getattr(dialogue_manager, "_build_conversation_summary", None)
+        if callable(summary_builder):
+            setattr(state, "conversation_summary", summary_builder(state))
+
+
+async def _rerank_search_results_with_llm(
+    http_client: httpx.AsyncClient,
+    *,
+    model_ip: str,
+    session_id: str,
+    user_message: str,
+    draft_reply: str,
+    context_facts: dict[str, Any] | None,
+    house_context_top10: list[dict[str, Any]],
+) -> tuple[str | None, list[str]]:
+    response_data = await _forward_chat_completion(
+        http_client,
+        model_ip=model_ip,
+        messages=_build_llm_search_rerank_messages(
+            user_message=user_message,
+            draft_reply=draft_reply,
+            context_facts=context_facts,
+            house_context_top10=house_context_top10,
+        ),
+        tools=[],
+        session_id=session_id,
+        step=STEP_LLM_SEARCH_RERANK,
+        llm_stage="search_rerank",
+    )
+    return _extract_llm_search_rerank_result(response_data)
+
+
 def _build_llm_detail_reply_messages(
     *,
     user_message: str,
@@ -2221,6 +2910,7 @@ async def _preload_landmark_catalog(*, cache: CacheManager, landmarks_client: La
 
 def create_app(settings: AgentSettings | None = None) -> FastAPI:
     cfg = settings or load_settings()
+    _configure_search_rerank_context_settings(cfg)
     setup_logging(cfg.log_level)
     # Fail fast at startup if tool schema is unavailable or invalid.
     _load_llm_tools()
@@ -2554,6 +3244,98 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                         step=STEP_LLM_RESPOND,
                         error=str(exc),
                     )
+            if response_kind == "search" and latest_state is not None:
+                house_context_top10 = _build_search_rerank_house_context_top10(
+                    latest_state,
+                    invoke_resp.candidates,
+                    tool_results=tool_results,
+                    limit=_SEARCH_RERANK_HOUSE_CONTEXT_LIMIT,
+                )
+                state_dirty = bool(house_context_top10)
+                if 0 < len(house_context_top10) <= 5:
+                    invoke_resp.debug["llm_search_rerank"] = {
+                        "applied": False,
+                        "reason": "candidate_count_lte_5",
+                        "candidate_count": len(house_context_top10),
+                    }
+                    log_event(
+                        LOGGER,
+                        "chat.llm_search_rerank.skipped",
+                        step=STEP_LLM_SEARCH_RERANK,
+                        reason="candidate_count_lte_5",
+                        candidate_count=len(house_context_top10),
+                    )
+                elif len(house_context_top10) >= 2:
+                    rerank_prompt_basis = (
+                        req.message
+                        + invoke_resp.text
+                        + json.dumps(respond_context_facts or {}, ensure_ascii=False)
+                        + json.dumps(house_context_top10, ensure_ascii=False)
+                    )
+                    rerank_prompt_tokens = (
+                        service.rough_token_estimate(rerank_prompt_basis)
+                        if hasattr(service, "rough_token_estimate")
+                        else max(1, int(len(rerank_prompt_basis) / 2))
+                    )
+                    try:
+                        rerank_message, rerank_house_ids = await _rerank_search_results_with_llm(
+                            app.state.http_client,
+                            model_ip=req.model_ip,
+                            session_id=req.session_id,
+                            user_message=req.message,
+                            draft_reply=invoke_resp.text,
+                            context_facts=respond_context_facts,
+                            house_context_top10=house_context_top10,
+                        )
+                        reranked_views = _build_reranked_house_views(
+                            selected_house_ids=rerank_house_ids,
+                            state=latest_state,
+                            fallback_views=invoke_resp.candidates,
+                            limit=5,
+                        )
+                        if reranked_views:
+                            invoke_resp.candidates = reranked_views
+                            reranked_ids = [item.house_id for item in reranked_views]
+                            _merge_referenced_house_ids(invoke_resp.debug, reranked_ids)
+                            invoke_resp.debug["llm_search_rerank"] = {
+                                "applied": True,
+                                "selected_house_ids": reranked_ids,
+                                "candidate_count": len(house_context_top10),
+                            }
+                            if isinstance(rerank_message, str) and rerank_message.strip():
+                                output_text = rerank_message.strip()
+
+                            _apply_search_rerank_to_state(
+                                latest_state,
+                                reranked_views=reranked_views,
+                                assistant_text=output_text,
+                                dialogue_manager=getattr(service, "dialogue", None),
+                            )
+                            state_dirty = True
+                            log_event(
+                                LOGGER,
+                                "chat.llm_search_rerank.applied",
+                                step=STEP_LLM_SEARCH_RERANK,
+                                selected_house_ids=reranked_ids,
+                                message_preview=preview_text(output_text, limit=220),
+                            )
+                            if hasattr(service, "record_llm_fallback_usage"):
+                                completion_basis = (rerank_message or "") + ",".join(reranked_ids)
+                                completion_tokens = (
+                                    service.rough_token_estimate(completion_basis)
+                                    if hasattr(service, "rough_token_estimate")
+                                    else max(1, int(len(completion_basis) / 2))
+                                )
+                                service.record_llm_fallback_usage(req.session_id, rerank_prompt_tokens + completion_tokens)
+                    except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
+                        log_event(
+                            LOGGER,
+                            "chat.llm_search_rerank.failed",
+                            step=STEP_LLM_SEARCH_RERANK,
+                            error=str(exc),
+                        )
+                if state_dirty and hasattr(service, "state_store"):
+                    service.state_store.upsert(latest_state)
             house_intents = {"search", "compare", "house_detail", "amenities", "listings", "rent_check", "rent"}
             context_housing_inquiry = _is_housing_context_inquiry(req.message, latest_state)
             should_attach_houses = (

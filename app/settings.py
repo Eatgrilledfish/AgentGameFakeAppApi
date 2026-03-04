@@ -55,6 +55,12 @@ class AgentSettings:
     max_output_candidates: int = 5
     state_ttl_sec: int = 1800
     budget_limit_slices: int = 300
+    rerank_house_context_fields: str = (
+        "house_id,community,district,rent,layout,area,subway_distance,commute_to_xierqi_min,"
+        "status,listing_platform,decoration,elevator,orientation,available_date,tags,nearby_landmarks"
+    )
+    rerank_landmark_context_fields: str = "id,name,category,district,type,type_name,distance,nearby_subway"
+    rerank_landmark_item_limit: int = 2
     timeout: TimeoutConfig = field(default_factory=TimeoutConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
@@ -77,4 +83,16 @@ def load_settings() -> AgentSettings:
         max_output_candidates=int(os.getenv("MAX_OUTPUT_CANDIDATES", "5")),
         state_ttl_sec=int(os.getenv("STATE_TTL_SEC", "1800")),
         budget_limit_slices=int(os.getenv("BUDGET_LIMIT_SLICES", "300")),
+        rerank_house_context_fields=os.getenv(
+            "RERANK_HOUSE_CONTEXT_FIELDS",
+            (
+                "house_id,community,district,rent,layout,area,subway_distance,commute_to_xierqi_min,"
+                "status,listing_platform,decoration,elevator,orientation,available_date,tags,nearby_landmarks"
+            ),
+        ),
+        rerank_landmark_context_fields=os.getenv(
+            "RERANK_LANDMARK_CONTEXT_FIELDS",
+            "id,name,category,district,type,type_name,distance,nearby_subway",
+        ),
+        rerank_landmark_item_limit=int(os.getenv("RERANK_LANDMARK_ITEM_LIMIT", "2")),
     )

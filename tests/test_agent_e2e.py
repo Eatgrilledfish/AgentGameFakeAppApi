@@ -9,7 +9,7 @@ from app.clients.houses import HousesClient
 from app.infra.cache import CacheManager
 from app.infra.tool_recorder import record_tool_result
 from app.main import _build_llm_context_facts, _preload_landmark_catalog, create_app
-from app.schemas import InvokeResponse, Landmark
+from app.schemas import CaseType, HouseLite, HouseViewModel, IntentType, InvokeResponse, Landmark, SearchSnapshot, SessionState, TurnSummary
 from app.settings import AgentSettings
 
 
@@ -906,6 +906,437 @@ def test_chat_route_parses_compact_string_nlu_payload() -> None:
     assert "年付" in llm_parse["tag_need"]["avoid"]
     assert "月付" in llm_parse["tag_need"]["prefer"]
     assert "房东直租" in llm_parse["tag_need"]["prefer"]
+
+
+def test_chat_route_applies_second_llm_rerank_and_persists_top5_context() -> None:
+    app = create_app()
+    captured: dict = {"llm_calls": 0}
+
+    state = SessionState(session_id="sess-rerank-top5", user_id="u-1", case_type=CaseType.multi)
+    state.last_candidates = [
+        HouseLite(house_id="HF_1", rent=3200, district="朝阳", layout="2居", subway_distance=900),
+        HouseLite(house_id="HF_2", rent=3100, district="朝阳", layout="2居", subway_distance=700),
+        HouseLite(house_id="HF_3", rent=3050, district="朝阳", layout="2居", subway_distance=650),
+        HouseLite(house_id="HF_4", rent=3300, district="朝阳", layout="2居", subway_distance=800),
+        HouseLite(house_id="HF_5", rent=3400, district="朝阳", layout="2居", subway_distance=780),
+        HouseLite(house_id="HF_6", rent=2990, district="朝阳", layout="2居", subway_distance=950),
+        HouseLite(house_id="HF_7", rent=3000, district="朝阳", layout="2居", subway_distance=500),
+        HouseLite(house_id="HF_8", rent=3150, district="朝阳", layout="2居", subway_distance=720),
+        HouseLite(house_id="HF_9", rent=3080, district="朝阳", layout="2居", subway_distance=610),
+        HouseLite(house_id="HF_10", rent=3250, district="朝阳", layout="2居", subway_distance=830),
+    ]
+    state.last_top5 = [
+        HouseViewModel(house_id="HF_1", rent=3200),
+        HouseViewModel(house_id="HF_2", rent=3100),
+        HouseViewModel(house_id="HF_3", rent=3050),
+        HouseViewModel(house_id="HF_4", rent=3300),
+        HouseViewModel(house_id="HF_5", rent=3400),
+    ]
+    state.search_history = [SearchSnapshot(query_text="朝阳两居", district="朝阳", house_ids=["HF_1", "HF_2", "HF_3", "HF_4", "HF_5"])]
+    state.recent_turns = [TurnSummary(user="找房", assistant="初稿", intent=IntentType.search, house_ids=["HF_1", "HF_2", "HF_3"])]
+
+    class StubStateStore:
+        def __init__(self):
+            self.state = state
+
+        def get(self, session_id):
+            assert session_id == "sess-rerank-top5"
+            return self.state
+
+        def upsert(self, value):
+            self.state = value
+
+    class StubService:
+        state_store = StubStateStore()
+
+        def rough_token_estimate(self, text: str) -> int:
+            return max(1, int(len(text) / 2))
+
+        def record_llm_fallback_usage(self, session_id: str, consumed_tokens: int) -> None:
+            captured["token_used"] = consumed_tokens
+
+        async def handle(self, request):
+            return InvokeResponse(
+                text="查找到以下符合您要求的房源",
+                candidates=[
+                    HouseViewModel(house_id="HF_1", rent=3200),
+                    HouseViewModel(house_id="HF_2", rent=3100),
+                    HouseViewModel(house_id="HF_3", rent=3050),
+                    HouseViewModel(house_id="HF_4", rent=3300),
+                    HouseViewModel(house_id="HF_5", rent=3400),
+                ],
+                debug={"response_kind": "search", "intent": "search"},
+            )
+
+    class StubResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            captured["llm_calls"] += 1
+            assert headers["Session-ID"] == "sess-rerank-top5"
+            if captured["llm_calls"] == 1:
+                return StubResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "i=search|p=d:朝阳;b:2;max:3500|t=m:;a:;p:月付",
+                                }
+                            }
+                        ]
+                    }
+                )
+            if captured["llm_calls"] == 2:
+                second_content = json["messages"][0]["content"]
+                assert "房源上下文top10(JSON)" in second_content
+                assert "HF_10" in second_content
+                assert "1. HF_1" not in second_content
+                return StubResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": '{"message":"我为你二次筛选了更匹配的5套房源。","houses":["HF_7","HF_2","HF_9","HF_1","HF_3"]}',
+                                }
+                            }
+                        ]
+                    }
+                )
+            raise AssertionError("unexpected llm call")
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-rerank-top5", "message": "朝阳两居，预算3500，离地铁近"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()["response"]
+    assert body["message"] == "我为你二次筛选了更匹配的5套房源。"
+    assert body["houses"] == ["HF_7", "HF_2", "HF_9", "HF_1", "HF_3"]
+    assert state.last_top5[0].house_id == "HF_7"
+    assert [item.house_id for item in state.last_top5] == ["HF_7", "HF_2", "HF_9", "HF_1", "HF_3"]
+    assert state.candidate_state.latest_house_ids == ["HF_7", "HF_2", "HF_9", "HF_1", "HF_3"]
+    assert len(state.house_context_top10) == 10
+    assert [item.house_id for item in state.house_context_top10[:5]] == ["HF_7", "HF_2", "HF_9", "HF_1", "HF_3"]
+    assert state.search_history[-1].house_ids == ["HF_7", "HF_2", "HF_9", "HF_1", "HF_3"]
+    assert captured["llm_calls"] == 2
+
+
+def test_chat_route_skips_second_llm_rerank_when_candidate_count_lte_5() -> None:
+    app = create_app()
+    captured: dict = {"llm_calls": 0}
+
+    state = SessionState(session_id="sess-rerank-skip", user_id="u-1", case_type=CaseType.multi)
+    state.last_candidates = [
+        HouseLite(house_id="HF_A1", rent=3200, district="朝阳", community="朝阳小区A"),
+        HouseLite(house_id="HF_A2", rent=3300, district="朝阳", community="朝阳小区B"),
+        HouseLite(house_id="HF_A3", rent=3400, district="朝阳", community="朝阳小区C"),
+    ]
+    state.last_top5 = [
+        HouseViewModel(house_id="HF_A1", rent=3200),
+        HouseViewModel(house_id="HF_A2", rent=3300),
+        HouseViewModel(house_id="HF_A3", rent=3400),
+    ]
+    state.search_history = [SearchSnapshot(query_text="朝阳两居", district="朝阳", house_ids=["HF_A1", "HF_A2", "HF_A3"])]
+    state.recent_turns = [TurnSummary(user="找房", assistant="初稿", intent=IntentType.search, house_ids=["HF_A1"])]
+
+    class StubStateStore:
+        def __init__(self):
+            self.state = state
+
+        def get(self, session_id):
+            assert session_id == "sess-rerank-skip"
+            return self.state
+
+        def upsert(self, value):
+            self.state = value
+
+    class StubService:
+        state_store = StubStateStore()
+
+        async def handle(self, request):
+            return InvokeResponse(
+                text="已找到3套符合要求的房源",
+                candidates=[
+                    HouseViewModel(house_id="HF_A1", rent=3200),
+                    HouseViewModel(house_id="HF_A2", rent=3300),
+                    HouseViewModel(house_id="HF_A3", rent=3400),
+                ],
+                debug={"response_kind": "search", "intent": "search"},
+            )
+
+    class StubResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            _ = url
+            captured["llm_calls"] += 1
+            assert headers["Session-ID"] == "sess-rerank-skip"
+            if captured["llm_calls"] == 1:
+                return StubResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "i=search|p=d:朝阳;b:2;max:3500|t=m:;a:;p:月付",
+                                }
+                            }
+                        ]
+                    }
+                )
+            raise AssertionError("candidate_count <= 5 should not call second llm rerank")
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-rerank-skip", "message": "朝阳两居，预算3500"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()["response"]
+    assert body["message"] == "已找到3套符合要求的房源"
+    assert body["houses"] == ["HF_A1", "HF_A2", "HF_A3"]
+    assert len(state.house_context_top10) == 3
+    assert captured["llm_calls"] == 1
+
+
+def test_chat_route_rerank_context_fields_are_configurable_with_landmarks() -> None:
+    app = create_app(
+        settings=AgentSettings(
+            rerank_house_context_fields="house_id,community,price,subway_distance,status,nearby_landmarks",
+            rerank_landmark_context_fields="name,distance,type",
+            rerank_landmark_item_limit=1,
+        )
+    )
+    captured: dict = {"llm_calls": 0}
+
+    state = SessionState(session_id="sess-rerank-config", user_id="u-1", case_type=CaseType.multi)
+    state.last_candidates = [
+        HouseLite(
+            house_id="HF_6751",
+            community="朝阳小区906",
+            district="朝阳",
+            rent=3200,
+            subway_distance=424,
+            status="available",
+            listing_platform="安居客",
+        ),
+        HouseLite(
+            house_id="HF_6752",
+            community="朝阳小区829",
+            district="朝阳",
+            rent=3300,
+            subway_distance=520,
+            status="available",
+            listing_platform="安居客",
+        ),
+        HouseLite(
+            house_id="HF_6753",
+            community="朝阳小区831",
+            district="朝阳",
+            rent=3400,
+            subway_distance=610,
+            status="available",
+            listing_platform="安居客",
+        ),
+        HouseLite(
+            house_id="HF_6754",
+            community="朝阳小区832",
+            district="朝阳",
+            rent=3450,
+            subway_distance=630,
+            status="available",
+            listing_platform="安居客",
+        ),
+        HouseLite(
+            house_id="HF_6755",
+            community="朝阳小区833",
+            district="朝阳",
+            rent=3500,
+            subway_distance=680,
+            status="available",
+            listing_platform="安居客",
+        ),
+        HouseLite(
+            house_id="HF_6756",
+            community="朝阳小区834",
+            district="朝阳",
+            rent=3600,
+            subway_distance=710,
+            status="available",
+            listing_platform="安居客",
+        ),
+    ]
+    state.last_top5 = [
+        HouseViewModel(house_id="HF_6751", rent=3200, community="朝阳小区906"),
+        HouseViewModel(house_id="HF_6752", rent=3300, community="朝阳小区829"),
+        HouseViewModel(house_id="HF_6753", rent=3400, community="朝阳小区831"),
+        HouseViewModel(house_id="HF_6754", rent=3450, community="朝阳小区832"),
+        HouseViewModel(house_id="HF_6755", rent=3500, community="朝阳小区833"),
+    ]
+    state.search_history = [SearchSnapshot(query_text="朝阳两居", district="朝阳", house_ids=["HF_6751", "HF_6752", "HF_6753"])]
+    state.recent_turns = [TurnSummary(user="找房", assistant="初稿", intent=IntentType.search, house_ids=["HF_6751"])]
+
+    class StubStateStore:
+        def __init__(self):
+            self.state = state
+
+        def get(self, session_id):
+            assert session_id == "sess-rerank-config"
+            return self.state
+
+        def upsert(self, value):
+            self.state = value
+
+    class StubService:
+        state_store = StubStateStore()
+
+        async def handle(self, request):
+            record_tool_result(
+                name="GET /api/houses/nearby_landmarks",
+                success=True,
+                output={
+                    "community": "朝阳小区906",
+                    "type": "shopping",
+                    "total": 1,
+                    "items": [
+                        {
+                            "landmark": {
+                                "id": "LM_004",
+                                "name": "王府井步行街",
+                                "category": "landmark",
+                                "district": "东城",
+                                "details": {
+                                    "type": "shopping",
+                                    "type_name": "商业街",
+                                },
+                            },
+                            "distance": 1888.224411287739,
+                        }
+                    ],
+                },
+                duration_ms=7,
+                method="GET",
+                url="http://mock/api/houses/nearby_landmarks",
+                status_code=200,
+            )
+            return InvokeResponse(
+                text="已找到候选房源",
+                candidates=[
+                    HouseViewModel(house_id="HF_6751", rent=3200, community="朝阳小区906"),
+                    HouseViewModel(house_id="HF_6752", rent=3300, community="朝阳小区829"),
+                    HouseViewModel(house_id="HF_6753", rent=3400, community="朝阳小区831"),
+                    HouseViewModel(house_id="HF_6754", rent=3450, community="朝阳小区832"),
+                    HouseViewModel(house_id="HF_6755", rent=3500, community="朝阳小区833"),
+                    HouseViewModel(house_id="HF_6756", rent=3600, community="朝阳小区834"),
+                ],
+                debug={"response_kind": "search", "intent": "search"},
+            )
+
+    class StubResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            _ = url
+            captured["llm_calls"] += 1
+            assert headers["Session-ID"] == "sess-rerank-config"
+            if captured["llm_calls"] == 1:
+                return StubResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "i=search|p=d:朝阳;b:2;max:3500|t=m:;a:;p:月付",
+                                }
+                            }
+                        ]
+                    }
+                )
+            if captured["llm_calls"] == 2:
+                second_content = json["messages"][0]["content"]
+                marker = "房源上下文top10(JSON)："
+                assert marker in second_content
+                house_context_json = second_content.split(marker, 1)[1]
+                house_context_rows = __import__("json").loads(house_context_json)
+                assert isinstance(house_context_rows, list) and house_context_rows
+                first = house_context_rows[0]
+                assert set(first.keys()) <= {
+                    "house_id",
+                    "community",
+                    "price",
+                    "subway_distance",
+                    "status",
+                    "nearby_landmarks",
+                }
+                assert first["price"] == 3200
+                assert "district" not in first
+                assert isinstance(first.get("nearby_landmarks"), list) and len(first["nearby_landmarks"]) == 1
+                assert set(first["nearby_landmarks"][0].keys()) <= {"name", "distance", "type"}
+                assert first["nearby_landmarks"][0]["name"] == "王府井步行街"
+                return StubResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "m=按你的偏好我优先选了2套|h=HF_6751,HF_6752",
+                                }
+                            }
+                        ]
+                    }
+                )
+            raise AssertionError("unexpected llm call")
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-rerank-config", "message": "朝阳两居，预算3500"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()["response"]
+    assert body["message"] == "按你的偏好我优先选了2套"
+    assert body["houses"][:2] == ["HF_6751", "HF_6752"]
+    assert len(body["houses"]) == 5
+    assert captured["llm_calls"] == 2
 
 
 def test_chat_route_uses_single_llm_call_and_applies_chat_reply_from_nlu() -> None:
