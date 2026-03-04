@@ -873,6 +873,71 @@ async def test_dialogue_promotes_llm_chat_to_search_for_tag_refinement_with_acti
 
 
 @pytest.mark.asyncio
+async def test_dialogue_promotes_llm_house_detail_to_search_for_preference_refinement() -> None:
+    class PreferencePlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            self.executed_queries.append(query.model_copy(deep=True))
+            _ = plan
+            _ = case_type
+            return [
+                HouseLite(
+                    house_id="HF_MONTHLY",
+                    rent=3200,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="A",
+                    subway_distance=600,
+                    commute_to_xierqi_min=36,
+                    status="可租",
+                    tags=["月付", "房东直租"],
+                ),
+                HouseLite(
+                    house_id="HF_YEARLY",
+                    rent=3000,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    community="B",
+                    subway_distance=500,
+                    commute_to_xierqi_min=34,
+                    status="可租",
+                    tags=["年付", "收中介费"],
+                ),
+            ]
+
+    dialogue, state, planner, _ = _build_dialogue(planner=PreferencePlanner())
+
+    first = await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-ctx", case_type=CaseType.single, message="帮我找朝阳区两居室，预算3000左右"),
+        state,
+        is_new_session=True,
+    )
+    assert first.debug["response_kind"] == "search"
+
+    second = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-ctx",
+            case_type=CaseType.single,
+            message="想问下能不能月付？最好能是房东直租。",
+            meta={
+                "llm_parse": {
+                    "intent": "house_detail",
+                    "tool_plan": {"operationId": "get_house_by_id", "arguments": {"id": "HF_MONTHLY"}},
+                    "soft": {"preferred_tags": ["月付", "房东直租"], "avoid_tags": ["年付", "收中介费"]},
+                    "confidence": 0.88,
+                }
+            },
+        ),
+        state,
+        is_new_session=False,
+    )
+
+    assert second.debug["response_kind"] == "search"
+    refined = planner.executed_queries[-1]
+    assert "月付" in refined.soft.preferred_tags
+    assert "房东直租" in refined.soft.preferred_tags
+
+
+@pytest.mark.asyncio
 async def test_dialogue_context_continuation_can_start_search_with_previous_tags() -> None:
     planner = DummyPlanner()
     houses = DummyHousesClient()

@@ -180,6 +180,15 @@ class DialogueManager:
                 resolved_house_id = self._resolve_house_id(request.message, merged, state)
                 if merged.hard.house_id is None and resolved_house_id:
                     merged.hard.house_id = resolved_house_id
+        if self._should_promote_detail_intent_to_search_refinement(request.message, merged, state):
+            merged.intent = IntentType.search
+            log_event(
+                LOGGER,
+                "dialogue.intent.adjusted",
+                original_intent=IntentType.house_detail.value,
+                adjusted_intent=IntentType.search.value,
+                reason="preference_refinement_without_explicit_house_reference",
+            )
         if self._should_treat_search_as_chat(request.message, merged):
             log_event(
                 LOGGER,
@@ -336,6 +345,48 @@ class DialogueManager:
         asks_status = any(token in text for token in _RENT_STATUS_QUERY_SIGNALS)
         commits_rent = any(token in text for token in _RENT_COMMIT_SIGNALS)
         return asks_status and not commits_rent
+
+    @staticmethod
+    def _has_explicit_house_reference(text: str) -> bool:
+        if _EXPLICIT_HOUSE_ID_PATTERN.search(text):
+            return True
+        if DialogueManager._extract_rank_index(text) is not None:
+            return True
+        return any(token in text for token in _HOUSE_REF_WORDS)
+
+    def _should_promote_detail_intent_to_search_refinement(
+        self,
+        text: str,
+        query: StructuredQuery,
+        state: SessionState,
+    ) -> bool:
+        if query.intent not in {IntentType.house_detail, IntentType.listings}:
+            return False
+
+        has_active_search_context = bool(state.last_top5) or bool(state.last_candidates) or state.phase in {
+            SessionPhase.searching,
+            SessionPhase.presenting,
+            SessionPhase.refining,
+        }
+        if not has_active_search_context:
+            return False
+        if self._has_explicit_house_reference(text):
+            return False
+
+        # LLM-first strategy: if parse carries actionable constraints/preferences
+        # (excluding explicit house refs), treat as search refinement.
+        hard = HardConstraints.model_validate(query.hard.model_dump())
+        hard.house_id = None
+        hard.listing_platform = None
+        inferred = StructuredQuery(
+            intent=IntentType.search,
+            hard=hard,
+            soft=SoftPreferences.model_validate(query.soft.model_dump()),
+            confidence=query.confidence,
+        )
+        if not self._has_actionable_preferences(inferred):
+            return False
+        return True
 
     @staticmethod
     def _build_search_follow_up_questions(query: StructuredQuery, user_text: str) -> list[str]:
@@ -1639,6 +1690,26 @@ def _to_int(value: Any) -> int | None:
         stripped = value.strip()
         if not stripped:
             return None
+        bedroom_match = re.search(r"([一二两三四五六七八九123456789])\s*(?:居|室)", stripped)
+        if bedroom_match:
+            token = bedroom_match.group(1)
+            if token.isdigit():
+                return int(token)
+            return _CH_NUM_TO_INT.get(token)
+
+        compact = stripped.replace("，", "").replace(",", "")
+        unit_match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kK千wW万])", compact)
+        if unit_match:
+            base = float(unit_match.group(1))
+            unit = unit_match.group(2).lower()
+            if unit in {"k", "千"}:
+                return int(base * 1000)
+            if unit in {"w", "万"}:
+                return int(base * 10000)
+
+        cn_value = _coerce_cn_int(compact)
+        if cn_value is not None:
+            return cn_value
         try:
             return int(float(stripped))
         except ValueError:
@@ -1683,3 +1754,37 @@ def _normalize_decoration_value(value: str) -> str | None:
     if cleaned in {"简装", "简装修"}:
         return "简装"
     return None
+
+
+def _coerce_cn_int(text: str) -> int | None:
+    digits = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    units = {"十": 10, "百": 100, "千": 1000}
+    if not text or not re.fullmatch(r"[一二两三四五六七八九十百千万零〇]+", text):
+        return None
+
+    total = 0
+    section = 0
+    number = 0
+    for ch in text:
+        if ch in digits:
+            number = digits[ch]
+            continue
+        if ch in units:
+            unit = units[ch]
+            if number == 0:
+                number = 1
+            section += number * unit
+            number = 0
+            continue
+        if ch == "万":
+            section += number
+            if section == 0:
+                section = 1
+            total += section * 10000
+            section = 0
+            number = 0
+            continue
+        return None
+
+    result = total + section + number
+    return result if result > 0 else None

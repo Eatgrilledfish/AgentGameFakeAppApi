@@ -1,0 +1,404 @@
+---
+
+## 0. 验收标准（必须满足）
+
+1. **房源相关意图**（search / compare / house_detail / amenities / listings / rent_check / rent）最终响应必须为：
+
+   ```json
+   response = {"message":"...","houses":[...]}
+   ```
+
+   * 找不到也必须：`"houses":[]`
+   * `response` 必须是 **JSON object**，不能是 string
+2. `houses[]` 中的 house_id **必须来自上游 API 返回**，禁止编造。
+3. “我可以租吗？”与“我要租这套”区分：
+
+   * `rent_check`：查 status
+   * `rent`：查 status=available 后调用 rent_house
+4. 模型调用与性能（比赛时间片/5秒约束）：
+
+   * 每轮**最多 1 次 Plan LLM**（意图+参数抽取）
+   * tags 语义筛选按需调用，且输入规模可控（topK、压缩）
+   * detail/listing 核验仅对 topK 并发（≤15，可选）
+
+---
+
+## 1. 总体架构（强制按 Pipeline 实现）
+
+### 1.1 Pipeline
+
+**(A) Plan（LLM-Plan）**
+输入：用户消息 + session 记忆摘要
+输出：严格 JSON（intent + query params + 可能的“tag语义需求”）
+
+**(B) Normalize（确定性）**
+把 Plan 输出归一化成上游 API 可接受参数（district/bedrooms/budget 等），并合并 session memory 的硬约束。
+
+**(C) Execute（确定性 + 可选 LLM tag 语义筛选）**
+
+1. by_platform 召回（topN）
+2. 硬过滤（预算、地铁、户型、装修、整租偏好等）
+3. 生成候选 topK（≤15）
+4. 基于最新 Session Memory 方案：构建 TagLexicon 压缩并用 LLM 对 tags 做语义筛选（可选两步 TagFocus→CandidateFilter）
+5. 排序取 top5 → houses
+
+**(D) Answer（模板优先，LLM 可选）**
+
+* 简单 search：模板生成（省 token）
+* compare/解释：可调用 1 次 LLM（只喂候选摘要+必要 tag 解码）
+
+---
+
+## 2. Plan 阶段（LLM-Plan 规范）
+
+### 2.1 输出 Schema（严格 JSON-only）
+
+LLM-Plan 必须输出：
+
+```json
+{
+  "intent": "chat|search|compare|house_detail|amenities|listings|rent_check|rent|terminate|offline",
+  "params": {
+    "district": "...",
+    "bedrooms": "...",
+    "min_price": ...,
+    "max_price": ...,
+    "decoration": "...",
+    "max_subway_dist": ...,
+    "rental_type": "整租|合租|null",
+    "min_area": ...,
+    "elevator": true|false|null
+  },
+  "tag_need": {
+    "must": ["..."], 
+    "avoid": ["..."],
+    "prefer": ["..."]
+  }
+}
+```
+
+### 2.2 tag_need 的定位（关键）
+
+你已经决定“不做规则补齐，交给 LLM 语义处理 tags”。因此 Plan 的 tag_need 只负责把用户自然语言转成三类需求：
+
+* `must`：刚需（例如“宽带包含”“必须能带狗”“暖气费不另收”）
+* `avoid`：明确避坑（例如“物业态度差”“中介费”“合同不规范”）
+* `prefer`：偏好（例如“月付”“VR看房”）
+
+> 注意：tag_need 是“语义需求”，不要求你事先知道 tag 名称。后面由 LLM 在 tags 中匹配。
+
+### 2.3 Plan 超时/失败降级（必须实现）
+
+* 若 Plan 超时/解析失败：
+
+  1. 使用 session memory 的 `req.hard` 作为查询条件；
+  2. 对用户文本做最小规则抽取（district/价格/户型/地铁关键词）；
+  3. 仍能执行 search 并返回 houses（保证不断轮）。
+
+---
+
+## 3. Normalize 阶段（确定性归一化，防字段丢失）
+
+### 3.1 district
+
+* 去掉“区/县/市”等后缀（朝阳区→朝阳）
+* 多区用逗号拼接（海淀、朝阳→海淀,朝阳）
+
+### 3.2 bedrooms（最易丢分）
+
+* “两居/两居室/2居”→ `"2"`
+* “2-3居”→ `"2,3"`（符合上游 API “逗号分隔”要求）
+
+### 3.3 budget
+
+* “X以内/不超过”→ `max_price=X`（min 可空）
+* “X左右”→ `min/max` 弹性窗口（允许 Plan 已给的 min/max；但必须做 clamp 校验）
+* 若召回不足（<5）允许扩窗 1-2 次（+10% 或 +300）
+
+### 3.4 其他
+
+* “近地铁”→ `max_subway_dist` 默认 800
+* “精装/精装修”→ “精装”
+
+> Normalize 的底线：**不允许静默丢字段**。校验失败要修正或降级策略执行。
+
+---
+
+## 4. Execute 阶段（核心：RawTags Session Memory + 压缩 + LLM 语义筛选）
+
+你最新策略：**Session Memory 存每套房对应 tags（未知也存），让 LLM 做语义识别**，但要压缩。
+
+### 4.1 召回与初筛（确定性）
+
+1. 调 `GET /api/houses/by_platform`：
+
+   * page_size 建议 30（topN=30）
+2. 初筛（硬过滤）：
+
+   * district、price、bedrooms、decoration、subway_distance≤max_subway_dist
+   * 若用户没说合租：整租优先；不足再补合租（可选）
+
+得到候选 `cands_topK`（≤15）进入 tag 语义环节。
+
+### 4.2 Session Memory：RawTags + TagLexicon（压缩核心）
+
+Session Memory（RawTags + TagLexicon 压缩）— **唯一规范**
+
+Agent 必须为每个 `session_id` 维护如下结构（字段名、层级保持一致）：
+
+```json
+{
+  "session_id": "abc123",
+  "req": {
+    "hard": {
+      "district": "朝阳",
+      "bedrooms": "2",
+      "budget": {"min": 2500, "max": 3500, "type": "around"},
+      "max_subway_dist": 800
+    },
+    "soft": {
+      "notes": ["希望宽带包含在房租里", "介意物业态度差"]
+    }
+  },
+
+  "tag_lexicon": {
+    "t1": "可养狗",
+    "t2": "不可养宠物",
+    "t3": "免宽带费",
+    "t4": "收暖气费",
+    "t5": "物业态度差",
+    "t6": "月付",
+    "t7": "押二"
+  },
+
+  "houses": {
+    "HF_123": {
+      "tag_ids": ["t3","t4","t5","t6","t7"],
+      "price": 2900,
+      "subway_distance": 600,
+      "rental_type": "整租",
+      "area_sqm": 58,
+      "updated_ts": 1772549000
+    },
+    "HF_456": {
+      "tag_ids": ["t2","t6"],
+      "price": 3000,
+      "subway_distance": 750,
+      "rental_type": "合租",
+      "area_sqm": 15,
+      "updated_ts": 1772549000
+    }
+  },
+
+  "candidate_state": {
+    "latest_house_ids": ["HF_123","HF_456"],
+    "focus_house_id": "HF_123"
+  }
+}
+```
+
+### 字段语义与写入规则（必须遵守）
+
+#### A) `req.hard`（硬约束，用于 Normalize + Execute 初筛）
+
+* 由 Plan 输出与多轮合并产生。
+* 任何新增硬约束（预算/地铁/户型/区域）必须写回这里，并用于下一轮查询 fingerprint。
+
+#### B) `req.soft.notes`（软偏好/语义关注点）
+
+* 用于表达**不结构化的偏好**（例如“宽带包含”“介意物业态度差”“希望安静”）。
+* **不要求你提前知道 tag 名称**；后续由 LLM 在 tags 中做语义匹配。
+* 每轮 Plan 若抽取到偏好，追加到 notes（可去重）。
+
+#### C) `tag_lexicon`（压缩核心：tid → raw_tag）
+
+* 只对“当前 session 里出现过的 tags”去重编号，**不是规则库**。
+* tid 建议按出现顺序递增：t1, t2, ...
+* 必须在本轮 topK 候选更新时增量维护（新 tag 分配新 tid）。
+
+> 实现细节：建议内部维护 `reverse_lexicon(raw_tag→tid)` 以 O(1) 去重；但不要求落盘/序列化。
+
+#### D) `houses`（房源缓存：house_id → {tag_ids + 少量数值字段}）
+
+* `tag_ids` 必须来自 `tag_lexicon` 的 tid。
+* 数值字段（price/subway_distance/rental_type/area_sqm）用于排序与展示，避免二次请求。
+* `updated_ts` 用于 TTL/过期控制（例如 5–10 分钟或同 session 内有效）。
+
+#### E) `candidate_state`（指代与多轮动作必备）
+
+* `latest_house_ids`：最近一次推荐/候选列表（用于“第一套/这套”）
+* `focus_house_id`：默认指代房（通常为最近一次排序 top1）
+
+---
+
+#### 4.2.1 Memory 结构（必须实现）
+
+```json
+{
+  "req": { "hard": {...}, "soft": {...} },
+
+  "tag_lexicon": { "t1": "免宽带费", "t2": "物业态度差", ... },
+  "reverse_lexicon": { "免宽带费": "t1", ... },   // 内存用，可不序列化
+
+  "houses": {
+    "HF_123": { "tag_ids": ["t1","t7"], "price": 2900, "subway_distance": 600, ... },
+    ...
+  },
+
+  "candidate_state": {
+    "latest_house_ids": ["HF_123","HF_456",...],
+    "focus_house_id": "HF_123"
+  }
+}
+```
+
+#### 4.2.2 构建 TagLexicon（每轮执行，增量更新）
+
+* 对 topK 候选的 raw tags 去重
+* 未见过的 tag 分配新 tid（t1,t2…）
+* 每套房存 `tag_ids` 列表（排序后压缩）
+* 可选进一步压缩：把 tid 转成数字并 delta-encode（非必需）
+
+### 4.3 LLM 语义筛选 tags（你要的“全语义、无规则”）
+
+#### 推荐做法：两步（更省 token、更稳）
+
+**Step 1：TagFocus（可选但强烈推荐）**
+输入：
+
+* 用户本轮 tag_need（must/avoid/prefer）
+* tag_lexicon（tid→tag文本）
+
+输出（JSON-only）：
+
+```json
+{"relevant_tag_ids":["t1","t2","t9"]}
+```
+
+**Step 2：CandidateFilter**
+输入：
+
+* 用户 tag_need
+* 候选房源列表：`house_id + tag_ids(仅保留 relevant_tag_ids 交集后的子集) + 必要数值`
+* tag_lexicon 只给 relevant 子集（极小）
+
+输出（JSON-only）：
+
+```json
+{
+  "selected": ["HF_123","HF_789"],
+  "must_confirm": [{"house_id":"HF_456","reason":"宽带是否包含未标明"}],
+  "rejected": [{"house_id":"HF_999","reason":"tag包含 物业态度差"}]
+}
+```
+
+> 这样 LLM 处理的是“短 tag 子集”，你既实现“语义覆盖未知 tag”，又能把 token 压下来。
+
+#### 一步法（更简单但 token 稍高）
+
+直接把 tag_need + topK 候选（house_id+tag_ids）+ lexicon 喂给 LLM 让它输出 selected/rejected。
+但务必限制：
+
+* topK ≤ 15
+* 每房 tags 只保留前 N 个（例如 20）或做 TagFocus 子集后再给
+
+### 4.4 排序与 top5 选择
+
+* 先按确定性匹配（预算贴合、地铁距离、装修等）给基础分
+* 结合 LLM 输出：
+
+  * selected：加分
+  * rejected：剔除
+  * must_confirm：保留但打“需确认”标记（message 用）
+
+最终取 top5 house_id → `houses[]`。
+
+---
+
+## 5. Answer 阶段（必须带 houses，模板优先）
+
+### 5.1 ResponseBuilder（硬约束）
+
+对房源相关 intent：
+
+* 必须输出 `{"message": "...", "houses": [...]}`
+* 找不到：`houses: []`
+
+### 5.2 message 内容策略
+
+* 简单推荐：模板输出（每套 1 行：价格、地铁、关键 tag 亮点/风险）
+* 对用户关注点（如“宽带包含”）：
+
+  * selected：明确写“命中：宽带包含（来自 tag）”
+  * must_confirm：写“未标明，建议确认”
+* compare：可调用 LLM 生成更自然话术，但输入只给候选摘要（不要丢全量 tags）
+
+---
+
+## 6. rent_check / rent（多轮动作）
+
+### 6.1 focus_house_id 规则
+
+* 用户说“这套”：使用 `candidate_state.focus_house_id`
+* 用户说“第一套/第二套”：用 `candidate_state.latest_house_ids[idx]`
+* 若都没有：回退到本轮 top1
+
+### 6.2 API 调用序列
+
+* rent_check：
+
+  1. GET house detail/status
+  2. 返回 `houses:[house_id]` + message
+* rent：
+
+  1. GET status
+  2. available → POST rent_house
+  3. 返回 `houses:[house_id]` + 成功/失败原因
+
+---
+
+## 7. Codex 修改清单（最终版，直接照做）
+
+1. **Session Memory（按最新设计）**
+
+   * req.hard/soft
+   * tag_lexicon + reverse_lexicon
+   * houses[house_id] = {tag_ids + 少量数值}
+   * candidate_state（latest_house_ids, focus_house_id）
+2. **TagLexicon Builder**
+
+   * 输入：topK 候选 raw tags
+   * 输出：增量更新 lexicon + 每房 tag_ids
+3. **LLM Tag Semantic Filter（无规则覆盖）**
+
+   * 实现 TagFocus（可选）+ CandidateFilter（必备）
+   * 限制 topK、限制 lexicon 子集，确保 token/时间片可控
+4. **Normalize 层**
+
+   * district/bedrooms/budget/max_subway_dist/decoration
+   * 禁止静默丢字段
+5. **Execute 层**
+
+   * by_platform → 初筛 → topK → TagLexicon → LLM筛选 → 排序 → top5
+6. **ResponseBuilder**
+
+   * 房源相关 intent 强制 houses（空数组也要）
+7. **rent_check/rent**
+
+   * focus_house_id 解析 + status 先查 + 决策调用 rent
+
+---
+
+## 8. 单测清单（最低必须覆盖）
+
+1. 单轮：朝阳+两居+预算+近地铁+精装 → houses 非空
+2. 多轮：先推荐 → 用户说“我希望宽带包含” → 走 TagFocus/CandidateFilter → houses 更新
+3. 多轮：用户说“这套能租吗” → rent_check
+4. 多轮：用户说“就租这套” → rent
+5. 无结果：仍输出 `houses: []`
+6. 任意房源相关回复都带 houses（包括 VR/费用解释轮）
+7，用户的纯对话，比如说你好，不用调用llm，直接模版回答
+
+---
+
+

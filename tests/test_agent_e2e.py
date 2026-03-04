@@ -607,6 +607,134 @@ def test_chat_route_llm_tool_call_keeps_nearby_max_distance_argument() -> None:
     assert "bedrooms" not in tool_plan["arguments"]
 
 
+def test_chat_route_llm_tool_call_maps_id_alias_to_house_id_for_house_detail() -> None:
+    app = create_app()
+    captured: dict = {}
+
+    class StubService:
+        async def handle(self, request):
+            captured["meta"] = request.meta
+            return InvokeResponse(text="ok", candidates=[], debug={"response_kind": "detail"})
+
+    class StubResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            assert headers["Session-ID"] == "sess-id-alias"
+            return StubResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "get_house_by_id",
+                                            "arguments": '{"id":"HF_14"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-id-alias", "message": "看看这个房源详情"},
+        )
+
+    assert resp.status_code == 200
+    tool_plan = captured["meta"]["llm_parse"]["tool_plan"]
+    assert tool_plan["operationId"] == "get_house_by_id"
+    assert tool_plan["arguments"]["house_id"] == "HF_14"
+    assert "id" not in tool_plan["arguments"]
+
+
+def test_chat_route_merges_llm_content_parse_with_tool_call_plan() -> None:
+    app = create_app()
+    captured: dict = {}
+
+    class StubService:
+        async def handle(self, request):
+            captured["meta"] = request.meta
+            return InvokeResponse(text="ok", candidates=[], debug={"response_kind": "search"})
+
+    class StubResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            assert headers["Session-ID"] == "sess-merge-parse"
+            return StubResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": (
+                                    '{"intent":"search","hard":{"budget_min":2600,"budget_max":3400},'
+                                    '"soft":{"preferred_tags":["月付","房东直租"],"avoid_tags":["年付"]},'
+                                    '"confidence":0.86}'
+                                ),
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "get_houses_by_platform",
+                                            "arguments": '{"district":"朝阳","max_price":3500,"bedrooms":"2"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-merge-parse", "message": "朝阳两居三千左右，月付房东直租"},
+        )
+
+    assert resp.status_code == 200
+    llm_parse = captured["meta"]["llm_parse"]
+    assert llm_parse["hard"]["budget_min"] == 2600
+    assert llm_parse["hard"]["budget_max"] == 3400
+    assert "月付" in llm_parse["soft"]["preferred_tags"]
+    assert llm_parse["tool_plan"]["operationId"] == "get_houses_by_platform"
+    assert llm_parse["tool_plan"]["arguments"]["district"] == "朝阳"
+
+
 def test_chat_route_uses_single_llm_call_and_applies_chat_reply_from_nlu() -> None:
     app = create_app()
     captured: dict = {}

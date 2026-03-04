@@ -1,0 +1,545 @@
+Agent 交互实时面板
+顺序关注：用户输入 → LLM输入 → LLM输出 → API调用 → API输出 → 最终回复。可在 URL 上附加 ?session_id=xxx 只看单会话。
+agent接收用户输入
+{
+  "stage": "agent接收用户输入",
+  "trace_id": "-",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "-",
+  "user_id": "-",
+  "event": "http.agent_io.request",
+  "method": "POST",
+  "path": "/api/v1/chat",
+  "query": "",
+  "request_content_type": "application/json",
+  "request_body": "{\"message\": \"想按自己喜欢的风格布置，所以打算租个空房，自己带家具。在朝阳区找两居室，预算三千左右。\", \"model_ip\": \"xxxx\", \"session_id\": \"eval_xxxx_EV-003-0_1772551129000525987\"}"
+}
+agent发往LLM的输入
+{
+  "stage": "agent发往LLM的输入",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.llm.request",
+  "llm_stage": "plan",
+  "method": "POST",
+  "url": "http://xxxx:8888/v1/chat/completions",
+  "headers": {
+    "Session-ID": "eval_xxxx_EV-003-0_1772551129000525987"
+  },
+  "request_content_type": "application/json",
+  "request_body": "{\"model\": \"\", \"messages\": [{\"role\": \"user\", \"content\": \"你是租房智能Agent决策器，目标是根据用户问题和tools列表决定如何查询。\\n只做三件事：识别intent、选择一个operationId、给出arguments。\\n要求：\\n1) 只能从tools选择，优先返回tool_calls；每次最多一个function。\\n2) arguments只允许使用工具定义参数名，不得新增字段。\\n3) 用户明确给house_id时必须使用；“这套/第一套”等可用focus_house_id/latest_search_house_ids指代。\\n4) 地点槽位：行政区/县/市/旗填district；商圈/片区/地标名填area。\\n5) 闲聊/情绪表达且无需工具时禁止tool_calls，返回chat JSON。\\n6) 有历史候选且用户补充偏好（如养宠/公园/看房方式/费用偏好）时，应视为继续筛选，优先search/compare而非chat。\\n7) rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\\nchat返回格式：\\n{\\\"intent\\\":\\\"chat\\\",\\\"tool_plan\\\":{\\\"operationId\\\":\\\"none\\\",\\\"arguments\\\":{}},\\\"hard\\\":{},\\\"soft\\\":{},\\\"assistant_reply\\\":\\\"...\\\",\\\"confidence\\\":0.6}\\n可用operationId：get_landmarks,get_landmark_by_name,search_landmarks,get_landmark_by_id,get_landmark_stats,get_house_by_id,get_house_listings,get_houses_by_community,get_houses_by_platform,get_nearby_landmarks,get_houses_nearby,get_house_stats,rent_house,terminate_rental,take_offline\\n会话摘要：\\n上下文事实：{}\\n用户输入：想按自己喜欢的风格布置，所以打算租个空房，自己带家具。在朝阳区找两居室，预算三千左右。\"}], \"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"get_landmarks\", \"description\": \"GET /api/landmarks\", \"parameters\": {\"type\": \"object\", \"properties\": {\"category\": {\"type\": \"string\"}, \"district\": {\"type\": \"string\"}}, \"additionalProperties\": false}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_landmark_by_name\", \"description\": \"GET /api/landmarks/name/{name}\", \"parameters\": {\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\"}}, \"additionalProperties\": false, \"required\": [\"name\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search_landmarks\", \"description\": \"GET /api/landmarks/search\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"category\": {\"type\": \"string\"}, \"district\": {\"type\": \"string\"}}, \"additionalProperties\": false, \"required\": [\"q\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_landmark_by_id\", \"description\": \"GET /api/landmarks/{id}\", \"parameters\": {\"type\": \"object\", \"properties\": {\"id\": {\"type\": \"string\"}}, \"additionalProperties\": false, \"required\": [\"id\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_landmark_stats\", \"description\": \"GET /api/landmarks/stats\", \"parameters\": {\"type\": \"object\", \"properties\": {}, \"additionalProperties\": false}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_house_by_id\", \"description\": \"GET /api/houses/{house_id}\", \"parameters\": {\"type\": \"object\", \"properties\": {\"house_id\": {\"type\": \"string\"}}, \"additionalProperties\": false, \"required\": [\"house_id\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_house_listings\", \"description\": \"GET /api/houses/listings/{house_id}\", \"parameters\": {\"type\": \"object\", \"properties\": {\"house_id\": {\"type\": \"string\"}}, \"additionalProperties\": false, \"required\": [\"house_id\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_houses_by_community\", \"description\": \"GET /api/houses/by_community\", \"parameters\": {\"type\": \"object\", \"properties\": {\"community\": {\"type\": \"string\"}, \"listing_platform\": {\"type\": \"string\", \"enum\": [\"链家\", \"安居客\", \"58同城\"]}, \"page\": {\"type\": \"integer\"}, \"page_size\": {\"type\": \"integer\"}}, \"additionalProperties\": false, \"required\": [\"community\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_houses_by_platform\", \"description\": \"GET /api/houses/by_platform\", \"parameters\": {\"type\": \"object\", \"properties\": {\"listing_platform\": {\"type\": \"string\", \"enum\": [\"链家\", \"安居客\", \"58同城\"]}, \"district\": {\"type\": \"string\"}, \"area\": {\"type\": \"string\"}, \"min_price\": {\"type\": \"integer\"}, \"max_price\": {\"type\": \"integer\"}, \"bedrooms\": {\"type\": \"string\"}, \"rental_type\": {\"type\": \"string\"}, \"decoration\": {\"type\": \"string\"}, \"orientation\": {\"type\": \"string\"}, \"elevator\": {\"type\": \"string\"}, \"min_area\": {\"type\": \"integer\"}, \"max_area\": {\"type\": \"integer\"}, \"property_type\": {\"type\": \"string\"}, \"subway_line\": {\"type\": \"string\"}, \"max_subway_dist\": {\"type\": \"integer\"}, \"subway_station\": {\"type\": \"string\"}, \"utilities_type\": {\"type\": \"string\"}, \"available_from_before\": {\"type\": \"string\"}, \"commute_to_xierqi_max\": {\"type\": \"integer\"}, \"sort_by\": {\"type\": \"string\"}, \"sort_order\": {\"type\": \"string\"}, \"page\": {\"type\": \"integer\"}, \"page_size\": {\"type\": \"integer\"}}, \"additionalProperties\": false}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_nearby_landmarks\", \"description\": \"GET /api/houses/nearby_landmarks\", \"parameters\": {\"type\": \"object\", \"properties\": {\"community\": {\"type\": \"string\"}, \"type\": {\"type\": \"string\"}, \"max_distance_m\": {\"type\": \"number\"}}, \"additionalProperties\": false, \"required\": [\"community\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_houses_nearby\", \"description\": \"GET /api/houses/nearby\", \"parameters\": {\"type\": \"object\", \"properties\": {\"landmark_id\": {\"type\": \"string\"}, \"max_distance\": {\"type\": \"number\"}, \"listing_platform\": {\"type\": \"string\", \"enum\": [\"链家\", \"安居客\", \"58同城\"]}, \"page\": {\"type\": \"integer\"}, \"page_size\": {\"type\": \"integer\"}}, \"additionalProperties\": false, \"required\": [\"landmark_id\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_house_stats\", \"description\": \"GET /api/houses/stats\", \"parameters\": {\"type\": \"object\", \"properties\": {}, \"additionalProperties\": false}}}, {\"type\": \"function\", \"function\": {\"name\": \"rent_house\", \"description\": \"POST /api/houses/{house_id}/rent\", \"parameters\": {\"type\": \"object\", \"properties\": {\"house_id\": {\"type\": \"string\"}, \"listing_platform\": {\"type\": \"string\", \"enum\": [\"链家\", \"安居客\", \"58同城\"]}}, \"additionalProperties\": false, \"required\": [\"house_id\", \"listing_platform\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"terminate_rental\", \"description\": \"POST /api/houses/{house_id}/terminate\", \"parameters\": {\"type\": \"object\", \"properties\": {\"house_id\": {\"type\": \"string\"}, \"listing_platform\": {\"type\": \"string\", \"enum\": [\"链家\", \"安居客\", \"58同城\"]}}, \"additionalProperties\": false, \"required\": [\"house_id\", \"listing_platform\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"take_offline\", \"description\": \"POST /api/houses/{house_id}/offline\", \"parameters\": {\"type\": \"object\", \"properties\": {\"house_id\": {\"type\": \"string\"}, \"listing_platform\": {\"type\": \"string\", \"enum\": [\"链家\", \"安居客\", \"58同城\"]}}, \"additionalProperties\": false, \"required\": [\"house_id\", \"listing_platform\"]}}}], \"stream\": false}"
+}
+LLM返回的输出
+{
+  "stage": "LLM返回的输出",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.llm.response",
+  "llm_stage": "plan",
+  "method": "POST",
+  "url": "http://xxxx:8888/v1/chat/completions",
+  "status_code": 200,
+  "response_content_type": "application/json",
+  "response_body": "{\"id\": \"chatcmpl-1772551140530189650\", \"object\": \"chat.completion\", \"created\": 1772551140, \"model\": \"afbe2428-c11b-4c86-ba15-f386f8f42242\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"\\n\\n\", \"tool_calls\": [{\"id\": \"call_5mClgEKe\", \"type\": \"function\", \"function\": {\"name\": \"get_houses_by_platform\", \"arguments\": \"{\\\"district\\\": \\\"朝阳区\\\", \\\"bedrooms\\\": \\\"两居室\\\", \\\"min_price\\\": 2500, \\\"max_price\\\": 3500}\"}}]}, \"finish_reason\": \"stop\", \"content_filter_results\": {\"hate\": {\"filtered\": false}, \"self_harm\": {\"filtered\": false}, \"sexual\": {\"filtered\": false}, \"violence\": {\"filtered\": false}, \"jailbreak\": {\"filtered\": false, \"detected\": false}, \"profanity\": {\"filtered\": false, \"detected\": false}}}], \"usage\": {\"prompt_tokens\": 1890, \"completion_tokens\": 279, \"total_tokens\": 2169, \"prompt_tokens_details\": null, \"completion_tokens_details\": null}, \"system_fingerprint\": \"\"}",
+  "duration_ms": 11489
+}
+agent调用API
+{
+  "stage": "agent调用API",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.request",
+  "method": "POST",
+  "url": "http://xxxx:8080/api/houses/init",
+  "params": {},
+  "json": null,
+  "headers": {
+    "X-User-ID": "xxxx"
+  }
+}
+agent得到API输出
+{
+  "stage": "agent得到API输出",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.response",
+  "method": "POST",
+  "url": "http://xxxx:8080/api/houses/init",
+  "status_code": 200,
+  "body": "{\"action\": \"reset_user\", \"message\": \"该用户状态覆盖已清空，房源恢复为初始状态\", \"user_id\": \"xxxx\"}"
+}
+agent调用API
+{
+  "stage": "agent调用API",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.request",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/by_platform?district=%E6%9C%9D%E9%98%B3&min_price=2500&max_price=3500&page=1&page_size=10",
+  "params": {
+    "district": "朝阳",
+    "min_price": 2500,
+    "max_price": 3500,
+    "page": 1,
+    "page_size": 10
+  },
+  "headers": {
+    "X-User-ID": "xxxx"
+  }
+}
+agent得到API输出
+{
+  "stage": "agent得到API输出",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.response",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/by_platform?district=%E6%9C%9D%E9%98%B3&min_price=2500&max_price=3500&page=1&page_size=10",
+  "status_code": 200,
+  "body": "{\"total\": 1059, \"page\": 1, \"page_size\": 10, \"items\": [{\"house_id\": \"HF_14\", \"community\": \"石门新居\", \"district\": \"朝阳\", \"area\": \"百子湾\", \"address\": \"百子湾南三路35号\", \"bedrooms\": 4, \"livingrooms\": 0, \"bathrooms\": 2, \"area_sqm\": 25, \"floor\": \"中层\", \"total_floors\": 16, \"orientation\": \"朝南\", \"decoration\": \"精装\", \"price\": 3050, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": true, \"subway\": \"7号线\", \"subway_distance\": 600, \"subway_station\": \"百子湾站\", \"commute_to_xierqi\": 0, \"available_from\": \"2026-02-25\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"采光好\", \"仅线上VR看房\", \"近学校\", \"近餐饮\", \"近菜市场\", \"仅接受年租\", \"可养宠物需宠物押金\", \"露天车位\", \"合同不规范\", \"绿化好环境佳\", \"24小时保安\", \"不可转租\", \"免水电费\", \"物业费另付\", \"包取暖费\", \"免宽带费\", \"收中介费\", \"押二\", \"年付\", \"车位费另付\"], \"hidden_noise_level\": \"中等\", \"status\": \"available\", \"longitude\": 116.5017, \"latitude\": 39.8917, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_45\", \"community\": \"恒基轩6区\", \"district\": \"朝阳\", \"area\": \"望京南\", \"address\": \"望京南路27号\", \"bedrooms\": 3, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 17, \"floor\": \"高层\", \"total_floors\": 11, \"orientation\": \"朝东\", \"decoration\": \"豪华\", \"price\": 3200, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": false, \"subway\": \"14号线\", \"subway_distance\": 3663, \"subway_station\": \"望京南站\", \"commute_to_xierqi\": 35, \"available_from\": \"2026-03-27\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"仅线上VR看房\", \"近警察局\", \"近商超\", \"可租2个月\", \"可养宠物需宠物押金\", \"车库车位\", \"物业管理到位\", \"房东不配合\", \"经同意可转租\", \"包水电费\", \"物业费另付\", \"包取暖费\", \"网费另付\", \"房东直租\", \"押二\", \"月付\", \"包车位\"], \"hidden_noise_level\": \"安静\", \"status\": \"available\", \"longitude\": 116.4888, \"latitude\": 39.9863, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_47\", \"community\": \"金地府9区\", \"district\": \"朝阳\", \"area\": \"东风北桥\", \"address\": \"东风北桥路69号\", \"bedrooms\": 4, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 16, \"floor\": \"中层\", \"total_floors\": 22, \"orientation\": \"南北\", \"decoration\": \"豪华\", \"price\": 3500, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": true, \"subway\": \"14号线\", \"subway_distance\": 982, \"subway_station\": \"东风北桥站\", \"commute_to_xierqi\": 42, \"available_from\": \"2026-03-16\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"南北通透\", \"采光好\", \"仅线上VR看房\", \"近公园\", \"仅接受年租\", \"可养狗\", \"不可转租\", \"提前退租可协商\", \"物业管理差\", \"绿化好环境佳\", \"房东不配合\", \"水电费另付\", \"物业费另付\", \"取暖费另付\", \"网费另付\", \"收中介费\", \"押二\", \"季付\", \"无车位\"], \"hidden_noise_level\": \"吵闹\", \"status\": \"available\", \"longitude\": 116.5123, \"latitude\": 39.959, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_59\", \"community\": \"和平舍\", \"district\": \"朝阳\", \"area\": \"国家体育\", \"address\": \"国家体育路15号\", \"bedrooms\": 4, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 21, \"floor\": \"中层\", \"total_floors\": 6, \"orientation\": \"南北\", \"decoration\": \"精装\", \"price\": 3500, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": true, \"subway\": \"8号线\", \"subway_distance\": 2407, \"subway_station\": \"奥林匹克公园站\", \"commute_to_xierqi\": 19, \"available_from\": \"2026-02-15\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"南北通透\", \"采光好\", \"仅线上AR看房\", \"近健身房\", \"可租5个月\", \"可养狗\", \"房东好沟通\", \"无门禁\", \"合同规范条款清晰\", \"物业管理差\", \"水电费另付\", \"包物业费\", \"取暖费另付\", \"包宽带\", \"房东直租\", \"押三\", \"季付\", \"无车位\"], \"hidden_noise_level\": \"吵闹\", \"status\": \"available\", \"longitude\": 116.3911, \"latitude\": 39.9938, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_63\", \"community\": \"天鸿悦\", \"district\": \"朝阳\", \"area\": \"798艺\", \"address\": \"798艺路7号\", \"bedrooms\": 3, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 21, \"floor\": \"高层\", \"total_floors\": 11, \"orientation\": \"朝东\", \"decoration\": \"精装\", \"price\": 3500, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": true, \"subway\": \"14号线\", \"subway_distance\": 1416, \"subway_station\": \"望京南站\", \"commute_to_xierqi\": 35, \"available_from\": \"2026-03-14\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"线下+线上\", \"工作日9-18点\", \"近餐饮\", \"近菜市场\", \"可半年租\", \"可养狗\", \"露天车位\", \"提前退租可协商\", \"门禁形同虚设\", \"合同规范条款清晰\", \"包水电费\", \"物业费另付\", \"包取暖费\", \"包宽带\", \"中介费半月租\", \"押一\", \"季付\", \"包车位\"], \"hidden_noise_level\": \"吵闹\", \"status\": \"available\", \"longitude\": 116.495, \"latitude\": 39.9877, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_65\", \"community\": \"观澜里1区\", \"district\": \"朝阳\", \"area\": \"望京SO\", \"address\": \"望京SO路50号\", \"bedrooms\": 4, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 29, \"floor\": \"中层\", \"total_floors\": 11, \"orientation\": \"南北\", \"decoration\": \"精装\", \"price\": 3500, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": true, \"subway\": \"14号线\", \"subway_distance\": 5238, \"subway_station\": \"望京站\", \"commute_to_xierqi\": 31, \"available_from\": \"2026-03-12\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"南北通透\", \"采光好\", \"仅线下看房\", \"工作日9-18点\", \"近公园\", \"近餐饮\", \"可年租\", \"可养宠物需宠物押金\", \"车库车位\", \"物业管理差\", \"合同规范条款清晰\", \"经同意可转租\", \"免水电费\", \"包物业费\", \"包取暖费\", \"包宽带\", \"中介费半月租\", \"押三\", \"年付\", \"包车位\"], \"hidden_noise_level\": \"安静\", \"status\": \"available\", \"longitude\": 116.4855, \"latitude\": 40.0103, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_67\", \"community\": \"保利公馆1区\", \"district\": \"朝阳\", \"area\": \"中石化\", \"address\": \"中石化路80号\", \"bedrooms\": 2, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 29, \"floor\": \"低层\", \"total_floors\": 6, \"orientation\": \"朝南\", \"decoration\": \"精装\", \"price\": 3500, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": true, \"subway\": \"2号线\", \"subway_distance\": 541, \"subway_station\": \"朝阳门站\", \"commute_to_xierqi\": 38, \"available_from\": \"2026-03-12\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"采光好\", \"仅线上VR看房\", \"近公园\", \"近银行\", \"近商超\", \"可租3个月\", \"可养宠物\", \"车库车位\", \"无门禁\", \"绿化好环境佳\", \"合同规范条款清晰\", \"提前退租扣押金\", \"物业管理差\", \"包水电费\", \"物业费另付\", \"包取暖费\", \"免宽带费\", \"中介费一月租\", \"押三\", \"月付\", \"免车位费\"], \"hidden_noise_level\": \"吵闹\", \"status\": \"available\", \"longitude\": 116.4371, \"latitude\": 39.9264, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_93\", \"community\": \"万达家园4区\", \"district\": \"朝阳\", \"area\": \"国贸\", \"address\": \"国贸路52号\", \"bedrooms\": 3, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 19, \"floor\": \"高层\", \"total_floors\": 11, \"orientation\": \"朝东\", \"decoration\": \"精装\", \"price\": 3500, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": true, \"subway\": \"1号线\", \"subway_distance\": 1568, \"subway_station\": \"国贸站\", \"commute_to_xierqi\": 44, \"available_from\": \"2026-03-15\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"线下+线上\", \"周末9-18点\", \"近加油站\", \"近警察局\", \"近学校\", \"近银行\", \"近健身房\", \"可年租\", \"可养狗\", \"绿化少环境一般\", \"不可转租\", \"房东不配合\", \"合同不规范\", \"水电费另付\", \"物业费另付\", \"包取暖费\", \"包宽带\", \"中介费半月租\", \"押二\", \"半年付\", \"无车位\"], \"hidden_noise_level\": \"安静\", \"status\": \"available\", \"longitude\": 116.4609, \"latitude\": 39.9079, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_95\", \"community\": \"翠湖国际1区\", \"district\": \"朝阳\", \"area\": \"百子湾\", \"address\": \"百子湾路7号\", \"bedrooms\": 4, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 25, \"floor\": \"中层\", \"total_floors\": 18, \"orientation\": \"南北\", \"decoration\": \"豪华\", \"price\": 3500, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": false, \"subway\": \"7号线\", \"subway_distance\": 4066, \"subway_station\": \"百子湾站\", \"commute_to_xierqi\": 51, \"available_from\": \"2026-03-01\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"南北通透\", \"采光好\", \"线下+线上\", \"仅周末看房\", \"近商超\", \"近加油站\", \"近医院\", \"可租3个月\", \"不可养宠物\", \"露天车位\", \"绿化好环境佳\", \"提前退租扣押金\", \"门禁形同虚设\", \"房东难联系\", \"水电费另付\", \"物业费另付\", \"免取暖费\", \"免宽带费\", \"中介费半月租\", \"押一\", \"季付\", \"车位费另付\"], \"hidden_noise_level\": \"吵闹\", \"status\": \"available\", \"longitude\": 116.4955, \"latitude\": 39.8913, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_97\", \"community\": \"和平庭\", \"district\": \"朝阳\", \"area\": \"高碑店\", \"address\": \"高碑店路49号\", \"bedrooms\": 2, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 17, \"floor\": \"共5层\", \"total_floors\": 5, \"orien...(truncated)"
+}
+agent调用API
+{
+  "stage": "agent调用API",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.request",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/by_platform?district=%E6%9C%9D%E9%98%B3&min_price=2500&max_price=3500&page=2&page_size=10",
+  "params": {
+    "district": "朝阳",
+    "min_price": 2500,
+    "max_price": 3500,
+    "page": 2,
+    "page_size": 10
+  },
+  "headers": {
+    "X-User-ID": "xxxx"
+  }
+}
+agent得到API输出
+{
+  "stage": "agent得到API输出",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.response",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/by_platform?district=%E6%9C%9D%E9%98%B3&min_price=2500&max_price=3500&page=2&page_size=10",
+  "status_code": 200,
+  "body": "{\"total\": 1059, \"page\": 2, \"page_size\": 10, \"items\": [{\"house_id\": \"HF_111\", \"community\": \"锦绣庭1区\", \"district\": \"朝阳\", \"area\": \"奥林匹克公园\", \"address\": \"奥林匹克公园路43号\", \"bedrooms\": 3, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 18, \"floor\": \"高层\", \"total_floors\": 11, \"orientation\": \"朝东\", \"decoration\": \"精装\", \"price\": 3500, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": true, \"subway\": \"8号线\", \"subway_distance\": 483, \"subway_station\": \"奥林匹克公园站\", \"commute_to_xierqi\": 20, \"available_from\": \"2026-03-27\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"仅线上AR看房\", \"近商超\", \"近加油站\", \"近公园\", \"近餐饮\", \"可租3个月\", \"可养猫\", \"车库车位\", \"经同意可转租\", \"提前退租可协商\", \"合同规范条款清晰\", \"门禁刷卡\", \"免水电费\", \"物业费另付\", \"包取暖费\", \"免宽带费\", \"收中介费\", \"押二\", \"月付\", \"包车位\"], \"hidden_noise_level\": \"吵闹\", \"status\": \"available\", \"longitude\": 116.3907, \"latitude\": 39.9893, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_125\", \"community\": \"博雅苑\", \"district\": \"朝阳\", \"area\": \"三元桥\", \"address\": \"三元桥路74号\", \"bedrooms\": 4, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 29, \"floor\": \"中层\", \"total_floors\": 4, \"orientation\": \"南北\", \"decoration\": \"空房\", \"price\": 3000, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": false, \"subway\": \"10号线\", \"subway_distance\": 4043, \"subway_station\": \"三元桥站\", \"commute_to_xierqi\": 34, \"available_from\": \"2026-03-09\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"南北通透\", \"采光好\", \"仅线上图片看房\", \"近健身房\", \"近学校\", \"近商超\", \"可半年租\", \"仅限小型犬\", \"露天车位\", \"房东好沟通\", \"无门禁\", \"经同意可转租\", \"提前退租可协商\", \"包水电费\", \"免物业费\", \"包取暖费\", \"包宽带\", \"收中介费\", \"押三\", \"半年付\", \"车位费另付\"], \"hidden_noise_level\": \"安静\", \"status\": \"available\", \"longitude\": 116.4607, \"latitude\": 39.9634, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_135\", \"community\": \"润泽悦5区\", \"district\": \"朝阳\", \"area\": \"东风北桥\", \"address\": \"东风北桥路49号\", \"bedrooms\": 3, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 28, \"floor\": \"共4层\", \"total_floors\": 4, \"orientation\": \"朝东\", \"decoration\": \"精装\", \"price\": 3500, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": false, \"subway\": \"14号线\", \"subway_distance\": 4712, \"subway_station\": \"东风北桥站\", \"commute_to_xierqi\": 40, \"available_from\": \"2026-02-23\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"线下+线上\", \"周末14-18点\", \"近商超\", \"近健身房\", \"可租2个月\", \"可养宠物需宠物押金\", \"车库车位\", \"房东好沟通\", \"合同规范条款清晰\", \"提前退租扣押金\", \"经同意可转租\", \"包水电费\", \"包物业费\", \"包取暖费\", \"包宽带\", \"中介费半月租\", \"押三\", \"月付\", \"包车位\"], \"hidden_noise_level\": \"吵闹\", \"status\": \"available\", \"longitude\": 116.5036, \"latitude\": 39.9642, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_137\", \"community\": \"翠湖府\", \"district\": \"朝阳\", \"area\": \"九龙山\", \"address\": \"九龙山路22号\", \"bedrooms\": 4, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 15, \"floor\": \"中层\", \"total_floors\": 32, \"orientation\": \"南北\", \"decoration\": \"精装\", \"price\": 3150, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": true, \"subway\": \"7号线\", \"subway_distance\": 564, \"subway_station\": \"九龙山站\", \"commute_to_xierqi\": 47, \"available_from\": \"2026-03-16\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"南北通透\", \"采光好\", \"仅线上图片看房\", \"近医院\", \"近学校\", \"近公园\", \"近银行\", \"可租4个月\", \"可养宠物\", \"露天车位\", \"物业管理到位\", \"绿化少环境一般\", \"经同意可转租\", \"免水电费\", \"免物业费\", \"免取暖费\", \"网费另付\", \"中介费半月租\", \"押一\", \"季付\", \"免车位费\"], \"hidden_noise_level\": \"安静\", \"status\": \"available\", \"longitude\": 116.4765, \"latitude\": 39.9013, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_139\", \"community\": \"天鸿轩\", \"district\": \"朝阳\", \"area\": \"三里屯太\", \"address\": \"三里屯太路59号\", \"bedrooms\": 2, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 24, \"floor\": \"低层\", \"total_floors\": 22, \"orientation\": \"朝南\", \"decoration\": \"精装\", \"price\": 3500, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": true, \"subway\": \"3号线\", \"subway_distance\": 2141, \"subway_station\": \"团结湖站\", \"commute_to_xierqi\": 37, \"available_from\": \"2026-02-21\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"采光好\", \"仅线上图片看房\", \"近学校\", \"近健身房\", \"可半年租\", \"可养猫\", \"露天车位\", \"绿化好环境佳\", \"不可转租\", \"水电费另付\", \"包物业费\", \"包取暖费\", \"网费另付\", \"中介费半月租\", \"押一\", \"月付\", \"免车位费\"], \"hidden_noise_level\": \"吵闹\", \"status\": \"available\", \"longitude\": 116.4509, \"latitude\": 39.9363, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_147\", \"community\": \"翠湖锦园4区\", \"district\": \"朝阳\", \"area\": \"国家体育\", \"address\": \"国家体育路37号\", \"bedrooms\": 3, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 15, \"floor\": \"共5层\", \"total_floors\": 5, \"orientation\": \"朝东\", \"decoration\": \"豪华\", \"price\": 3500, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": false, \"subway\": \"8号线\", \"subway_distance\": 588, \"subway_station\": \"奥林匹克公园站\", \"commute_to_xierqi\": 19, \"available_from\": \"2026-03-15\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"线下+线上\", \"周末9-18点\", \"近健身房\", \"近餐饮\", \"近警察局\", \"近公园\", \"可半年租\", \"可养宠物需宠物押金\", \"露天车位\", \"不可转租\", \"合同规范条款清晰\", \"水电费另付\", \"物业费另付\", \"包取暖费\", \"包宽带\", \"收中介费\", \"押二\", \"半年付\", \"车位费另付\"], \"hidden_noise_level\": \"吵闹\", \"status\": \"available\", \"longitude\": 116.3901, \"latitude\": 39.9971, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_151\", \"community\": \"润泽嘉园\", \"district\": \"朝阳\", \"area\": \"798艺\", \"address\": \"798艺路89号\", \"bedrooms\": 2, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 27, \"floor\": \"低层\", \"total_floors\": 32, \"orientation\": \"朝南\", \"decoration\": \"简装\", \"price\": 3500, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"公寓\", \"utilities_type\": \"商水商电\", \"elevator\": true, \"subway\": \"14号线\", \"subway_distance\": 246, \"subway_station\": \"望京南站\", \"commute_to_xierqi\": 37, \"available_from\": \"2026-02-21\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"采光好\", \"线下+线上\", \"全天可看房\", \"近健身房\", \"可租4个月\", \"可养宠物\", \"车库车位\", \"经同意可转租\", \"房东好沟通\", \"门禁形同虚设\", \"包水电费\", \"包物业费\", \"免取暖费\", \"网费另付\", \"收中介费\", \"押三\", \"季付\", \"免车位费\"], \"hidden_noise_level\": \"吵闹\", \"status\": \"available\", \"longitude\": 116.5024, \"latitude\": 39.9852, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_153\", \"community\": \"恒通苑4区\", \"district\": \"朝阳\", \"area\": \"望京SO\", \"address\": \"望京SO路91号\", \"bedrooms\": 3, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 26, \"floor\": \"高层\", \"total_floors\": 18, \"orientation\": \"朝东\", \"decoration\": \"简装\", \"price\": 3500, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": true, \"subway\": \"14号线\", \"subway_distance\": 1208, \"subway_station\": \"望京站\", \"commute_to_xierqi\": 32, \"available_from\": \"2026-03-31\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"仅线下看房\", \"工作日9-18点\", \"近加油站\", \"近医院\", \"近商超\", \"近学校\", \"近警察局\", \"可租3个月\", \"可养狗\", \"绿化少环境一般\", \"合同不规范\", \"门禁刷卡\", \"房东好沟通\", \"不可转租\", \"免水电费\", \"免物业费\", \"免取暖费\", \"包宽带\", \"房东直租\", \"押三\", \"月付\", \"无车位\"], \"hidden_noise_level\": \"安静\", \"status\": \"available\", \"longitude\": 116.4855, \"latitude\": 40.0027, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_155\", \"community\": \"御景华府1区\", \"district\": \"朝阳\", \"area\": \"中石化\", \"address\": \"中石化路37号\", \"bedrooms\": 4, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 29, \"floor\": \"中层\", \"total_floors\": 6, \"orientation\": \"南北\", \"decoration\": \"简装\", \"price\": 3500, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": false, \"subway\": \"2号线\", \"subway_distance\": 4540, \"subway_station\": \"朝阳门站\", \"commute_to_xierqi\": 36, \"available_from\": \"2026-03-08\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"南北通透\", \"采光好\", \"仅线下看房\", \"周末14-18点\", \"近商超\", \"可租3个月\", \"可养狗\", \"车库车位\", \"不可转租\", \"房东不配合\", \"物业管理差\", \"免水电费\", \"包物业费\", \"免取暖费\", \"免宽带费\", \"收中介费\", \"押三\", \"月付\", \"车位费另付\"], \"hidden_noise_level\": \"吵闹\", \"status\": \"available\", \"longitude\": 116.4386, \"latitude\": 39.9337, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_183\", \"community\": \"幸福阁\", \"district\": \"朝阳\", \"area\": \"百子湾\", \"address\": \"百子湾路51号\", \"bedrooms\": 3, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 20, \"floor\": \"高层\", \"total_floors\": 22, \"or...(truncated)"
+}
+agent调用API
+{
+  "stage": "agent调用API",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.request",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E7%9F%B3%E9%97%A8%E6%96%B0%E5%B1%85&type=shopping&max_distance_m=3000",
+  "params": {
+    "community": "石门新居",
+    "type": "shopping",
+    "max_distance_m": 3000
+  },
+  "headers": {
+    "X-User-ID": "xxxx"
+  }
+}
+agent调用API
+{
+  "stage": "agent调用API",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.request",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E7%BF%A0%E6%B9%96%E5%BA%9C&type=shopping&max_distance_m=3000",
+  "params": {
+    "community": "翠湖府",
+    "type": "shopping",
+    "max_distance_m": 3000
+  },
+  "headers": {
+    "X-User-ID": "xxxx"
+  }
+}
+agent调用API
+{
+  "stage": "agent调用API",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.request",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E9%94%A6%E7%BB%A3%E5%BA%AD1%E5%8C%BA&type=shopping&max_distance_m=3000",
+  "params": {
+    "community": "锦绣庭1区",
+    "type": "shopping",
+    "max_distance_m": 3000
+  },
+  "headers": {
+    "X-User-ID": "xxxx"
+  }
+}
+agent调用API
+{
+  "stage": "agent调用API",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.request",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E7%BF%A0%E6%B9%96%E9%94%A6%E5%9B%AD4%E5%8C%BA&type=shopping&max_distance_m=3000",
+  "params": {
+    "community": "翠湖锦园4区",
+    "type": "shopping",
+    "max_distance_m": 3000
+  },
+  "headers": {
+    "X-User-ID": "xxxx"
+  }
+}
+agent调用API
+{
+  "stage": "agent调用API",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.request",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E5%8D%9A%E9%9B%85%E8%8B%91&type=shopping&max_distance_m=3000",
+  "params": {
+    "community": "博雅苑",
+    "type": "shopping",
+    "max_distance_m": 3000
+  },
+  "headers": {
+    "X-User-ID": "xxxx"
+  }
+}
+agent得到API输出
+{
+  "stage": "agent得到API输出",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.response",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E7%9F%B3%E9%97%A8%E6%96%B0%E5%B1%85&type=shopping&max_distance_m=3000",
+  "status_code": 200,
+  "body": "{\"community\": \"石门新居\", \"type\": \"shopping\", \"total\": 0, \"items\": null}"
+}
+agent调用API
+{
+  "stage": "agent调用API",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.request",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E7%9F%B3%E9%97%A8%E6%96%B0%E5%B1%85&type=park&max_distance_m=3000",
+  "params": {
+    "community": "石门新居",
+    "type": "park",
+    "max_distance_m": 3000
+  },
+  "headers": {
+    "X-User-ID": "xxxx"
+  }
+}
+agent得到API输出
+{
+  "stage": "agent得到API输出",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.response",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E7%BF%A0%E6%B9%96%E5%BA%9C&type=shopping&max_distance_m=3000",
+  "status_code": 200,
+  "body": "{\"community\": \"翠湖府\", \"type\": \"shopping\", \"total\": 1, \"items\": [{\"landmark\": {\"id\": \"LM_002\", \"name\": \"国贸商城\", \"category\": \"landmark\", \"district\": \"朝阳\", \"longitude\": 116.4623, \"latitude\": 39.9106, \"details\": {\"address\": \"北京市朝阳区建国门外大街1号\", \"category\": \"landmark\", \"district\": \"朝阳\", \"landmark_id\": \"LM_002\", \"latitude\": 39.9106, \"longitude\": 116.4623, \"name\": \"国贸商城\", \"nearby_subway\": \"国贸站\", \"type\": \"shopping\", \"type_name\": \"购物中心\"}}, \"distance\": 1592.6245331539099}]}"
+}
+agent调用API
+{
+  "stage": "agent调用API",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.request",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E7%BF%A0%E6%B9%96%E5%BA%9C&type=park&max_distance_m=3000",
+  "params": {
+    "community": "翠湖府",
+    "type": "park",
+    "max_distance_m": 3000
+  },
+  "headers": {
+    "X-User-ID": "xxxx"
+  }
+}
+agent得到API输出
+{
+  "stage": "agent得到API输出",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.response",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E7%BF%A0%E6%B9%96%E9%94%A6%E5%9B%AD4%E5%8C%BA&type=shopping&max_distance_m=3000",
+  "status_code": 200,
+  "body": "{\"community\": \"翠湖锦园4区\", \"type\": \"shopping\", \"total\": 0, \"items\": null}"
+}
+agent调用API
+{
+  "stage": "agent调用API",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.request",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E7%BF%A0%E6%B9%96%E9%94%A6%E5%9B%AD4%E5%8C%BA&type=park&max_distance_m=3000",
+  "params": {
+    "community": "翠湖锦园4区",
+    "type": "park",
+    "max_distance_m": 3000
+  },
+  "headers": {
+    "X-User-ID": "xxxx"
+  }
+}
+agent得到API输出
+{
+  "stage": "agent得到API输出",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.response",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E9%94%A6%E7%BB%A3%E5%BA%AD1%E5%8C%BA&type=shopping&max_distance_m=3000",
+  "status_code": 200,
+  "body": "{\"community\": \"锦绣庭1区\", \"type\": \"shopping\", \"total\": 0, \"items\": null}"
+}
+agent调用API
+{
+  "stage": "agent调用API",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.request",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E9%94%A6%E7%BB%A3%E5%BA%AD1%E5%8C%BA&type=park&max_distance_m=3000",
+  "params": {
+    "community": "锦绣庭1区",
+    "type": "park",
+    "max_distance_m": 3000
+  },
+  "headers": {
+    "X-User-ID": "xxxx"
+  }
+}
+agent得到API输出
+{
+  "stage": "agent得到API输出",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.response",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E5%8D%9A%E9%9B%85%E8%8B%91&type=shopping&max_distance_m=3000",
+  "status_code": 200,
+  "body": "{\"community\": \"博雅苑\", \"type\": \"shopping\", \"total\": 1, \"items\": [{\"landmark\": {\"id\": \"LM_007\", \"name\": \"蓝色港湾\", \"category\": \"landmark\", \"district\": \"朝阳\", \"longitude\": 116.4812, \"latitude\": 39.9512, \"details\": {\"address\": \"北京市朝阳区朝阳公园路6号\", \"category\": \"landmark\", \"district\": \"朝阳\", \"landmark_id\": \"LM_007\", \"latitude\": 39.9512, \"longitude\": 116.4812, \"name\": \"蓝色港湾\", \"nearby_subway\": \"枣营站\", \"type\": \"shopping\", \"type_name\": \"购物中心\"}}, \"distance\": 2212.083862853476}]}"
+}
+agent调用API
+{
+  "stage": "agent调用API",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.request",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E5%8D%9A%E9%9B%85%E8%8B%91&type=park&max_distance_m=3000",
+  "params": {
+    "community": "博雅苑",
+    "type": "park",
+    "max_distance_m": 3000
+  },
+  "headers": {
+    "X-User-ID": "xxxx"
+  }
+}
+agent得到API输出
+{
+  "stage": "agent得到API输出",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.response",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E7%9F%B3%E9%97%A8%E6%96%B0%E5%B1%85&type=park&max_distance_m=3000",
+  "status_code": 200,
+  "body": "{\"community\": \"石门新居\", \"type\": \"park\", \"total\": 0, \"items\": null}"
+}
+agent得到API输出
+{
+  "stage": "agent得到API输出",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.response",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E7%BF%A0%E6%B9%96%E5%BA%9C&type=park&max_distance_m=3000",
+  "status_code": 200,
+  "body": "{\"community\": \"翠湖府\", \"type\": \"park\", \"total\": 0, \"items\": null}"
+}
+agent得到API输出
+{
+  "stage": "agent得到API输出",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.response",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E7%BF%A0%E6%B9%96%E9%94%A6%E5%9B%AD4%E5%8C%BA&type=park&max_distance_m=3000",
+  "status_code": 200,
+  "body": "{\"community\": \"翠湖锦园4区\", \"type\": \"park\", \"total\": 1, \"items\": [{\"landmark\": {\"id\": \"LM_010\", \"name\": \"奥林匹克公园\", \"category\": \"landmark\", \"district\": \"朝阳\", \"longitude\": 116.3892, \"latitude\": 39.9917, \"details\": {\"address\": \"北京市朝阳区北辰东路15号\", \"category\": \"landmark\", \"district\": \"朝阳\", \"landmark_id\": \"LM_010\", \"latitude\": 39.9917, \"longitude\": 116.3892, \"name\": \"奥林匹克公园\", \"nearby_subway\": \"奥林匹克公园站\", \"type\": \"park\", \"type_name\": \"公园\"}}, \"distance\": 605.3275072126851}]}"
+}
+agent得到API输出
+{
+  "stage": "agent得到API输出",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.response",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E5%8D%9A%E9%9B%85%E8%8B%91&type=park&max_distance_m=3000",
+  "status_code": 200,
+  "body": "{\"community\": \"博雅苑\", \"type\": \"park\", \"total\": 1, \"items\": [{\"landmark\": {\"id\": \"LM_011\", \"name\": \"朝阳公园\", \"category\": \"landmark\", \"district\": \"朝阳\", \"longitude\": 116.4912, \"latitude\": 39.9512, \"details\": {\"address\": \"北京市朝阳区朝阳公园南路1号\", \"category\": \"landmark\", \"district\": \"朝阳\", \"landmark_id\": \"LM_011\", \"latitude\": 39.9512, \"longitude\": 116.4912, \"name\": \"朝阳公园\", \"nearby_subway\": \"朝阳公园站\", \"type\": \"park\", \"type_name\": \"公园\"}}, \"distance\": 2932.292121221653}]}"
+}
+agent得到API输出
+{
+  "stage": "agent得到API输出",
+  "trace_id": "8179eb17d4d2",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Single",
+  "user_id": "xxxx",
+  "event": "http.agent_io.api.response",
+  "method": "GET",
+  "url": "http://xxxx:8080/api/houses/nearby_landmarks?community=%E9%94%A6%E7%BB%A3%E5%BA%AD1%E5%8C%BA&type=park&max_distance_m=3000",
+  "status_code": 200,
+  "body": "{\"community\": \"锦绣庭1区\", \"type\": \"park\", \"total\": 1, \"items\": [{\"landmark\": {\"id\": \"LM_010\", \"name\": \"奥林匹克公园\", \"category\": \"landmark\", \"district\": \"朝阳\", \"longitude\": 116.3892, \"latitude\": 39.9917, \"details\": {\"address\": \"北京市朝阳区北辰东路15号\", \"category\": \"landmark\", \"district\": \"朝阳\", \"landmark_id\": \"LM_010\", \"latitude\": 39.9917, \"longitude\": 116.3892, \"name\": \"奥林匹克公园\", \"nearby_subway\": \"奥林匹克公园站\", \"type\": \"park\", \"type_name\": \"公园\"}}, \"distance\": 295.88553330369115}]}"
+}
+agent最终返回用户
+{
+  "stage": "agent最终返回用户",
+  "trace_id": "-",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "-",
+  "user_id": "-",
+  "event": "http.agent_io.response",
+  "method": "POST",
+  "path": "/api/v1/chat",
+  "query": "",
+  "status_code": 200,
+  "response_content_type": "application/json",
+  "response_body": "{\"session_id\": \"eval_xxxx_EV-003-0_1772551129000525987\", \"response\": {\"message\": \"为您找到以下符合条件的房源：\", \"houses\": [\"HF_14\", \"HF_137\", \"HF_111\", \"HF_147\", \"HF_125\"]}, \"status\": \"success\", \"tool_results\": [{\"seq\": 1, \"name\": \"POST /api/houses/init\", \"success\": true, \"output\": {\"action\": \"reset_user\", \"message\": \"该用户状态覆盖已清空，房源恢复为初始状态\", \"user_id\": \"xxxx\"}, \"duration_ms\": 74, \"method\": \"POST\", \"url\": \"http://xxxx:8080/api/houses/init\", \"status_code\": 200}, {\"seq\": 2, \"name\": \"GET /api/houses/by_platform\", \"success\": true, \"output\": {\"total\": 1059, \"page\": 1, \"page_size\": 10, \"items\": [{\"house_id\": \"HF_14\", \"community\": \"石门新居\", \"district\": \"朝阳\", \"area\": \"百子湾\", \"address\": \"百子湾南三路35号\", \"bedrooms\": 4, \"livingrooms\": 0, \"bathrooms\": 2, \"area_sqm\": 25, \"floor\": \"中层\", \"total_floors\": 16, \"orientation\": \"朝南\", \"decoration\": \"精装\", \"price\": 3050, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": true, \"subway\": \"7号线\", \"subway_distance\": 600, \"subway_station\": \"百子湾站\", \"commute_to_xierqi\": 0, \"available_from\": \"2026-02-25\", \"listing_platform\": \"安居客\", \"listing_url\": \"https://bj.zu.anjuke.com/\", \"tags\": [\"采光好\", \"仅线上VR看房\", \"近学校\", \"近餐饮\", \"近菜市场\", \"仅接受年租\", \"可养宠物需宠物押金\", \"露天车位\", \"合同不规范\", \"绿化好环境佳\", \"24小时保安\", \"不可转租\", \"免水电费\", \"物业费另付\", \"包取暖费\", \"免宽带费\", \"收中介费\", \"押二\", \"年付\", \"车位费另付\"], \"hidden_noise_level\": \"中等\", \"status\": \"available\", \"longitude\": 116.5017, \"latitude\": 39.8917, \"coordinate_system\": \"WGS84\"}, {\"house_id\": \"HF_45\", \"community\": \"恒基轩6区\", \"district\": \"朝阳\", \"area\": \"望京南\", \"address\": \"望京南路27号\", \"bedrooms\": 3, \"livingrooms\": 1, \"bathrooms\": 1, \"area_sqm\": 17, \"floor\": \"高层\", \"total_floors\": 11, \"orientation\": \"朝东\", \"decoration\": \"豪华\", \"price\": 3200, \"price_unit\": \"元/月\", \"rental_type\": \"合租\", \"property_type\": \"住宅\", \"utilities_type\": \"民水民电\", \"elevator\": false, \"subway\": \"14号线\", \"subway_distance\": 3663, \"subway_station\": \"望京南站\", \"commute_to_xierqi\": 35, \"available_from\": \"2026-03-27\", \"listing_platform\": \"安居客\", \"listing_url\": \"ht...(truncated)",
+  "duration_ms": 11814
+}
+agent接收用户输入
+{
+  "stage": "agent接收用户输入",
+  "trace_id": "-",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "-",
+  "user_id": "-",
+  "event": "http.agent_io.request",
+  "method": "POST",
+  "path": "/api/v1/chat",
+  "query": "",
+  "request_content_type": "application/json",
+  "request_body": "{\"message\": \"想问下能不能月付？最好能是房东直租。\", \"model_ip\": \"xxxx\", \"session_id\": \"eval_xxxx_EV-003-0_1772551129000525987\"}"
+}
+agent发往LLM的输入
+{
+  "stage": "agent发往LLM的输入",
+  "trace_id": "692639e3b02a",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Multi",
+  "user_id": "xxxx",
+  "event": "http.agent_io.llm.request",
+  "llm_stage": "plan",
+  "method": "POST",
+  "url": "http://xxxx:8888/v1/chat/completions",
+  "headers": {
+    "Session-ID": "eval_xxxx_EV-003-0_1772551129000525987"
+  },
+  "request_content_type": "application/json",
+  "request_body": "{\"model\": \"\", \"messages\": [{\"role\": \"user\", \"content\": \"你是租房智能Agent决策器，目标是根据用户问题和tools列表决定如何查询。\\n只做三件事：识别intent、选择一个operationId、给出arguments。\\n要求：\\n1) 只能从tools选择，优先返回tool_calls；每次最多一个function。\\n2) arguments只允许使用工具定义参数名，不得新增字段。\\n3) 用户明确给house_id时必须使用；“这套/第一套”等可用focus_house_id/latest_search_house_ids指代。\\n4) 地点槽位：行政区/县/市/旗填district；商圈/片区/地标名填area。\\n5) 闲聊/情绪表达且无需工具时禁止tool_calls，返回chat JSON。\\n6) 有历史候选且用户补充偏好（如养宠/公园/看房方式/费用偏好）时，应视为继续筛选，优先search/compare而非chat。\\n7) rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\\nchat返回格式：\\n{\\\"intent\\\":\\\"chat\\\",\\\"tool_plan\\\":{\\\"operationId\\\":\\\"none\\\",\\\"arguments\\\":{}},\\\"hard\\\":{},\\\"soft\\\":{},\\\"assistant_reply\\\":\\\"...\\\",\\\"confidence\\\":0.6}\\n可用operationId：get_landmarks,get_landmark_by_name,search_landmarks,get_landmark_by_id,get_landmark_stats,get_house_by_id,get_house_listings,get_houses_by_community,get_houses_by_platform,get_nearby_landmarks,get_houses_nearby,get_house_stats,rent_house,terminate_rental,take_offline\\n会话摘要：约束[区域=朝阳，预算上限=3500] 焦点[house=HF_14，platform=安居客] 检索[1:朝阳:HF_14/HF_137]\\n上下文事实：{\\\"case_type\\\": \\\"Single\\\", \\\"focus_house_id\\\": \\\"HF_14\\\", \\\"focus_listing_platform\\\": \\\"安居客\\\", \\\"confirmed_constraints\\\": {\\\"district\\\": \\\"朝阳\\\", \\\"budget_min\\\": 2500, \\\"budget_max\\\": 3500}, \\\"soft_preferences\\\": {\\\"prefer_spacious\\\": false, \\\"prioritize_subway_distance\\\": false, \\\"prioritize_commute\\\": false}, \\\"recent_searches\\\": [{\\\"house_ids\\\": [\\\"HF_14\\\", \\\"HF_137\\\"], \\\"district\\\": \\\"朝阳\\\"}], \\\"latest_search_house_ids\\\": [\\\"HF_14\\\", \\\"HF_137\\\"], \\\"latest_top_houses\\\": [{\\\"house_id\\\": \\\"HF_14\\\", \\\"rent\\\": 3050, \\\"subway_distance\\\": 600, \\\"commute_to_xierqi_min\\\": 0, \\\"pet_friendly\\\": true, \\\"key_tags\\\": [\\\"采光好\\\", \\\"可养宠物需宠物押金\\\", \\\"免水电费\\\", \\\"物业费另付\\\"]}, {\\\"house_id\\\": \\\"HF_137\\\", \\\"rent\\\": 3150, \\\"subway_distance\\\": 564, \\\"commute_to_xierqi_min\\\": 47, \\\"pet_friendly\\\": true, \\\"amenity_summary\\\": {\\\"shopping_count\\\": 1, \\\"nearest_shopping_m\\\": 1592.6}, \\\"key_tags\\\": [\\\"采光好\\\", \\\"近公园\\\", \\\"可养宠物\\\", \\\"免水电费\\\"]}, {\\\"house_id\\\": \\\"HF_111\\\", \\\"rent\\\": 3500, \\\"subway_distance\\\": 483, \\\"commute_to_xierqi_min\\\": 20, \\\"pet_friendly\\\": true, \\\"amenity_summary\\\": {\\\"park_count\\\": 1, \\\"nearest_park_m\\\": 295.9}, \\\"key_tags\\\": [\\\"近商超\\\", \\\"近公园\\\", \\\"可养猫\\\", \\\"免水电费\\\"]}]}\\n用户输入：想问下能不能月付？最好能是房东直租。\"}], \"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"get_landmarks\", \"description\": \"GET /api/landmarks\", \"parameters\": {\"type\": \"object\", \"properties\": {\"category\": {\"type\": \"string\"}, \"district\": {\"type\": \"string\"}}, \"additionalProperties\": false}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_landmark_by_name\", \"description\": \"GET /api/landmarks/name/{name}\", \"parameters\": {\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\"}}, \"additionalProperties\": false, \"required\": [\"name\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search_landmarks\", \"description\": \"GET /api/landmarks/search\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"category\": {\"type\": \"string\"}, \"district\": {\"type\": \"string\"}}, \"additionalProperties\": false, \"required\": [\"q\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_landmark_by_id\", \"description\": \"GET /api/landmarks/{id}\", \"parameters\": {\"type\": \"object\", \"properties\": {\"id\": {\"type\": \"string\"}}, \"additionalProperties\": false, \"required\": [\"id\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_landmark_stats\", \"description\": \"GET /api/landmarks/stats\", \"parameters\": {\"type\": \"object\", \"properties\": {}, \"additionalProperties\": false}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_house_by_id\", \"description\": \"GET /api/houses/{house_id}\", \"parameters\": {\"type\": \"object\", \"properties\": {\"house_id\": {\"type\": \"string\"}}, \"additionalProperties\": false, \"required\": [\"house_id\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_house_listings\", \"description\": \"GET /api/houses/listings/{house_id}\", \"parameters\": {\"type\": \"object\", \"properties\": {\"house_id\": {\"type\": \"string\"}}, \"additionalProperties\": false, \"required\": [\"house_id\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_houses_by_community\", \"description\": \"GET /api/houses/by_community\", \"parameters\": {\"type\": \"object\", \"properties\": {\"community\": {\"type\": \"string\"}, \"listing_platform\": {\"type\": \"string\", \"enum\": [\"链家\", \"安居客\", \"58同城\"]}, \"page\": {\"type\": \"integer\"}, \"page_size\": {\"type\": \"integer\"}}, \"additionalProperties\": false, \"required\": [\"community\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_houses_by_platform\", \"description\": \"GET /api/houses/by_platform\", \"parameters\": {\"type\": \"object\", \"properties\": {\"listing_platform\": {\"type\": \"string\", \"enum\": [\"链家\", \"安居客\", \"58同城\"]}, \"district\": {\"type\": \"string\"}, \"area\": {\"type\": \"string\"}, \"min_price\": {\"type\": \"integer\"}, \"max_price\": {\"type\": \"integer\"}, \"bedrooms\": {\"type\": \"string\"}, \"rental_type\": {\"type\": \"string\"}, \"decoration\": {\"type\": \"string\"}, \"orientation\": {\"type\": \"string\"}, \"elevator\": {\"type\": \"string\"}, \"min_area\": {\"type\": \"integer\"}, \"max_area\": {\"type\": \"integer\"}, \"property_type\": {\"type\": \"string\"}, \"subway_line\": {\"type\": \"string\"}, \"max_subway_dist\": {\"type\": \"integer\"}, \"subway_station\": {\"type\": \"string\"}, \"utilities_type\": {\"type\": \"string\"}, \"available_from_before\": {\"type\": \"string\"}, \"commute_to_xierqi_max\": {\"type\": \"integer\"}, \"sort_by\": {\"type\": \"string\"}, \"sort_order\": {\"type\": \"string\"}, \"page\": {\"type\": \"integer\"}, \"page_size\": {\"type\": \"integer\"}}, \"additionalProperties\": false}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_nearby_landmarks\", \"description\": \"GET /api/houses/nearby_landmarks\", \"parameters\": {\"type\": \"object\", \"properties\": {\"community\": {\"type\": \"string\"}, \"type\": {\"type\": \"string\"}, \"max_distance_m\": {\"type\": \"number\"}}, \"additionalProperties\": false, \"required\": [\"community\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_houses_nearby\", \"description\": \"GET /api/houses/nearby\", \"parameters\": {\"type\": \"object\", \"properties\": {\"landmark_id\": {\"type\": \"string\"}, \"max_distance\": {\"type\": \"number\"}, \"listing_platform\": {\"type\": \"string\", \"enum\": [\"链家\", \"安居客\", \"58同城\"]}, \"page\": {\"type\": \"integer\"}, \"page_size\": {\"type\": \"integer\"}}, \"additionalProperties\": false, \"required\": [\"landmark_id\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"get_house_stats\", \"description\": \"GET /api/houses/stats\", \"parameters\": {\"type\": \"object\", \"properties\": {}, \"additionalProperties\": false}}}, {\"type\": \"function\", \"function\": {\"name\": \"rent_house\", \"description\": \"POST /api/houses/{house_id}/rent\", \"parameters\": {\"type\": \"object\", \"properties\": {\"house_id\": {\"type\": \"string\"}, \"listing_platform\": {\"type\": \"string\", \"enum\": [\"链家\", \"安居客\", \"58同城\"]}}, \"additionalProperties\": false, \"required\": [\"house_id\", \"listing_platform\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"terminate_rental\", \"description\": \"POST /api/houses/{house_id}/terminate\", \"parameters\": {\"type\": \"object\", \"properties\": {\"house_id\": {\"type\": \"string\"}, \"listing_platform\": {\"type\": \"string\", \"enum\": [\"链家\", \"安居客\", \"58同城\"]}}, \"additionalProperties\": false, \"required\": [\"house_id\", \"listing_platform\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"take_offline\", \"description\": \"POST /api/houses/{house_id}/offline\", \"parameters\": {\"type\": \"object\", \"properties\": {\"house_id\": {\"type\": \"string\"}, \"listing_platform\": {\"type\": \"string\", \"enum\": [\"链家\", \"安居客\", \"58同城\"]}}, \"additionalProperties\": false, \"required\": [\"house_id\", \"listing_platform\"]}}}], \"stream\": false}"
+}
+LLM返回的输出
+{
+  "stage": "LLM返回的输出",
+  "trace_id": "692639e3b02a",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "Multi",
+  "user_id": "xxxx",
+  "event": "http.agent_io.llm.response",
+  "llm_stage": "plan",
+  "method": "POST",
+  "url": "http://xxxx:8888/v1/chat/completions",
+  "status_code": 200,
+  "response_content_type": "application/json",
+  "response_body": "{\"id\": \"chatcmpl-1772551155319238206\", \"object\": \"chat.completion\", \"created\": 1772551155, \"model\": \"afbe2428-c11b-4c86-ba15-f386f8f42242\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"\\n\\n\", \"tool_calls\": [{\"id\": \"call_BygRXmtl\", \"type\": \"function\", \"function\": {\"name\": \"get_house_by_id\", \"arguments\": \"{\\\"id\\\": \\\"HF_14\\\"}\"}}]}, \"finish_reason\": \"stop\", \"content_filter_results\": {\"hate\": {\"filtered\": false}, \"self_harm\": {\"filtered\": false}, \"sexual\": {\"filtered\": false}, \"violence\": {\"filtered\": false}, \"jailbreak\": {\"filtered\": false, \"detected\": false}, \"profanity\": {\"filtered\": false, \"detected\": false}}}], \"usage\": {\"prompt_tokens\": 2340, \"completion_tokens\": 345, \"total_tokens\": 2685, \"prompt_tokens_details\": null, \"completion_tokens_details\": null}, \"system_fingerprint\": \"\"}",
+  "duration_ms": 14251
+}
+agent最终返回用户
+{
+  "stage": "agent最终返回用户",
+  "trace_id": "-",
+  "session_id": "eval_xxxx_EV-003-0_1772551129000525987",
+  "case_type": "-",
+  "user_id": "-",
+  "event": "http.agent_io.response",
+  "method": "POST",
+  "path": "/api/v1/chat",
+  "query": "",
+  "status_code": 200,
+  "response_content_type": "application/json",
+  "response_body": "{\"session_id\": \"eval_xxxx_EV-003-0_1772551129000525987\", \"response\": {\"message\": \"请告诉我要看的房源（例如 HF_2001，或说第一套/这套）。\"}, \"status\": \"success\", \"tool_results\": [], \"timestamp\": 1772551161, \"duration_ms\": 14253}",
+  "duration_ms": 14253
+}

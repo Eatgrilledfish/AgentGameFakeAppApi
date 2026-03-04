@@ -48,6 +48,28 @@ STEP_HTTP = "STEP-00-HTTP"
 STARTUP_LANDMARK_PRELOAD_SESSION_ID = "startup_landmarks_preload"
 
 LLM_TIMEOUT = httpx.Timeout(60.0)
+_CN_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_CN_SMALL_UNITS = {"十": 10, "百": 100, "千": 1000}
+_TOOL_ARGUMENT_KEY_ALIASES: dict[str, dict[str, str]] = {
+    "get_house_by_id": {"id": "house_id"},
+    "get_house_listings": {"id": "house_id"},
+    "rent_house": {"id": "house_id"},
+    "terminate_rental": {"id": "house_id"},
+    "take_offline": {"id": "house_id"},
+}
 
 
 def _preview_http_body(raw_body: bytes, content_type: str | None, limit: int = 2000) -> str:
@@ -654,8 +676,9 @@ def _sanitize_llm_parse(parsed: dict[str, Any]) -> dict[str, Any]:
     sanitized_arguments: dict[str, Any] = {}
     op_specs = known_op_specs.get(operation_id, {})
     if isinstance(arguments, dict):
+        remapped_arguments = _apply_tool_argument_aliases(operation_id, arguments)
         if op_specs:
-            for key, value in arguments.items():
+            for key, value in remapped_arguments.items():
                 if not isinstance(key, str):
                     continue
                 spec = op_specs.get(key)
@@ -665,7 +688,7 @@ def _sanitize_llm_parse(parsed: dict[str, Any]) -> dict[str, Any]:
                 if coerced is not None:
                     sanitized_arguments[key] = coerced
         else:
-            sanitized_arguments = {k: v for k, v in arguments.items() if isinstance(k, str)}
+            sanitized_arguments = {k: v for k, v in remapped_arguments.items() if isinstance(k, str)}
 
     required = _load_tool_required_params().get(operation_id, set())
     for req_key in required:
@@ -679,6 +702,21 @@ def _sanitize_llm_parse(parsed: dict[str, Any]) -> dict[str, Any]:
         "arguments": sanitized_arguments,
     }
     return normalized
+
+
+def _apply_tool_argument_aliases(operation_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    alias_map = _TOOL_ARGUMENT_KEY_ALIASES.get(operation_id)
+    if not alias_map:
+        return arguments
+
+    remapped: dict[str, Any] = {}
+    for key, value in arguments.items():
+        if not isinstance(key, str):
+            continue
+        canonical = alias_map.get(key, key)
+        if canonical not in remapped:
+            remapped[canonical] = value
+    return remapped
 
 
 def _coerce_argument_value(value: Any, spec: dict[str, Any]) -> Any:
@@ -724,8 +762,27 @@ def _coerce_int(value: Any) -> int | None:
         stripped = value.strip()
         if not stripped:
             return None
+        compact = stripped.replace(",", "").replace("，", "")
+        if compact.endswith("元"):
+            compact = compact[:-1]
+        if compact.endswith("块"):
+            compact = compact[:-1]
+
+        unit_match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kK千wW万])", compact)
+        if unit_match:
+            base = float(unit_match.group(1))
+            unit = unit_match.group(2).lower()
+            if unit in {"k", "千"}:
+                return int(base * 1000)
+            if unit in {"w", "万"}:
+                return int(base * 10000)
+
+        cn_value = _coerce_cn_number(compact)
+        if cn_value is not None:
+            return cn_value
+
         try:
-            return int(float(stripped))
+            return int(float(compact))
         except ValueError:
             return None
     return None
@@ -777,6 +834,40 @@ def _normalize_enum_value(value: Any, enum_values: list[Any], param_name: Any) -
         if normalized.lower() == "anjuke" and "安居客" in enum_values:
             return "安居客"
     return value
+
+
+def _coerce_cn_number(text: str) -> int | None:
+    if not text or not re.search(r"[一二两三四五六七八九十百千万零〇]", text):
+        return None
+    if not re.fullmatch(r"[一二两三四五六七八九十百千万零〇]+", text):
+        return None
+
+    total = 0
+    section = 0
+    number = 0
+    for ch in text:
+        if ch in _CN_DIGITS:
+            number = _CN_DIGITS[ch]
+            continue
+        if ch in _CN_SMALL_UNITS:
+            unit = _CN_SMALL_UNITS[ch]
+            if number == 0:
+                number = 1
+            section += number * unit
+            number = 0
+            continue
+        if ch == "万":
+            section += number
+            if section == 0:
+                section = 1
+            total += section * 10000
+            section = 0
+            number = 0
+            continue
+        return None
+
+    result = total + section + number
+    return result if result > 0 else None
 
 
 def _build_llm_context_facts(state: Any) -> dict[str, Any]:
@@ -1004,6 +1095,9 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
         "4) 地点槽位：行政区/县/市/旗填district；商圈/片区/地标名填area。\n"
         "5) 闲聊/情绪表达且无需工具时禁止tool_calls，返回chat JSON。\n"
         "6) 有历史候选且用户补充偏好（如养宠/公园/看房方式/费用偏好）时，应视为继续筛选，优先search/compare而非chat。\n"
+        "6.1) 即使返回tool_calls，也必须在content里同时返回JSON对象（intent/tool_plan/hard/soft/assistant_reply/confidence）。\n"
+        "6.2) 预算表达出现“左右/上下/附近/约/大概”时，优先输出budget_min+budget_max区间，不只给单边上限。\n"
+        "6.3) 偏好尽量沉淀到soft.preferred_tags/soft.avoid_tags（如月付、房东直租、VR看房、中介费、费用包含）。\n"
         "7) rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\n"
         "chat返回格式：\n"
         '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},"hard":{},"soft":{},"assistant_reply":"...","confidence":0.6}\n'
@@ -1141,15 +1235,38 @@ async def _analyze_intent_with_llm(
         llm_stage="plan",
     )
     tool_plan = _extract_llm_tool_plan(response_data)
-    if isinstance(tool_plan, dict):
-        return _sanitize_llm_parse(tool_plan)
-
+    text_parse: dict[str, Any] | None = None
     llm_text = _extract_llm_text_content(response_data)
     if llm_text:
         parsed = _extract_json_object(llm_text)
-        if parsed:
-            return _sanitize_llm_parse(parsed)
+        if isinstance(parsed, dict):
+            text_parse = parsed
+
+    merged = _merge_llm_parse_candidates(tool_plan, text_parse)
+    if isinstance(merged, dict):
+        return _sanitize_llm_parse(merged)
     return None
+
+
+def _merge_llm_parse_candidates(
+    tool_parse: dict[str, Any] | None,
+    text_parse: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if tool_parse is None and text_parse is None:
+        return None
+    if tool_parse is None:
+        return text_parse
+    if text_parse is None:
+        return tool_parse
+
+    merged = dict(text_parse)
+    # Function-call arguments are the most executable form; keep them authoritative.
+    merged["tool_plan"] = tool_parse.get("tool_plan", merged.get("tool_plan"))
+    if "intent" not in merged and "intent" in tool_parse:
+        merged["intent"] = tool_parse["intent"]
+    if "confidence" not in merged and "confidence" in tool_parse:
+        merged["confidence"] = tool_parse["confidence"]
+    return merged
 
 
 def _build_llm_detail_reply_messages(
