@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -27,8 +28,10 @@ from app.schemas import (
     SearchSnapshot,
     SessionPhase,
     SessionState,
+    SessionHouseMemory,
     SoftPreferences,
     StructuredQuery,
+    TagNeed,
     TurnSummary,
 )
 
@@ -115,6 +118,54 @@ _TOOL_ARGUMENT_ALIASES = {
     "landmark_id": "landmark_id",
     "max_distance": "max_distance",
 }
+_HOUSE_INTENTS = {
+    IntentType.search,
+    IntentType.compare,
+    IntentType.house_detail,
+    IntentType.amenities,
+    IntentType.listings,
+    IntentType.rent_check,
+    IntentType.rent,
+}
+_TAG_CANCEL_TOKENS = ("无所谓", "不介意", "取消", "不用", "别管", "算了")
+_TAG_CANCEL_TOPICS: dict[str, tuple[str, ...]] = {
+    "物业": ("物业",),
+    "宽带": ("宽带", "网费", "网络"),
+    "暖气": ("暖气", "取暖"),
+    "宠物": ("宠物", "养狗", "养猫"),
+    "中介": ("中介",),
+    "VR": ("vr", "线上看房", "在线看房"),
+    "月付": ("月付",),
+    "电梯": ("电梯",),
+}
+_REJECT_SCORE_PENALTY = 10.0
+_TAG_FILTER_TOPK_THRESHOLD = 3
+_RELEVANT_LEXICON_LIMIT = 60
+_TAG_TOPIC_KEYWORDS = (
+    "宽带",
+    "物业",
+    "暖气",
+    "宠物",
+    "养狗",
+    "养猫",
+    "中介",
+    "月付",
+    "押一",
+    "押二",
+    "押三",
+    "电梯",
+    "地铁",
+    "看房",
+    "vr",
+    "ar",
+    "合同",
+    "停车",
+    "采光",
+    "朝南",
+    "通勤",
+    "民水民电",
+    "商水商电",
+)
 
 
 class DialogueManager:
@@ -203,10 +254,10 @@ class DialogueManager:
                 LOGGER,
                 "dialogue.intent.adjusted",
                 original_intent=IntentType.rent.value,
-                adjusted_intent=IntentType.house_detail.value,
+                adjusted_intent=IntentType.rent_check.value,
                 reason="rent_status_question_without_commitment",
             )
-            merged.intent = IntentType.house_detail
+            merged.intent = IntentType.rent_check
         log_event(
             LOGGER,
             "dialogue.nlu.done",
@@ -220,6 +271,8 @@ class DialogueManager:
             if merged.intent in {IntentType.rent, IntentType.terminate, IntentType.offline}:
                 log_event(LOGGER, "dialogue.action.detected", intent=merged.intent.value)
                 resp = await self._handle_action(merged, state)
+            elif merged.intent == IntentType.rent_check:
+                resp = await self._handle_rent_check(merged, state)
             elif merged.intent == IntentType.listings:
                 resp = await self._handle_listings_query(merged, state)
             elif merged.intent == IntentType.house_detail:
@@ -257,6 +310,7 @@ class DialogueManager:
             LOGGER.exception("Data source error")
             resp = InvokeResponse(text=f"接口调用失败：{exc}，请稍后重试。", candidates=[], debug={"response_kind": "error"})
 
+        resp.debug.setdefault("intent", merged.intent.value)
         self._remember_turn(state, request.message, resp, merged.intent)
         self.state_store.upsert(state)
         return resp
@@ -454,6 +508,7 @@ class DialogueManager:
 
         recommend = selected[0]
         state.focus_house_id = recommend.house_id
+        state.candidate_state.focus_house_id = recommend.house_id
         preferred = self._platform_from_text(recommend.listing_platform)
         if preferred is not None:
             state.focus_listing_platform = preferred
@@ -535,17 +590,47 @@ class DialogueManager:
 
     async def _handle_search(self, query: StructuredQuery, request: InvokeRequest, state: SessionState) -> InvokeResponse:
         state.phase = SessionPhase.searching
+        self._normalize_query(query, request.message)
+        self._refresh_session_req(state, query, request.message)
+
         plan = await self.planner.build_plan(query)
         log_event(LOGGER, "dialogue.plan.built", plan_type=plan.plan_type, landmark_id=plan.landmark_id)
         candidates = await self.planner.execute_plan(plan, query, request.case_type)
         log_event(LOGGER, "dialogue.plan.executed", candidate_count=len(candidates))
-        top = await self.ranker.rank_two_stage(candidates, query, max_output=self.max_output_candidates)
+
+        filtered = self._filter_candidates_with_hard_constraints(candidates, query)
+        if len(filtered) < 5:
+            expanded = self._expand_budget_and_refilter(candidates, query, filtered)
+            if expanded:
+                filtered = expanded
+
+        topk = self._pick_topk_candidates(filtered, query, limit=15)
+        self._update_tag_lexicon_memory(state, topk)
+        allowlist = {house.house_id for house in topk}
+        should_run_tag_filter = self._should_run_tag_semantic_filter(query, state, topk)
+        semantic = self._run_tag_semantic_filter(query, state, topk, allowlist=allowlist, enabled=should_run_tag_filter)
+
+        rank_query = query.model_copy(deep=True)
+        if rank_query.hard.district and "," in rank_query.hard.district:
+            # Multi-district has been applied in pre-filtering.
+            rank_query.hard.district = None
+        deterministic_ranked = await self.ranker.rank_two_stage(topk, rank_query, max_output=max(1, len(topk)))
+        fused_ranked, semantic_fusion = self._apply_semantic_decisions(
+            ranked_views=deterministic_ranked,
+            candidates=topk,
+            query=rank_query,
+            semantic=semantic,
+        )
+        top = fused_ranked[: self.max_output_candidates]
+        if not top:
+            top = deterministic_ranked[: self.max_output_candidates]
+            semantic_fusion["fallback"] = "deterministic_topk"
         log_event(LOGGER, "dialogue.rank.done", top_count=len(top))
 
         state.phase = SessionPhase.presenting
         state.confirmed_constraints = query.hard
         state.soft_preferences = query.soft
-        state.last_candidates = self._compress_candidates(candidates)
+        state.last_candidates = self._compress_candidates(topk)
         state.last_top5 = top
         self._remember_search_snapshot(state, request.message, query)
 
@@ -553,8 +638,541 @@ class DialogueManager:
             case_type=request.case_type,
             query=query,
             top_houses=top,
-            debug={"response_kind": "search", "plan": plan.plan_type, "candidate_count": len(candidates)},
+            debug={
+                "response_kind": "search",
+                "plan": plan.plan_type,
+                "candidate_count": len(candidates),
+                "filtered_count": len(filtered),
+                "topk_count": len(topk),
+                "semantic_filter": semantic,
+                "semantic_fusion": semantic_fusion,
+            },
         )
+
+    def _normalize_query(self, query: StructuredQuery, user_text: str) -> None:
+        hard = query.hard
+        if hard.district:
+            hard.district = self._normalize_district_value(hard.district)
+        if hard.layout:
+            hard.layout = self._normalize_layout_value(hard.layout)
+        if hard.budget_min is not None and hard.budget_max is not None and hard.budget_min > hard.budget_max:
+            hard.budget_min, hard.budget_max = hard.budget_max, hard.budget_min
+        if hard.budget_max is not None and hard.budget_min is None and any(token in user_text for token in ("左右", "上下", "附近", "约", "大概")):
+            hard.budget_min = int(max(0, round(hard.budget_max * 0.9)))
+            hard.budget_max = int(round(hard.budget_max * 1.1))
+        if hard.max_subway_dist is None and any(token in user_text for token in ("近地铁", "离地铁近", "靠近地铁")):
+            hard.max_subway_dist = 800
+        if query.soft.decoration == "精装修":
+            query.soft.decoration = "精装"
+        if query.soft.decoration == "简装修":
+            query.soft.decoration = "简装"
+        query.tag_need = self._normalize_tag_need(query.tag_need, query.soft)
+
+    @staticmethod
+    def _normalize_district_value(value: str) -> str | None:
+        tokens = [item.strip() for item in re.split(r"[、,，/和\s]+", value) if item.strip()]
+        if not tokens:
+            return None
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for token in tokens:
+            cleaned = token
+            for suffix in ("区", "县", "市"):
+                if cleaned.endswith(suffix) and len(cleaned) > len(suffix):
+                    cleaned = cleaned[: -len(suffix)]
+                    break
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            normalized.append(cleaned)
+        if not normalized:
+            return None
+        return ",".join(normalized)
+
+    @staticmethod
+    def _normalize_layout_value(value: str) -> str:
+        text = value.strip()
+        if not text:
+            return value
+        trans = str.maketrans({"一": "1", "二": "2", "两": "2", "三": "3", "四": "4", "五": "5"})
+        normalized = text.translate(trans)
+        range_match = re.search(r"([1-5])\s*[-~到至]\s*([1-5])\s*(?:居|室)", normalized)
+        if range_match:
+            a = int(range_match.group(1))
+            b = int(range_match.group(2))
+            low, high = sorted((a, b))
+            return f"{low},{high}居"
+        single_match = re.search(r"([1-9])\s*(?:居|室)", normalized)
+        if single_match:
+            return f"{single_match.group(1)}居"
+        return normalized
+
+    @staticmethod
+    def _normalize_tag_need(tag_need: TagNeed, soft: SoftPreferences) -> TagNeed:
+        must = [item.strip() for item in tag_need.must if isinstance(item, str) and item.strip()]
+        avoid = [item.strip() for item in tag_need.avoid if isinstance(item, str) and item.strip()]
+        prefer = [item.strip() for item in tag_need.prefer if isinstance(item, str) and item.strip()]
+        for item in soft.avoid_tags:
+            if item and item not in avoid:
+                avoid.append(item)
+        for item in soft.preferred_tags:
+            if item and item not in prefer:
+                prefer.append(item)
+        return TagNeed(must=must[:8], avoid=avoid[:12], prefer=prefer[:12])
+
+    def _refresh_session_req(self, state: SessionState, query: StructuredQuery, user_text: str) -> None:
+        merged_hard = HardConstraints.model_validate(state.req.hard.model_dump())
+        for key, value in query.hard.model_dump(exclude_none=True).items():
+            setattr(merged_hard, key, value)
+        state.req.hard = merged_hard
+
+        merged_tag_need = self._merge_tag_need_accumulated(
+            current=self._normalize_tag_need(query.tag_need, query.soft),
+            accumulated=state.req.soft.tag_need_accumulated,
+            user_text=user_text,
+        )
+        state.req.soft.tag_need_accumulated = merged_tag_need
+        notes = list(state.req.soft.notes)
+        for bucket in (merged_tag_need.must, merged_tag_need.avoid, merged_tag_need.prefer):
+            for item in bucket:
+                note = item.strip()
+                if note and note not in notes:
+                    notes.append(note)
+        state.req.soft.notes = notes[-30:]
+
+    def _merge_tag_need_accumulated(self, *, current: TagNeed, accumulated: TagNeed, user_text: str) -> TagNeed:
+        merged_must = list(dict.fromkeys([*accumulated.must, *current.must]))
+        merged_avoid = list(dict.fromkeys([*accumulated.avoid, *current.avoid]))
+        merged_prefer = list(dict.fromkeys([*accumulated.prefer, *current.prefer]))
+        cleaned = TagNeed(must=merged_must[:20], avoid=merged_avoid[:20], prefer=merged_prefer[:20])
+        return self._apply_tag_need_revocations(cleaned, user_text)
+
+    @staticmethod
+    def _apply_tag_need_revocations(tag_need: TagNeed, user_text: str) -> TagNeed:
+        text = (user_text or "").lower()
+        if not text or not any(token in text for token in _TAG_CANCEL_TOKENS):
+            return tag_need
+
+        revoked_keywords: set[str] = set()
+        for _, aliases in _TAG_CANCEL_TOPICS.items():
+            for alias in aliases:
+                if alias.lower() in text:
+                    revoked_keywords.update(a.lower() for a in aliases)
+                    break
+
+        if not revoked_keywords:
+            return tag_need
+
+        def keep(item: str) -> bool:
+            lowered = item.lower()
+            return not any(keyword in lowered for keyword in revoked_keywords)
+
+        return TagNeed(
+            must=[item for item in tag_need.must if keep(item)],
+            avoid=[item for item in tag_need.avoid if keep(item)],
+            prefer=[item for item in tag_need.prefer if keep(item)],
+        )
+
+    def _filter_candidates_with_hard_constraints(self, candidates: list[HouseLite], query: StructuredQuery) -> list[HouseLite]:
+        return [house for house in candidates if self._matches_hard_constraints(house, query)]
+
+    def _expand_budget_and_refilter(
+        self,
+        candidates: list[HouseLite],
+        query: StructuredQuery,
+        base_filtered: list[HouseLite],
+    ) -> list[HouseLite]:
+        if query.hard.budget_max is None:
+            return base_filtered
+        if len(base_filtered) >= 5:
+            return base_filtered
+
+        relaxed = list(base_filtered)
+        budget_max = query.hard.budget_max
+        for _ in range(2):
+            budget_max = max(int(round(budget_max * 1.1)), budget_max + 300)
+            query_copy = query.model_copy(deep=True)
+            query_copy.hard.budget_max = budget_max
+            rows = [house for house in candidates if self._matches_hard_constraints(house, query_copy)]
+            if len(rows) > len(relaxed):
+                relaxed = rows
+            if len(relaxed) >= 5:
+                break
+        return relaxed
+
+    def _matches_hard_constraints(self, house: HouseLite, query: StructuredQuery) -> bool:
+        hard = query.hard
+        if hard.budget_max is not None and house.rent is not None and house.rent > hard.budget_max:
+            return False
+        if hard.budget_min is not None and house.rent is not None and house.rent < hard.budget_min:
+            return False
+        if hard.max_subway_dist is not None and house.subway_distance is not None and house.subway_distance > hard.max_subway_dist:
+            return False
+        if hard.area_min is not None and house.area is not None and house.area < hard.area_min:
+            return False
+        if hard.district and house.district:
+            district_values = {item.strip() for item in hard.district.split(",") if item.strip()}
+            if district_values and house.district not in district_values:
+                return False
+        if hard.rent_type and house.layout:
+            if hard.rent_type == "整租" and any(token in house.layout for token in ("单间", "合租")):
+                return False
+            if hard.rent_type == "合租" and not any(token in house.layout for token in ("单间", "合租")):
+                return False
+        bedroom_tokens = self._extract_bedroom_tokens(hard.layout)
+        if bedroom_tokens and house.layout:
+            house_bedrooms = self._extract_bedroom_tokens(house.layout)
+            if house_bedrooms and not (house_bedrooms & bedroom_tokens):
+                return False
+        if query.soft.decoration and house.decoration:
+            if query.soft.decoration != house.decoration:
+                return False
+        if query.soft.elevator is not None and house.elevator is not None:
+            if query.soft.elevator != house.elevator:
+                return False
+        return True
+
+    @staticmethod
+    def _extract_bedroom_tokens(value: str | None) -> set[str]:
+        if not value:
+            return set()
+        normalized = value.translate(str.maketrans({"一": "1", "二": "2", "两": "2", "三": "3", "四": "4", "五": "5"}))
+        values = set(re.findall(r"([1-9])\s*(?:居|室)?", normalized))
+        return values
+
+    def _pick_topk_candidates(self, candidates: list[HouseLite], query: StructuredQuery, *, limit: int) -> list[HouseLite]:
+        ranked = sorted(candidates, key=lambda house: self._base_house_score(house, query), reverse=True)
+        return ranked[:limit]
+
+    def _base_house_score(self, house: HouseLite, query: StructuredQuery) -> float:
+        score = 0.0
+        if house.rent is not None:
+            score -= house.rent / 1000.0
+            if query.hard.budget_max is not None:
+                score += max(0.0, (query.hard.budget_max - house.rent) / max(query.hard.budget_max, 1))
+        if house.subway_distance is not None:
+            score += max(0.0, 2.0 - house.subway_distance / 1000.0)
+        if house.commute_to_xierqi_min is not None:
+            score += max(0.0, 2.0 - house.commute_to_xierqi_min / 60.0)
+        if house.area is not None:
+            score += min(2.0, house.area / 80.0)
+        if query.hard.rent_type == "整租" and house.layout and not any(token in house.layout for token in ("单间", "合租")):
+            score += 0.5
+        return score
+
+    def _update_tag_lexicon_memory(self, state: SessionState, candidates: list[HouseLite]) -> None:
+        if not state.reverse_lexicon and state.tag_lexicon:
+            state.reverse_lexicon = {tag: tid for tid, tag in state.tag_lexicon.items()}
+
+        for house in candidates:
+            tag_ids: list[str] = []
+            for raw_tag in house.tags:
+                if not isinstance(raw_tag, str):
+                    continue
+                tag = raw_tag.strip()
+                if not tag:
+                    continue
+                tid = state.reverse_lexicon.get(tag)
+                if tid is None:
+                    tid = f"t{len(state.tag_lexicon) + 1}"
+                    state.tag_lexicon[tid] = tag
+                    state.reverse_lexicon[tag] = tid
+                if tid not in tag_ids:
+                    tag_ids.append(tid)
+
+            state.houses[house.house_id] = SessionHouseMemory(
+                tag_ids=sorted(tag_ids),
+                price=house.rent,
+                subway_distance=house.subway_distance,
+                rental_type=self._infer_rental_type(house),
+                area_sqm=house.area,
+                updated_ts=int(time.time()),
+            )
+
+        house_ids = [house.house_id for house in candidates]
+        state.candidate_state.latest_house_ids = house_ids
+        if house_ids:
+            state.candidate_state.focus_house_id = house_ids[0]
+
+    @staticmethod
+    def _infer_rental_type(house: HouseLite) -> str | None:
+        if not house.layout:
+            return None
+        if any(token in house.layout for token in ("单间", "合租")):
+            return "合租"
+        return "整租"
+
+    def _should_run_tag_semantic_filter(self, query: StructuredQuery, state: SessionState, candidates: list[HouseLite]) -> bool:
+        if len(candidates) < _TAG_FILTER_TOPK_THRESHOLD:
+            return False
+        merged = self._build_merged_tag_need(query, state)
+        return bool(merged.must or merged.avoid or merged.prefer)
+
+    def _build_merged_tag_need(self, query: StructuredQuery, state: SessionState) -> TagNeed:
+        current = query.tag_need
+        accumulated = state.req.soft.tag_need_accumulated
+        return TagNeed(
+            must=list(dict.fromkeys([*accumulated.must, *current.must]))[:20],
+            avoid=list(dict.fromkeys([*accumulated.avoid, *current.avoid]))[:20],
+            prefer=list(dict.fromkeys([*accumulated.prefer, *current.prefer]))[:20],
+        )
+
+    def _run_tag_semantic_filter(
+        self,
+        query: StructuredQuery,
+        state: SessionState,
+        candidates: list[HouseLite],
+        *,
+        allowlist: set[str],
+        enabled: bool,
+    ) -> dict[str, Any]:
+        merged_need = self._build_merged_tag_need(query, state)
+        need_terms = [*merged_need.must, *merged_need.avoid, *merged_need.prefer]
+        if not enabled or not need_terms:
+            return {
+                "enabled": enabled,
+                "candidate_filter_ran": False,
+                "merged_tag_need": merged_need.model_dump(),
+                "relevant_tag_ids": [],
+                "selected": [house.house_id for house in candidates if house.house_id in allowlist],
+                "must_confirm": [],
+                "rejected": [],
+            }
+
+        relevant_tag_ids = self._tag_focus(need_terms, state.tag_lexicon)
+        relevant_lexicon = self._build_relevant_lexicon_for_candidate_filter(
+            relevant_tag_ids=relevant_tag_ids,
+            candidates=candidates,
+            state=state,
+            merged_need=merged_need,
+            limit=_RELEVANT_LEXICON_LIMIT,
+        )
+        if not relevant_lexicon:
+            return {
+                "enabled": True,
+                "candidate_filter_ran": False,
+                "merged_tag_need": merged_need.model_dump(),
+                "relevant_tag_ids": [],
+                "selected": [house.house_id for house in candidates if house.house_id in allowlist],
+                "must_confirm": [],
+                "rejected": [],
+            }
+
+        selected: list[str] = []
+        must_confirm: list[dict[str, str]] = []
+        rejected: list[dict[str, str]] = []
+        relevant_tag_id_set = set(relevant_lexicon.keys())
+
+        for house in candidates:
+            if house.house_id not in allowlist:
+                continue
+            memory = state.houses.get(house.house_id)
+            if memory is None:
+                selected.append(house.house_id)
+                continue
+            house_tag_ids = [tid for tid in memory.tag_ids if tid in relevant_tag_id_set][:20]
+            tag_texts = [relevant_lexicon.get(tid, "") for tid in house_tag_ids if relevant_lexicon.get(tid)]
+
+            avoid_hit = self._match_any_need(merged_need.avoid, tag_texts)
+            if avoid_hit is not None:
+                rejected.append({"house_id": house.house_id, "reason": f"命中避坑标签：{avoid_hit}"})
+                continue
+
+            must_hit = self._match_any_need(merged_need.must, tag_texts)
+            if merged_need.must and must_hit is None:
+                must_confirm.append({"house_id": house.house_id, "reason": "刚需标签未明确标注"})
+                continue
+
+            selected.append(house.house_id)
+
+        sanitized = self._sanitize_candidate_filter_output(
+            allowlist=allowlist,
+            selected=selected,
+            must_confirm=must_confirm,
+            rejected=rejected,
+        )
+        return {
+            "enabled": True,
+            "candidate_filter_ran": True,
+            "merged_tag_need": merged_need.model_dump(),
+            "relevant_tag_ids": list(relevant_lexicon.keys()),
+            "selected": sanitized["selected"],
+            "must_confirm": sanitized["must_confirm"],
+            "rejected": sanitized["rejected"],
+        }
+
+    def _build_relevant_lexicon_for_candidate_filter(
+        self,
+        *,
+        relevant_tag_ids: list[str],
+        candidates: list[HouseLite],
+        state: SessionState,
+        merged_need: TagNeed,
+        limit: int,
+    ) -> dict[str, str]:
+        if not relevant_tag_ids:
+            return {}
+        candidate_coverage: dict[str, int] = {tid: 0 for tid in relevant_tag_ids}
+        for house in candidates:
+            memory = state.houses.get(house.house_id)
+            if not memory:
+                continue
+            for tid in memory.tag_ids:
+                if tid in candidate_coverage:
+                    candidate_coverage[tid] += 1
+
+        need_terms = [*merged_need.must, *merged_need.avoid, *merged_need.prefer]
+        ranked = sorted(
+            [tid for tid in relevant_tag_ids if tid in state.tag_lexicon],
+            key=lambda tid: (
+                candidate_coverage.get(tid, 0),
+                max((SequenceMatcher(None, need, state.tag_lexicon.get(tid, "")).ratio() for need in need_terms), default=0.0),
+            ),
+            reverse=True,
+        )
+        clipped = ranked[:limit]
+        return {tid: state.tag_lexicon[tid] for tid in clipped}
+
+    @staticmethod
+    def _sanitize_candidate_filter_output(
+        *,
+        allowlist: set[str],
+        selected: list[str],
+        must_confirm: list[dict[str, str]],
+        rejected: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        selected_clean = [house_id for house_id in selected if house_id in allowlist]
+        must_confirm_clean = [
+            item
+            for item in must_confirm
+            if isinstance(item, dict) and isinstance(item.get("house_id"), str) and item["house_id"] in allowlist
+        ]
+        rejected_clean = [
+            item
+            for item in rejected
+            if isinstance(item, dict) and isinstance(item.get("house_id"), str) and item["house_id"] in allowlist
+        ]
+        return {"selected": selected_clean, "must_confirm": must_confirm_clean, "rejected": rejected_clean}
+
+    def _apply_semantic_decisions(
+        self,
+        *,
+        ranked_views: list[Any],
+        candidates: list[HouseLite],
+        query: StructuredQuery,
+        semantic: dict[str, Any],
+    ) -> tuple[list[Any], dict[str, Any]]:
+        if not ranked_views:
+            return ranked_views, {"applied": False}
+
+        merged_need = TagNeed.model_validate(semantic.get("merged_tag_need") or {"must": [], "avoid": [], "prefer": []})
+        selected_ids = set(str(item) for item in semantic.get("selected", []))
+        must_confirm_map: dict[str, str] = {}
+        for row in semantic.get("must_confirm", []):
+            if isinstance(row, dict):
+                house_id = row.get("house_id")
+                reason = row.get("reason")
+                if isinstance(house_id, str) and isinstance(reason, str):
+                    must_confirm_map[house_id] = reason
+        rejected_map: dict[str, str] = {}
+        for row in semantic.get("rejected", []):
+            if isinstance(row, dict):
+                house_id = row.get("house_id")
+                reason = row.get("reason")
+                if isinstance(house_id, str) and isinstance(reason, str):
+                    rejected_map[house_id] = reason
+
+        top2_ids = {view.house_id for view in ranked_views[:2]}
+        candidate_map = {house.house_id: house for house in candidates}
+        decisions: dict[str, dict[str, Any]] = {}
+
+        for view in ranked_views:
+            base_score = float(view.score or 0.0)
+            house_id = view.house_id
+            adjusted = base_score
+            action = "neutral"
+            reason = ""
+            hard_drop = False
+
+            if house_id in selected_ids:
+                adjusted += 15.0
+                action = "selected_boost"
+            if house_id in must_confirm_map:
+                adjusted += 3.0
+                action = "must_confirm_boost"
+                reason = must_confirm_map[house_id]
+
+            if house_id in rejected_map:
+                reject_reason = rejected_map[house_id]
+                is_hard = self._is_hard_conflict(reject_reason, merged_need)
+                protected_top2 = (
+                    house_id in top2_ids
+                    and house_id in candidate_map
+                    and self._matches_hard_constraints(candidate_map[house_id], query)
+                )
+                if is_hard and not protected_top2:
+                    hard_drop = True
+                    action = "rejected_drop"
+                    reason = reject_reason
+                else:
+                    adjusted -= _REJECT_SCORE_PENALTY
+                    action = "rejected_penalty"
+                    reason = reject_reason
+
+            decisions[house_id] = {
+                "base_score": round(base_score, 4),
+                "adjusted_score": round(adjusted, 4),
+                "action": action,
+                "reason": reason,
+                "hard_drop": hard_drop,
+                "needs_confirm": house_id in must_confirm_map,
+            }
+
+        kept = [view for view in ranked_views if not decisions.get(view.house_id, {}).get("hard_drop", False)]
+        kept = sorted(kept, key=lambda view: decisions.get(view.house_id, {}).get("adjusted_score", float(view.score or 0.0)), reverse=True)
+        return kept, {"applied": True, "decisions": decisions, "must_confirm": must_confirm_map}
+
+    def _is_hard_conflict(self, rejected_reason: str, tag_need: TagNeed) -> bool:
+        reason = re.sub(r"[^\w\u4e00-\u9fa5]+", "", rejected_reason.lower())
+        if not reason:
+            return False
+        for item in tag_need.avoid:
+            normalized = re.sub(r"[^\w\u4e00-\u9fa5]+", "", item.lower())
+            if normalized and (normalized in reason or reason in normalized):
+                return True
+        for item in tag_need.must:
+            normalized = re.sub(r"[^\w\u4e00-\u9fa5]+", "", item.lower())
+            if normalized and (normalized in reason or reason in normalized):
+                return True
+        return False
+
+    def _tag_focus(self, needs: list[str], lexicon: dict[str, str]) -> list[str]:
+        picked: list[str] = []
+        for tid, tag in lexicon.items():
+            if any(self._semantic_match(need, tag) for need in needs):
+                picked.append(tid)
+        return picked
+
+    def _match_any_need(self, needs: list[str], tags: list[str]) -> str | None:
+        for need in needs:
+            for tag in tags:
+                if self._semantic_match(need, tag):
+                    return tag
+        return None
+
+    @staticmethod
+    def _semantic_match(need: str, tag: str) -> bool:
+        left = re.sub(r"[^\w\u4e00-\u9fa5]+", "", need.lower())
+        right = re.sub(r"[^\w\u4e00-\u9fa5]+", "", tag.lower())
+        if not left or not right:
+            return False
+        if left in right or right in left:
+            return True
+        # Prefer explicit topic overlap to avoid fuzzy-ratio misses such as "宽带包含" vs "宽带标签X".
+        for keyword in _TAG_TOPIC_KEYWORDS:
+            if keyword in left and keyword in right:
+                return True
+        return SequenceMatcher(None, left, right).ratio() >= 0.54
 
     async def _init_session_data(self, state: SessionState) -> None:
         try:
@@ -587,6 +1205,7 @@ class DialogueManager:
         listings = await self._load_listings(house_id)
         preferred_platform = self._choose_preferred_platform(listings) or self._platform_from_text(house.listing_platform)
         state.focus_house_id = house_id
+        state.candidate_state.focus_house_id = house_id
         if preferred_platform is not None:
             state.focus_listing_platform = preferred_platform
 
@@ -650,6 +1269,7 @@ class DialogueManager:
 
         if referenced:
             state.focus_house_id = referenced[0]
+            state.candidate_state.focus_house_id = referenced[0]
 
         record_tool_result(
             name="SESSION_TOP5_SUBWAY_DISTANCE",
@@ -693,12 +1313,14 @@ class DialogueManager:
         listings = await self._load_listings(house_id)
         if not listings:
             state.focus_house_id = house_id
+            state.candidate_state.focus_house_id = house_id
             return InvokeResponse(
                 text=f"{house_id} 暂未查到平台挂牌记录。",
                 debug={"response_kind": "detail", "referenced_house_ids": [house_id]},
             )
 
         state.focus_house_id = house_id
+        state.candidate_state.focus_house_id = house_id
         preferred = self._choose_preferred_platform(listings)
         if preferred is not None:
             state.focus_listing_platform = preferred
@@ -727,12 +1349,51 @@ class DialogueManager:
             debug={"response_kind": "detail", "referenced_house_ids": [house_id]},
         )
 
+    async def _handle_rent_check(self, query: StructuredQuery, state: SessionState) -> InvokeResponse:
+        house_id = query.hard.house_id or state.focus_house_id or state.candidate_state.focus_house_id
+        if not house_id:
+            return InvokeResponse(
+                text="请告诉我要确认的房源（例如 HF_2001，或说第一套/这套）。",
+                debug={"response_kind": "detail"},
+            )
+        allowlist = self._build_action_house_allowlist(state)
+        if allowlist and house_id not in allowlist:
+            fallback = [hid for hid in state.candidate_state.latest_house_ids if hid in allowlist][:5]
+            return InvokeResponse(
+                text=f"未在当前候选中找到 {house_id}，请从最近推荐房源中选择。",
+                debug={"response_kind": "detail", "referenced_house_ids": fallback},
+            )
+
+        detail = await self._load_house_detail(house_id)
+        if detail is None:
+            return InvokeResponse(
+                text=f"未找到房源 {house_id} 的状态，请确认 house_id 是否正确。",
+                debug={"response_kind": "detail", "referenced_house_ids": [house_id]},
+            )
+
+        listings = await self._load_listings(house_id)
+        listing_status = next((row.status for row in listings if row.status), None)
+        status = detail.status or listing_status or "状态未知"
+        state.focus_house_id = house_id
+        state.candidate_state.focus_house_id = house_id
+        return InvokeResponse(
+            text=f"{house_id} 当前状态：{status}。",
+            debug={"response_kind": "detail", "referenced_house_ids": [house_id]},
+        )
+
     async def _handle_action(self, query: StructuredQuery, state: SessionState) -> InvokeResponse:
-        house_id = query.hard.house_id or state.focus_house_id
+        house_id = query.hard.house_id or state.focus_house_id or state.candidate_state.focus_house_id
         if not house_id:
             return InvokeResponse(
                 text="请提供要操作的房源 house_id（例如 HF_2001），或先说“租第一套”。",
                 debug={"response_kind": "action"},
+            )
+        allowlist = self._build_action_house_allowlist(state)
+        if allowlist and house_id not in allowlist:
+            fallback = [hid for hid in state.candidate_state.latest_house_ids if hid in allowlist][:5]
+            return InvokeResponse(
+                text=f"未在当前候选中找到 {house_id}，请先指定最近推荐的房源再操作。",
+                debug={"response_kind": "action", "referenced_house_ids": fallback},
             )
 
         requested_platform = query.hard.listing_platform
@@ -786,12 +1447,29 @@ class DialogueManager:
         self.cache.invalidate_query_cache()
         state.phase = SessionPhase.presenting
         state.focus_house_id = house_id
+        state.candidate_state.focus_house_id = house_id
         state.focus_listing_platform = platform
         log_event(LOGGER, "dialogue.action.done", action=action, result=result)
         return InvokeResponse(
             text=f"{message}：{house_id}（{platform.value}）。",
             debug={"response_kind": "action", "action_result": result, "referenced_house_ids": [house_id]},
         )
+
+    @staticmethod
+    def _build_action_house_allowlist(state: SessionState) -> set[str]:
+        allowlist = {
+            house_id
+            for house_id in state.candidate_state.latest_house_ids
+            if isinstance(house_id, str) and house_id
+        }
+        # Keep current focus actionable even when user pivots back to an earlier recommended house.
+        if isinstance(state.candidate_state.focus_house_id, str) and state.candidate_state.focus_house_id:
+            allowlist.add(state.candidate_state.focus_house_id)
+        if isinstance(state.focus_house_id, str) and state.focus_house_id:
+            allowlist.add(state.focus_house_id)
+        if not allowlist and state.last_top5:
+            allowlist = {item.house_id for item in state.last_top5 if isinstance(item.house_id, str) and item.house_id}
+        return allowlist
 
     def _resolve_rent_platform_and_status(
         self,
@@ -857,6 +1535,7 @@ class DialogueManager:
     def _has_actionable_preferences(query: StructuredQuery) -> bool:
         hard = query.hard
         soft = query.soft
+        tag_need = query.tag_need
         return any(
             [
                 hard.layout,
@@ -876,6 +1555,9 @@ class DialogueManager:
                 soft.prefer_spacious,
                 soft.prioritize_subway_distance,
                 soft.prioritize_commute,
+                bool(tag_need.must),
+                bool(tag_need.avoid),
+                bool(tag_need.prefer),
             ]
         )
 
@@ -1072,6 +1754,27 @@ class DialogueManager:
         DialogueManager._infer_preferences_from_user_text(user_text, hard, soft)
         state.confirmed_constraints = hard
         state.soft_preferences = soft
+        state.req.hard = HardConstraints.model_validate(hard.model_dump())
+        merged = DialogueManager._merge_tag_need_for_chat_memory(
+            current=TagNeed(must=[], avoid=soft.avoid_tags, prefer=soft.preferred_tags),
+            accumulated=state.req.soft.tag_need_accumulated,
+            user_text=user_text,
+        )
+        state.req.soft.tag_need_accumulated = merged
+        notes = list(state.req.soft.notes)
+        for item in [*merged.must, *merged.avoid, *merged.prefer]:
+            if item and item not in notes:
+                notes.append(item)
+        state.req.soft.notes = notes[-30:]
+
+    @staticmethod
+    def _merge_tag_need_for_chat_memory(*, current: TagNeed, accumulated: TagNeed, user_text: str) -> TagNeed:
+        merged = TagNeed(
+            must=list(dict.fromkeys([*accumulated.must, *current.must]))[:20],
+            avoid=list(dict.fromkeys([*accumulated.avoid, *current.avoid]))[:20],
+            prefer=list(dict.fromkeys([*accumulated.prefer, *current.prefer]))[:20],
+        )
+        return DialogueManager._apply_tag_need_revocations(merged, user_text)
 
     @staticmethod
     def _infer_preferences_from_user_text(user_text: str, hard: HardConstraints, soft: SoftPreferences) -> None:
@@ -1166,8 +1869,30 @@ class DialogueManager:
                         continue
                 setattr(soft, field_name, value)
 
+        merged_tag_need = TagNeed.model_validate(query.tag_need.model_dump())
+        for item in soft.preferred_tags:
+            if item and item not in merged_tag_need.prefer:
+                merged_tag_need.prefer.append(item)
+        for item in soft.avoid_tags:
+            if item and item not in merged_tag_need.avoid:
+                merged_tag_need.avoid.append(item)
+        for item in state.req.soft.tag_need_accumulated.must:
+            if item and item not in merged_tag_need.must:
+                merged_tag_need.must.append(item)
+        for item in state.req.soft.tag_need_accumulated.avoid:
+            if item and item not in merged_tag_need.avoid:
+                merged_tag_need.avoid.append(item)
+        for item in state.req.soft.tag_need_accumulated.prefer:
+            if item and item not in merged_tag_need.prefer:
+                merged_tag_need.prefer.append(item)
+
         query.hard = hard
         query.soft = soft
+        query.tag_need = TagNeed(
+            must=merged_tag_need.must[:20],
+            avoid=merged_tag_need.avoid[:20],
+            prefer=merged_tag_need.prefer[:20],
+        )
         return query
 
     def _apply_llm_parse(self, query: StructuredQuery, llm_parse: Any) -> StructuredQuery:
@@ -1201,6 +1926,10 @@ class DialogueManager:
         soft_raw = llm_parse.get("soft")
         if isinstance(soft_raw, dict):
             self._apply_soft_overrides(query.soft, soft_raw)
+
+        tag_need_raw = llm_parse.get("tag_need")
+        if isinstance(tag_need_raw, dict):
+            self._apply_tag_need_overrides(query.tag_need, tag_need_raw)
 
         return query
 
@@ -1440,6 +2169,23 @@ class DialogueManager:
                         continue
                     setattr(soft, key, cleaned)
 
+    @staticmethod
+    def _apply_tag_need_overrides(tag_need: TagNeed, payload: dict[str, Any]) -> None:
+        for key in ("must", "avoid", "prefer"):
+            value = payload.get(key)
+            if value is None:
+                continue
+            if isinstance(value, list):
+                tokens = [str(item).strip() for item in value if isinstance(item, str) and item.strip()]
+            elif isinstance(value, str):
+                tokens = [item.strip() for item in re.split(r"[,，/、\s]+", value) if item.strip()]
+            else:
+                tokens = []
+            if not tokens:
+                continue
+            existing = getattr(tag_need, key)
+            setattr(tag_need, key, sorted(set(existing + tokens)))
+
     def _resolve_house_id(self, user_text: str, query: StructuredQuery, state: SessionState) -> str | None:
         if query.hard.house_id:
             return query.hard.house_id
@@ -1466,6 +2212,8 @@ class DialogueManager:
                 return snapshot.house_ids[0]
 
         if any(word in user_text for word in _HOUSE_REF_WORDS):
+            if state.candidate_state.focus_house_id:
+                return state.candidate_state.focus_house_id
             if state.focus_house_id:
                 return state.focus_house_id
             latest_ids = self._latest_house_ids(state)
@@ -1558,6 +2306,8 @@ class DialogueManager:
 
     @staticmethod
     def _latest_house_ids(state: SessionState) -> list[str]:
+        if state.candidate_state.latest_house_ids:
+            return state.candidate_state.latest_house_ids
         if state.search_history and state.search_history[-1].house_ids:
             return state.search_history[-1].house_ids
         return [item.house_id for item in state.last_top5]
@@ -1576,6 +2326,8 @@ class DialogueManager:
             state.search_history.append(snapshot)
             state.search_history = state.search_history[-8:]
             state.focus_house_id = house_ids[0]
+            state.candidate_state.latest_house_ids = house_ids
+            state.candidate_state.focus_house_id = house_ids[0]
             platform = self._platform_from_text(state.last_top5[0].listing_platform if state.last_top5 else None)
             if platform is not None:
                 state.focus_listing_platform = platform

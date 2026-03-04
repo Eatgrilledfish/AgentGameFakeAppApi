@@ -946,6 +946,23 @@ def _build_llm_context_facts(state: Any) -> dict[str, Any]:
         if picked_soft:
             facts["soft_preferences"] = picked_soft
 
+    req_state = getattr(state, "req", None)
+    if req_state is not None and hasattr(req_state, "model_dump"):
+        req_dict = req_state.model_dump(exclude_none=True)
+        if isinstance(req_dict, dict):
+            facts["req"] = req_dict
+
+    candidate_state = getattr(state, "candidate_state", None)
+    if candidate_state is not None and hasattr(candidate_state, "model_dump"):
+        candidate_dict = candidate_state.model_dump(exclude_none=True)
+        if isinstance(candidate_dict, dict) and candidate_dict:
+            facts["candidate_state"] = candidate_dict
+
+    tag_lexicon = getattr(state, "tag_lexicon", None)
+    if isinstance(tag_lexicon, dict) and tag_lexicon:
+        compact_lexicon = dict(list(tag_lexicon.items())[:40])
+        facts["tag_lexicon"] = compact_lexicon
+
     search_history = getattr(state, "search_history", None)
     if isinstance(search_history, list) and search_history:
         recent_searches: list[dict[str, Any]] = []
@@ -1081,6 +1098,82 @@ def _pick_key_tags_for_llm(tags: list[Any], *, limit: int = 4) -> list[str]:
     return picked
 
 
+def _should_skip_llm_nlu(message: str) -> bool:
+    text = (message or "").strip().lower()
+    if not text:
+        return True
+    if re.fullmatch(r"(你好|您好|hi|hello|hey|哈喽|在吗|在不在)[!！。,. ]*", text):
+        return True
+    if len(text) <= 8 and any(token in text for token in ("谢谢", "好的", "收到", "明白")):
+        return True
+    return False
+
+
+def _collect_house_ids_from_state(state: Any) -> set[str]:
+    house_ids: set[str] = set()
+    if state is None:
+        return house_ids
+
+    candidate_state = getattr(state, "candidate_state", None)
+    latest_ids = getattr(candidate_state, "latest_house_ids", None)
+    if isinstance(latest_ids, list) and latest_ids:
+        for house_id in latest_ids:
+            if isinstance(house_id, str) and house_id:
+                house_ids.add(house_id)
+        return house_ids
+
+    last_top5 = getattr(state, "last_top5", None)
+    if isinstance(last_top5, list):
+        for item in last_top5[:5]:
+            house_id = getattr(item, "house_id", None)
+            if isinstance(house_id, str) and house_id:
+                house_ids.add(house_id)
+    return house_ids
+
+
+def _collect_house_ids_from_tool_results(tool_results: list[dict[str, Any]]) -> set[str]:
+    found: set[str] = set()
+    for row in tool_results:
+        if not isinstance(row, dict) or row.get("success") is not True:
+            continue
+        output = row.get("output")
+        _walk_house_ids(output, found)
+    return found
+
+
+def _walk_house_ids(payload: Any, found: set[str]) -> None:
+    if isinstance(payload, dict):
+        house_id = payload.get("house_id")
+        if isinstance(house_id, str) and house_id:
+            found.add(house_id)
+        for value in payload.values():
+            _walk_house_ids(value, found)
+        return
+    if isinstance(payload, list):
+        for item in payload:
+            _walk_house_ids(item, found)
+
+
+_HOUSE_CONTEXT_REF_TOKENS = ("这套", "第一套", "第二套", "上面那个", "刚才推荐的")
+_HOUSE_CONTEXT_ACTION_TOKENS = ("租", "能租", "看房", "vr", "带宠物", "宽带", "暖气", "物业", "押", "费用")
+
+
+def _is_housing_context_inquiry(message: str, state: Any) -> bool:
+    candidate_state = getattr(state, "candidate_state", None)
+    latest_ids = getattr(candidate_state, "latest_house_ids", None)
+    if not isinstance(latest_ids, list) or not latest_ids:
+        return False
+
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+    if any(token in text for token in _HOUSE_CONTEXT_REF_TOKENS):
+        return True
+    if any(token in text for token in _HOUSE_CONTEXT_ACTION_TOKENS):
+        return True
+    return False
+
+
 def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str, Any] | None = None) -> list[dict[str, str]]:
     summary_text = summary[:500] if summary else ""
     context_json = json.dumps(context_facts or {}, ensure_ascii=False)
@@ -1095,12 +1188,13 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
         "4) 地点槽位：行政区/县/市/旗填district；商圈/片区/地标名填area。\n"
         "5) 闲聊/情绪表达且无需工具时禁止tool_calls，返回chat JSON。\n"
         "6) 有历史候选且用户补充偏好（如养宠/公园/看房方式/费用偏好）时，应视为继续筛选，优先search/compare而非chat。\n"
-        "6.1) 即使返回tool_calls，也必须在content里同时返回JSON对象（intent/tool_plan/hard/soft/assistant_reply/confidence）。\n"
+        "6.1) 即使返回tool_calls，也必须在content里同时返回JSON对象（intent/tool_plan/hard/soft/tag_need/assistant_reply/confidence）。\n"
         "6.2) 预算表达出现“左右/上下/附近/约/大概”时，优先输出budget_min+budget_max区间，不只给单边上限。\n"
         "6.3) 偏好尽量沉淀到soft.preferred_tags/soft.avoid_tags（如月付、房东直租、VR看房、中介费、费用包含）。\n"
+        "6.4) 用户在问“这套可租吗/我可以租吗/能租吗”时，intent应为rent_check，不要直接给rent。\n"
         "7) rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\n"
         "chat返回格式：\n"
-        '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},"hard":{},"soft":{},"assistant_reply":"...","confidence":0.6}\n'
+        '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},"hard":{},"soft":{},"tag_need":{"must":[],"avoid":[],"prefer":[]},"assistant_reply":"...","confidence":0.6}\n'
         f"可用operationId：{available_tools}\n"
         f"会话摘要：{summary_text}\n"
         f"上下文事实：{context_json}\n"
@@ -1601,38 +1695,41 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                 if hasattr(service, "rough_token_estimate")
                 else max(1, int(len(prompt_basis) / 2))
             )
-            try:
-                http_client: httpx.AsyncClient = app.state.http_client
-                llm_parse = await _analyze_intent_with_llm(
-                    http_client,
-                    model_ip=req.model_ip,
-                    session_id=req.session_id,
-                    message=req.message,
-                    summary=state_summary,
-                    context_facts=context_facts,
-                )
-                if llm_parse:
-                    invoke_meta["llm_parse"] = llm_parse
+            if not _should_skip_llm_nlu(req.message):
+                try:
+                    http_client: httpx.AsyncClient = app.state.http_client
+                    llm_parse = await _analyze_intent_with_llm(
+                        http_client,
+                        model_ip=req.model_ip,
+                        session_id=req.session_id,
+                        message=req.message,
+                        summary=state_summary,
+                        context_facts=context_facts,
+                    )
+                    if llm_parse:
+                        invoke_meta["llm_parse"] = llm_parse
+                        log_event(
+                            LOGGER,
+                            "chat.llm_nlu.applied",
+                            step=STEP_LLM_NLU,
+                            llm_parse=llm_parse,
+                        )
+                        if hasattr(service, "record_llm_fallback_usage"):
+                            completion_tokens = (
+                                service.rough_token_estimate(json.dumps(llm_parse, ensure_ascii=False))
+                                if hasattr(service, "rough_token_estimate")
+                                else max(1, int(len(json.dumps(llm_parse, ensure_ascii=False)) / 2))
+                            )
+                            service.record_llm_fallback_usage(req.session_id, nlu_prompt_tokens + completion_tokens)
+                except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
                     log_event(
                         LOGGER,
-                        "chat.llm_nlu.applied",
+                        "chat.llm_nlu.failed",
                         step=STEP_LLM_NLU,
-                        llm_parse=llm_parse,
+                        error=str(exc),
                     )
-                    if hasattr(service, "record_llm_fallback_usage"):
-                        completion_tokens = (
-                            service.rough_token_estimate(json.dumps(llm_parse, ensure_ascii=False))
-                            if hasattr(service, "rough_token_estimate")
-                            else max(1, int(len(json.dumps(llm_parse, ensure_ascii=False)) / 2))
-                        )
-                        service.record_llm_fallback_usage(req.session_id, nlu_prompt_tokens + completion_tokens)
-            except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
-                log_event(
-                    LOGGER,
-                    "chat.llm_nlu.failed",
-                    step=STEP_LLM_NLU,
-                    error=str(exc),
-                )
+            else:
+                log_event(LOGGER, "chat.llm_nlu.skipped", step=STEP_LLM_NLU, reason="simple_chat_message")
 
             log_event(
                 LOGGER,
@@ -1664,15 +1761,8 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             tool_results = get_tool_results()
             latest_state = service.state_store.get(req.session_id) if hasattr(service, "state_store") else None
             respond_context_facts = _build_llm_context_facts(latest_state) if latest_state is not None else context_facts
-            if response_kind == "search" or bool(invoke_resp.candidates):
-                houses = [item.house_id for item in invoke_resp.candidates]
-                response_payload: dict[str, Any] = {
-                    "message": "为您找到以下符合条件的房源：",
-                    "houses": houses,
-                }
-                if not houses:
-                    response_payload["message"] = invoke_resp.text
-            elif response_kind in {"detail", "action"} and tool_results:
+            intent_value = str(invoke_resp.debug.get("intent", "")).strip().lower()
+            if response_kind in {"detail", "action"} and tool_results:
                 respond_prompt_basis = (
                     req.message
                     + invoke_resp.text
@@ -1716,7 +1806,6 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                         step=STEP_LLM_RESPOND,
                         error=str(exc),
                     )
-                response_payload = {"message": output_text}
             elif response_kind == "chat":
                 assistant_reply = llm_parse.get("assistant_reply")
                 if isinstance(assistant_reply, str) and assistant_reply.strip():
@@ -1727,7 +1816,40 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                         step=STEP_LLM_NLU,
                         llm_output=preview_text(output_text, limit=300),
                     )
-                response_payload = {"message": output_text}
+
+            house_intents = {"search", "compare", "house_detail", "amenities", "listings", "rent_check", "rent"}
+            context_housing_inquiry = _is_housing_context_inquiry(req.message, latest_state)
+            should_attach_houses = (
+                bool(invoke_resp.candidates)
+                or response_kind == "search"
+                or intent_value in house_intents
+                or context_housing_inquiry
+            )
+            if should_attach_houses:
+                houses: list[str] = []
+                seen_house_ids: set[str] = set()
+                known_house_ids = _collect_house_ids_from_state(latest_state) | _collect_house_ids_from_tool_results(tool_results)
+                for item in invoke_resp.candidates:
+                    house_id = getattr(item, "house_id", None)
+                    if isinstance(house_id, str) and house_id and house_id not in seen_house_ids:
+                        seen_house_ids.add(house_id)
+                        known_house_ids.add(house_id)
+                        houses.append(house_id)
+                for ref in invoke_resp.debug.get("referenced_house_ids", []):
+                    if isinstance(ref, str) and ref and ref in known_house_ids and ref not in seen_house_ids:
+                        seen_house_ids.add(ref)
+                        houses.append(ref)
+                if not houses and latest_state is not None and (
+                    intent_value in {"rent_check", "rent", "house_detail", "listings", "amenities"} or context_housing_inquiry
+                ):
+                    focus_house_id = getattr(getattr(latest_state, "candidate_state", None), "focus_house_id", None)
+                    if isinstance(focus_house_id, str) and focus_house_id and focus_house_id in known_house_ids:
+                        houses.append(focus_house_id)
+                if not houses and latest_state is not None and context_housing_inquiry:
+                    latest_ids = getattr(getattr(latest_state, "candidate_state", None), "latest_house_ids", None)
+                    if isinstance(latest_ids, list):
+                        houses = [hid for hid in latest_ids if isinstance(hid, str) and hid][:5]
+                response_payload: dict[str, Any] = {"message": output_text, "houses": houses}
             else:
                 response_payload = {"message": output_text}
 

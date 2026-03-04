@@ -1073,3 +1073,282 @@ async def test_dialogue_multi_flow_search_compare_then_rent() -> None:
     )
     assert "已提交租房操作" in rent_resp.text
     assert houses.rent_calls[-1][0] == best_house_id
+
+
+@pytest.mark.asyncio
+async def test_dialogue_search_updates_session_tag_lexicon_memory() -> None:
+    class TaggedPlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            self.executed_queries.append(query.model_copy(deep=True))
+            _ = plan
+            _ = case_type
+            return [
+                HouseLite(
+                    house_id="HF_TAG_1",
+                    rent=3800,
+                    layout="2居1厅1卫",
+                    district="大兴",
+                    community="黄村小区",
+                    subway_distance=780,
+                    commute_to_xierqi_min=65,
+                    status="可租",
+                    tags=["免宽带费", "月付", "物业态度差"],
+                )
+            ]
+
+    dialogue, state, _, _ = _build_dialogue(planner=TaggedPlanner(), houses_client=DummyHousesClient())
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-tag-memory",
+            case_type=CaseType.single,
+            message="帮我找大兴区两居，预算4000以内，我希望宽带包含，不要物业态度差",
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    assert resp.debug["response_kind"] == "search"
+    assert state.tag_lexicon
+    assert "HF_TAG_1" in state.houses
+    assert state.houses["HF_TAG_1"].tag_ids
+    assert state.candidate_state.latest_house_ids == ["HF_TAG_1"]
+    assert state.candidate_state.focus_house_id == "HF_TAG_1"
+    assert any("宽带" in note or "物业" in note for note in state.req.soft.notes)
+
+
+@pytest.mark.asyncio
+async def test_dialogue_rejected_does_not_hard_drop_top2_when_conflict_not_certain() -> None:
+    class ConflictPlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            self.executed_queries.append(query.model_copy(deep=True))
+            _ = plan
+            _ = case_type
+            return [
+                HouseLite(
+                    house_id="HF_TOP1",
+                    rent=3600,
+                    layout="2居1厅1卫",
+                    district="大兴",
+                    subway_distance=500,
+                    commute_to_xierqi_min=40,
+                    status="可租",
+                    tags=["物业态度差", "月付"],
+                ),
+                HouseLite(
+                    house_id="HF_TOP2",
+                    rent=3650,
+                    layout="2居1厅1卫",
+                    district="大兴",
+                    subway_distance=520,
+                    commute_to_xierqi_min=42,
+                    status="可租",
+                    tags=["月付"],
+                ),
+                HouseLite(
+                    house_id="HF_TOP3",
+                    rent=3800,
+                    layout="2居1厅1卫",
+                    district="大兴",
+                    subway_distance=600,
+                    commute_to_xierqi_min=50,
+                    status="可租",
+                    tags=["月付"],
+                ),
+            ]
+
+    dialogue, state, _, _ = _build_dialogue(planner=ConflictPlanner(), houses_client=DummyHousesClient())
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-reject-protect",
+            case_type=CaseType.single,
+            message="帮我找大兴两居，预算4000以内，不要物业态度差，最好月付",
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    assert resp.debug["response_kind"] == "search"
+    decisions = resp.debug["semantic_fusion"]["decisions"]
+    assert decisions["HF_TOP1"]["action"] in {"rejected_penalty", "selected_boost", "must_confirm_boost"}
+    assert "HF_TOP1" in [item.house_id for item in resp.candidates]
+
+
+@pytest.mark.asyncio
+async def test_dialogue_rejected_hard_conflict_can_drop_non_top2() -> None:
+    class ConflictPlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            self.executed_queries.append(query.model_copy(deep=True))
+            _ = plan
+            _ = case_type
+            return [
+                HouseLite(house_id="HF_A", rent=3600, layout="2居1厅1卫", district="大兴", subway_distance=450, commute_to_xierqi_min=35, status="可租", tags=["月付"]),
+                HouseLite(house_id="HF_B", rent=3650, layout="2居1厅1卫", district="大兴", subway_distance=500, commute_to_xierqi_min=40, status="可租", tags=["月付"]),
+                HouseLite(house_id="HF_C", rent=3900, layout="2居1厅1卫", district="大兴", subway_distance=700, commute_to_xierqi_min=60, status="可租", tags=["物业态度差"]),
+                HouseLite(house_id="HF_D", rent=3950, layout="2居1厅1卫", district="大兴", subway_distance=750, commute_to_xierqi_min=65, status="可租", tags=["月付"]),
+            ]
+
+    dialogue, state, _, _ = _build_dialogue(planner=ConflictPlanner(), houses_client=DummyHousesClient())
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-reject-drop",
+            case_type=CaseType.single,
+            message="帮我找大兴两居，预算4000以内，不要物业态度差",
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    decisions = resp.debug["semantic_fusion"]["decisions"]
+    assert decisions["HF_C"]["action"] == "rejected_drop"
+    assert "HF_C" not in [item.house_id for item in resp.candidates]
+
+
+@pytest.mark.asyncio
+async def test_dialogue_candidate_filter_uses_tagfocus_relevant_subset_and_limit() -> None:
+    many_tags = [f"宽带标签{i}" for i in range(1, 71)] + ["完全无关标签"]
+
+    class ManyTagsPlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            self.executed_queries.append(query.model_copy(deep=True))
+            _ = plan
+            _ = case_type
+            return [
+                HouseLite(
+                    house_id="HF_TAGS_1",
+                    rent=3500,
+                    layout="2居1厅1卫",
+                    district="大兴",
+                    subway_distance=500,
+                    commute_to_xierqi_min=40,
+                    status="可租",
+                    tags=many_tags,
+                ),
+                HouseLite(
+                    house_id="HF_TAGS_2",
+                    rent=3550,
+                    layout="2居1厅1卫",
+                    district="大兴",
+                    subway_distance=520,
+                    commute_to_xierqi_min=42,
+                    status="可租",
+                    tags=[f"宽带标签{i}" for i in range(1, 11)],
+                ),
+                HouseLite(
+                    house_id="HF_TAGS_3",
+                    rent=3600,
+                    layout="2居1厅1卫",
+                    district="大兴",
+                    subway_distance=550,
+                    commute_to_xierqi_min=45,
+                    status="可租",
+                    tags=["月付"],
+                ),
+            ]
+
+    dialogue, state, _, _ = _build_dialogue(planner=ManyTagsPlanner(), houses_client=DummyHousesClient())
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-relevant-limit",
+            case_type=CaseType.single,
+            message="帮我找大兴两居，预算4000以内，希望宽带包含",
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    relevant_ids = resp.debug["semantic_filter"]["relevant_tag_ids"]
+    assert len(relevant_ids) <= 60
+    irrelevant_tid = next((tid for tid, tag in state.tag_lexicon.items() if tag == "完全无关标签"), None)
+    if irrelevant_tid:
+        assert irrelevant_tid not in relevant_ids
+
+    top_coverage_tids = [tid for tid, tag in state.tag_lexicon.items() if tag in {f"宽带标签{i}" for i in range(1, 11)}]
+    assert top_coverage_tids
+    assert all(tid in relevant_ids for tid in top_coverage_tids)
+
+
+@pytest.mark.asyncio
+async def test_dialogue_action_rejects_house_outside_latest_allowlist() -> None:
+    dialogue, state, _, houses = _build_dialogue()
+    await dialogue.handle_turn(
+        InvokeRequest(session_id="sess-allowlist", case_type=CaseType.single, message="帮我找大兴区两居室，预算4000以内"),
+        state,
+        is_new_session=True,
+    )
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-allowlist",
+            case_type=CaseType.single,
+            message="帮我租HF_9999",
+            meta={"llm_parse": {"intent": "rent", "hard": {"house_id": "HF_9999"}, "confidence": 0.9}},
+        ),
+        state,
+        is_new_session=False,
+    )
+
+    assert "未在当前候选中找到 HF_9999" in resp.text
+    assert houses.rent_calls == []
+
+
+@pytest.mark.asyncio
+async def test_dialogue_tag_need_accumulated_supports_revocation() -> None:
+    class TaggedPlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            self.executed_queries.append(query.model_copy(deep=True))
+            _ = plan
+            _ = case_type
+            return [
+                HouseLite(
+                    house_id="HF_TAG_REVOKE",
+                    rent=3600,
+                    layout="2居1厅1卫",
+                    district="大兴",
+                    subway_distance=700,
+                    commute_to_xierqi_min=55,
+                    status="可租",
+                    tags=["物业态度差", "月付"],
+                ),
+                HouseLite(
+                    house_id="HF_TAG_REVOKE_2",
+                    rent=3650,
+                    layout="2居1厅1卫",
+                    district="大兴",
+                    subway_distance=720,
+                    commute_to_xierqi_min=58,
+                    status="可租",
+                    tags=["月付"],
+                ),
+                HouseLite(
+                    house_id="HF_TAG_REVOKE_3",
+                    rent=3700,
+                    layout="2居1厅1卫",
+                    district="大兴",
+                    subway_distance=730,
+                    commute_to_xierqi_min=60,
+                    status="可租",
+                    tags=["月付"],
+                ),
+            ]
+
+    dialogue, state, _, _ = _build_dialogue(planner=TaggedPlanner(), houses_client=DummyHousesClient())
+    await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-tag-revoke",
+            case_type=CaseType.single,
+            message="帮我找大兴两居，预算4000以内，不要物业态度差",
+        ),
+        state,
+        is_new_session=True,
+    )
+    assert any("物业" in item for item in state.req.soft.tag_need_accumulated.avoid)
+
+    await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-tag-revoke",
+            case_type=CaseType.single,
+            message="继续找，物业无所谓",
+        ),
+        state,
+        is_new_session=False,
+    )
+    assert not any("物业" in item for item in state.req.soft.tag_need_accumulated.avoid)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import re
 from typing import Any
 
 from app.clients.exceptions import DataSourceError
@@ -152,7 +153,7 @@ class Planner:
             resp = await self.houses_client.by_platform(
                 listing_platform=query.hard.listing_platform.value if query.hard.listing_platform else None,
                 page=page,
-                page_size=10,
+                page_size=30,
                 district=query.hard.district,
                 area=query.hard.area,
                 min_price=query.hard.budget_min,
@@ -268,10 +269,17 @@ def _layout_to_bedrooms(layout: str | None) -> str | None:
     if not layout:
         return None
     normalized = layout.translate(str.maketrans({"一": "1", "二": "2", "两": "2", "三": "3", "四": "4", "五": "5"}))
-    for ch in normalized:
-        if ch.isdigit():
-            return ch
-    return None
+    values = re.findall(r"([1-9])", normalized)
+    if not values:
+        return None
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return ",".join(unique)
 
 
 def _to_elevator_param(value: bool | None) -> str | None:

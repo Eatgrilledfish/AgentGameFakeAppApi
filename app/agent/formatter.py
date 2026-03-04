@@ -30,6 +30,31 @@ class OutputFormatter:
         if case_type == CaseType.multi:
             text += "。已按通勤、租金、地铁与居住条件综合排序（最多5套），如需我继续对比并给出决策建议可以直接说。"
 
+        semantic_fusion = (debug or {}).get("semantic_fusion") if isinstance(debug, dict) else None
+        if isinstance(semantic_fusion, dict):
+            must_confirm = semantic_fusion.get("must_confirm")
+            if isinstance(must_confirm, dict) and must_confirm:
+                snippets = [f"{house_id}（{reason}）" for house_id, reason in must_confirm.items()][:3]
+                if snippets:
+                    text += " 需确认：" + "；".join(snippets) + "。"
+
+            decisions = semantic_fusion.get("decisions")
+            if isinstance(decisions, dict) and decisions:
+                hard_rejected = [
+                    f"{house_id}（{item.get('reason', '与偏好冲突')}）"
+                    for house_id, item in decisions.items()
+                    if isinstance(item, dict) and item.get("action") == "rejected_drop"
+                ][:3]
+                risk_rejected = [
+                    f"{house_id}（{item.get('reason', '存在偏好风险')}）"
+                    for house_id, item in decisions.items()
+                    if isinstance(item, dict) and item.get("action") == "rejected_penalty"
+                ][:3]
+                if hard_rejected:
+                    text += " 已排除（明确冲突）：" + "；".join(hard_rejected) + "。"
+                if risk_rejected:
+                    text += " 存在风险（建议确认）：" + "；".join(risk_rejected) + "。"
+
         return InvokeResponse(text=text, candidates=top_houses, debug=debug or {})
 
     def render_action_result(self, action: str, result: dict) -> InvokeResponse:

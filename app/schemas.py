@@ -20,6 +20,7 @@ class IntentType(str, Enum):
     amenities = "amenities"
     house_detail = "house_detail"
     listings = "listings"
+    rent_check = "rent_check"
     rent = "rent"
     terminate = "terminate"
     offline = "offline"
@@ -66,10 +67,17 @@ class SoftPreferences(BaseModel):
     prioritize_commute: bool = False
 
 
+class TagNeed(BaseModel):
+    must: list[str] = Field(default_factory=list)
+    avoid: list[str] = Field(default_factory=list)
+    prefer: list[str] = Field(default_factory=list)
+
+
 class StructuredQuery(BaseModel):
     intent: IntentType = IntentType.search
     hard: HardConstraints = Field(default_factory=HardConstraints)
     soft: SoftPreferences = Field(default_factory=SoftPreferences)
+    tag_need: TagNeed = Field(default_factory=TagNeed)
     clarify_questions: list[str] = Field(default_factory=list)
     confidence: float = 0.6
 
@@ -171,6 +179,30 @@ class TurnSummary(BaseModel):
     house_ids: list[str] = Field(default_factory=list)
 
 
+class SessionReqSoft(BaseModel):
+    notes: list[str] = Field(default_factory=list)
+    tag_need_accumulated: TagNeed = Field(default_factory=TagNeed)
+
+
+class SessionReq(BaseModel):
+    hard: HardConstraints = Field(default_factory=HardConstraints)
+    soft: SessionReqSoft = Field(default_factory=SessionReqSoft)
+
+
+class SessionHouseMemory(BaseModel):
+    tag_ids: list[str] = Field(default_factory=list)
+    price: int | None = None
+    subway_distance: int | None = None
+    rental_type: str | None = None
+    area_sqm: float | None = None
+    updated_ts: int | None = None
+
+
+class CandidateState(BaseModel):
+    latest_house_ids: list[str] = Field(default_factory=list)
+    focus_house_id: str | None = None
+
+
 class SessionState(BaseModel):
     session_id: str
     user_id: str
@@ -188,6 +220,11 @@ class SessionState(BaseModel):
     recent_turns: list[TurnSummary] = Field(default_factory=list)
     conversation_summary: str = ""
     excluded_reasons: dict[str, str] = Field(default_factory=dict)
+    req: SessionReq = Field(default_factory=SessionReq)
+    tag_lexicon: dict[str, str] = Field(default_factory=dict)
+    reverse_lexicon: dict[str, str] = Field(default_factory=dict)
+    houses: dict[str, SessionHouseMemory] = Field(default_factory=dict)
+    candidate_state: CandidateState = Field(default_factory=CandidateState)
     budget: BudgetState = Field(default_factory=BudgetState)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

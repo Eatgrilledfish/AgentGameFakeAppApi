@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from app.schemas import CaseType, HardConstraints, IntentType, Platform, SessionState, SoftPreferences, StructuredQuery
+from app.schemas import CaseType, HardConstraints, IntentType, Platform, SessionState, SoftPreferences, StructuredQuery, TagNeed
 
 _PLATFORMS = {
     "链家": Platform.lianjia,
@@ -71,6 +71,7 @@ class RuleBasedNLU:
         text = _normalize_typos(text)
         hard = HardConstraints()
         soft = SoftPreferences()
+        tag_need = TagNeed()
         _ = state
         _ = case_type
 
@@ -89,6 +90,7 @@ class RuleBasedNLU:
         self._extract_move_in_date(text, hard)
         self._extract_landmark_or_community(text, hard)
         self._extract_soft_preferences(text, soft)
+        tag_need = self._extract_tag_need(text, soft)
 
         if intent in {IntentType.rent, IntentType.terminate, IntentType.offline}:
             questions = self._build_action_questions(hard)
@@ -113,6 +115,7 @@ class RuleBasedNLU:
             intent=intent,
             hard=hard,
             soft=soft,
+            tag_need=tag_need,
             clarify_questions=questions,
             confidence=min(0.95, confidence),
         )
@@ -122,6 +125,12 @@ class RuleBasedNLU:
             word in text
             for word in ["这套", "这一套", "这个房", "它", "第一套", "第二套", "第三套", "最开始", "最初", "上一套", "刚才那套"]
         )
+        asks_rent_status = house_ref and any(
+            word in text for word in ["可租吗", "可以租吗", "能租吗", "能不能租", "是否可租", "能否租", "我可以租吗"]
+        )
+        commits_rent = any(word in text for word in ["租这个", "租这套", "租这一套", "帮我租", "我要租", "我想租", "办理租房"])
+        if asks_rent_status and not commits_rent:
+            return IntentType.rent_check
         if any(word in text for word in ["退租", "恢复可租", "退掉", "取消租", "不租了"]):
             return IntentType.terminate
         if "下架" in text:
@@ -142,7 +151,7 @@ class RuleBasedNLU:
         ):
             return IntentType.listings
         if house_ref and any(
-            word in text for word in ["详情", "详细", "离地铁", "地铁多远", "多远", "可租吗", "可以租吗", "能租吗", "详细情况"]
+            word in text for word in ["详情", "详细", "离地铁", "地铁多远", "多远", "详细情况"]
         ):
             return IntentType.house_detail
         if any(word in text for word in ["商场", "商超", "公园", "配套"]) and any(
@@ -358,6 +367,28 @@ class RuleBasedNLU:
             if tag and tag not in soft.avoid_tags:
                 soft.avoid_tags.append(tag)
 
+    def _extract_tag_need(self, text: str, soft: SoftPreferences) -> TagNeed:
+        must = _extract_need_phrases(
+            text,
+            prefixes=("必须", "一定要", "必须要", "需要", "务必", "得有", "要有", "要能", "必须能"),
+        )
+        avoid = _extract_need_phrases(
+            text,
+            prefixes=("不要", "不想", "避免", "排除", "介意", "别", "不接受", "不能有"),
+        )
+        prefer = _extract_need_phrases(
+            text,
+            prefixes=("希望", "最好", "优先", "倾向", "想要", "更想", "偏好"),
+        )
+
+        for tag in soft.avoid_tags:
+            if tag not in avoid:
+                avoid.append(tag)
+        for tag in soft.preferred_tags:
+            if tag not in prefer:
+                prefer.append(tag)
+        return TagNeed(must=must[:8], avoid=avoid[:10], prefer=prefer[:10])
+
     def _build_clarify_questions(self, hard: HardConstraints) -> list[str]:
         questions: list[str] = []
         if hard.budget_max is None:
@@ -561,3 +592,27 @@ def _detect_fee_intent(text: str, keywords: tuple[str, ...]) -> str | None:
     if exclude_hit and not include_hit:
         return "exclude"
     return None
+
+
+def _extract_need_phrases(text: str, prefixes: tuple[str, ...]) -> list[str]:
+    if not text:
+        return []
+    parts = [chunk.strip() for chunk in re.split(r"[，,。；;!！?？\n]+", text) if chunk.strip()]
+    needs: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        for prefix in prefixes:
+            if prefix not in part:
+                continue
+            idx = part.find(prefix)
+            fragment = part[idx + len(prefix) :].strip(" ：:，,。.!！?？")
+            if not fragment:
+                continue
+            if len(fragment) > 24:
+                fragment = fragment[:24]
+            if fragment in seen:
+                continue
+            seen.add(fragment)
+            needs.append(fragment)
+            break
+    return needs

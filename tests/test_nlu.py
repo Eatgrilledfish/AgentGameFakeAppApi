@@ -64,7 +64,7 @@ def test_detect_house_detail_intent_without_triggering_rent() -> None:
     nlu = RuleBasedNLU()
     q = nlu.parse("这套可以租吗", _state(), CaseType.single)
 
-    assert q.intent.value == "house_detail"
+    assert q.intent.value == "rent_check"
 
 
 def test_detect_compare_intent_from_bijia_phrase() -> None:

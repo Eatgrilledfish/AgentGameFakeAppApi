@@ -60,7 +60,7 @@ def test_chat_route_returns_houses_json_when_candidates_exist() -> None:
         assert resp.status_code == 200
         body = resp.json()
         assert body["session_id"] == "sess-1"
-        assert body["response"]["message"] == "为您找到以下符合条件的房源："
+        assert body["response"]["message"] == "给你筛选好了"
         assert body["response"]["houses"] == ["HF_2101"]
         assert body["status"] == "success"
     assert body["timestamp"] < 10_000_000_000
@@ -282,6 +282,157 @@ def test_chat_route_returns_response_object_for_search_without_candidates() -> N
         assert resp.status_code == 200
         payload = resp.json()["response"]
         assert payload == {"message": "当前条件无结果", "houses": []}
+
+
+def test_chat_route_house_detail_response_must_include_houses_array() -> None:
+    app = create_app()
+
+    class StubService:
+        async def handle(self, request):
+            return InvokeResponse(
+                text="HF_4 当前可租，离地铁约 620 米。",
+                candidates=[{"house_id": "HF_4"}],
+                debug={"response_kind": "detail", "intent": "house_detail", "referenced_house_ids": ["HF_4"]},
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-detail-houses", "message": "这套能租吗"},
+        )
+
+    assert resp.status_code == 200
+    payload = resp.json()["response"]
+    assert payload["message"].startswith("HF_4 当前可租")
+    assert payload["houses"] == ["HF_4"]
+
+
+def test_chat_route_simple_greeting_skips_llm_nlu_call() -> None:
+    app = create_app()
+    captured = {"llm_calls": 0}
+
+    class StubService:
+        async def handle(self, request):
+            return InvokeResponse(text="你好，我在。", candidates=[], debug={"response_kind": "chat", "intent": "chat"})
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            _ = url
+            _ = json
+            _ = headers
+            captured["llm_calls"] += 1
+            raise AssertionError("simple greeting should not call llm nlu")
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-greeting-skip-llm", "message": "你好"},
+        )
+
+    assert resp.status_code == 200
+    assert captured["llm_calls"] == 0
+    assert resp.json()["response"] == {"message": "你好，我在。"}
+
+
+def test_chat_route_rent_related_intents_return_houses_array() -> None:
+    app = create_app()
+    calls = {"idx": 0}
+
+    class StubService:
+        async def handle(self, request):
+            calls["idx"] += 1
+            if calls["idx"] == 1:
+                return InvokeResponse(
+                    text="HF_4 当前状态：可租。",
+                    candidates=[{"house_id": "HF_4"}],
+                    debug={"response_kind": "detail", "intent": "rent_check", "referenced_house_ids": ["HF_4"]},
+                )
+            return InvokeResponse(
+                text="已提交租房操作：HF_4（安居客）。",
+                candidates=[{"house_id": "HF_4"}],
+                debug={"response_kind": "action", "intent": "rent", "referenced_house_ids": ["HF_4"]},
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        resp_check = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-rent-check", "message": "这套能租吗"},
+        )
+        resp_rent = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-rent-check", "message": "我要租这套"},
+        )
+
+    assert resp_check.status_code == 200
+    assert resp_check.json()["response"]["houses"] == ["HF_4"]
+    assert resp_rent.status_code == 200
+    assert resp_rent.json()["response"]["houses"] == ["HF_4"]
+
+
+def test_chat_route_chat_intent_in_housing_context_still_returns_houses() -> None:
+    app = create_app()
+
+    class StubState:
+        conversation_summary = "上轮推荐过房源"
+        candidate_state = type("CandidateState", (), {"latest_house_ids": ["HF_CTX_1", "HF_CTX_2"], "focus_house_id": None})()
+        last_top5 = []
+        houses = {}
+
+    class StubStateStore:
+        def get(self, session_id):
+            assert session_id == "sess-ctx-chat"
+            return StubState()
+
+    class StubService:
+        state_store = StubStateStore()
+
+        async def handle(self, request):
+            return InvokeResponse(text="支持VR看房。", candidates=[], debug={"response_kind": "chat", "intent": "chat"})
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-ctx-chat", "message": "这套能VR看房吗"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["response"]["houses"] == ["HF_CTX_1", "HF_CTX_2"]
+
+
+def test_chat_route_generic_chat_word_does_not_force_houses_in_context() -> None:
+    app = create_app()
+
+    class StubState:
+        conversation_summary = "上轮推荐过房源"
+        candidate_state = type("CandidateState", (), {"latest_house_ids": ["HF_CTX_1", "HF_CTX_2"], "focus_house_id": None})()
+        last_top5 = []
+        houses = {}
+
+    class StubStateStore:
+        def get(self, session_id):
+            assert session_id == "sess-ctx-chat-generic"
+            return StubState()
+
+    class StubService:
+        state_store = StubStateStore()
+
+        async def handle(self, request):
+            return InvokeResponse(text="我挺好的。", candidates=[], debug={"response_kind": "chat", "intent": "chat"})
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-ctx-chat-generic", "message": "最近怎么样"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["response"] == {"message": "我挺好的。"}
 
 
 def test_chat_route_keeps_natural_text_for_non_search_reply() -> None:

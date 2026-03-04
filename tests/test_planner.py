@@ -182,3 +182,20 @@ def test_planner_by_platform_passes_soft_preferences_to_upstream_params() -> Non
     assert first["orientation"] == "朝南"
     assert first["elevator"] == "true"
     assert first["decoration"] == "精装"
+
+
+def test_planner_layout_range_maps_to_bedrooms_csv() -> None:
+    landmarks = FuzzyLandmarksClient()
+    houses = ByPlatformCaptureHousesClient()
+    planner = Planner(landmarks_client=landmarks, houses_client=houses)
+    query = StructuredQuery(
+        hard=HardConstraints(layout="2,3居"),
+        soft={},
+    )
+    plan = RetrievalPlan(plan_type="by_platform")
+
+    _ = asyncio.run(planner.execute_plan(plan, query, CaseType.single))
+
+    assert houses.by_platform_calls
+    first = houses.by_platform_calls[0]
+    assert first["bedrooms"] == "2,3"
