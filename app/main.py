@@ -103,6 +103,34 @@ _TOOL_OPTIONAL_PARAM_PRIORITY = (
     "type",
 )
 _TOOL_OPTIONAL_PARAM_LIMIT = 10
+_LLM_NLU_PARAM_KEY_ALIASES = {
+    "district": "district",
+    "d": "district",
+    "bedrooms": "bedrooms",
+    "b": "bedrooms",
+    "min_price": "min_price",
+    "min": "min_price",
+    "max_price": "max_price",
+    "max": "max_price",
+    "decoration": "decoration",
+    "dec": "decoration",
+    "max_subway_dist": "max_subway_dist",
+    "sub": "max_subway_dist",
+    "rental_type": "rental_type",
+    "rt": "rental_type",
+    "min_area": "min_area",
+    "area": "min_area",
+    "elevator": "elevator",
+    "el": "elevator",
+}
+_LLM_NLU_TAG_KEY_ALIASES = {
+    "must": "must",
+    "m": "must",
+    "avoid": "avoid",
+    "a": "avoid",
+    "prefer": "prefer",
+    "p": "prefer",
+}
 
 _LLM_COMPACT_TOOLS: list[dict[str, Any]] = [
     {
@@ -1719,21 +1747,18 @@ def _is_housing_context_inquiry(message: str, state: Any) -> bool:
 def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str, Any] | None = None) -> list[dict[str, str]]:
     summary_text = summary[:220] if summary else ""
     context_text = _format_context_facts_for_prompt(context_facts)
-    ops_index_text = _format_ops_index_for_prompt(_load_llm_ops_prompt_index())
     content = (
-        "你是租房智能Agent决策器（Plan模块），只输出严格JSON对象。\n"
-        "契约只允许三个顶层字段：intent、params、tag_need。\n"
+        "你是租房智能Agent决策器（Plan模块）。\n"
+        "只输出1行字符串，不要解释。\n"
+        "格式：i=<intent>|p=k:v;k:v|t=m:x,y;a:u,v;p:q,r\n"
         "intent可选：chat/search/compare/house_detail/amenities/listings/rent_check/rent/terminate/offline。\n"
-        "params仅允许字段：district, bedrooms, min_price, max_price, decoration, max_subway_dist, rental_type, min_area, elevator。\n"
-        "tag_need仅允许字段：must, avoid, prefer（均为字符串数组）。\n"
-        "禁止输出 tool_plan/hard/soft/assistant_reply/confidence/其他字段。\n"
-        "预算表达“左右/上下/附近/约/大概”时，尽量给 min_price 与 max_price 区间。\n"
-        "用户问“这套可租吗/我可以租吗/能租吗”时intent应为rent_check，不要输出rent。\n"
-        "输出示例：\n"
-        '{"intent":"search","params":{"district":"朝阳","bedrooms":"2","max_price":3500},"tag_need":{"must":[],"avoid":[],"prefer":["VR看房"]}}\n'
-        f"可用操作索引(仅供参考)：\n{ops_index_text}\n"
+        "p仅允许键：district,bedrooms,min_price,max_price,decoration,max_subway_dist,rental_type,min_area,elevator。\n"
+        "短键可用：d,b,min,max,dec,sub,rt,area,el。\n"
+        "t里 m=must, a=avoid, p=prefer；没值留空。\n"
+        "规则：用户问“这套可租吗/我可以租吗/能租吗”时 i=rent_check；预算表达“左右/上下/附近/约/大概”时尽量给 min_price 与 max_price 区间。\n"
+        "示例：i=search|p=d:朝阳;b:2;max:3500|t=m:;a:;p:VR看房\n"
         f"会话摘要：{summary_text}\n"
-        f"上下文事实：\n{context_text}\n"
+        f"上下文：\n{context_text}\n"
         f"用户输入：{message}"
     )
     return [{"role": "user", "content": content}]
@@ -1846,6 +1871,130 @@ def _parse_llm_tool_arguments(raw: Any) -> dict[str, Any]:
     return {}
 
 
+def _parse_llm_nlu_payload(raw: str) -> dict[str, Any] | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+
+    if text.startswith("```"):
+        text = text.replace("```text", "").replace("```txt", "").replace("```", "").strip()
+    text = text.replace("｜", "|").replace("：", ":")
+
+    compact_parsed = _parse_llm_nlu_compact_payload(text)
+    if compact_parsed:
+        return compact_parsed
+
+    parsed = _extract_json_object(text)
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _parse_llm_nlu_compact_payload(text: str) -> dict[str, Any] | None:
+    segments = [seg.strip() for seg in re.split(r"[|\n]+", text) if isinstance(seg, str) and seg.strip()]
+    if not segments:
+        return None
+
+    parsed: dict[str, Any] = {"params": {}, "tag_need": {"must": [], "avoid": [], "prefer": []}}
+    has_signal = False
+
+    for segment in segments:
+        key, value = _split_compact_pair(segment)
+        if key is None:
+            continue
+        norm_key = key.strip().lower()
+        if norm_key in {"i", "intent"}:
+            if value:
+                parsed["intent"] = value.strip().lower()
+                has_signal = True
+            continue
+        if norm_key in {"p", "params"}:
+            params = _parse_llm_nlu_compact_params(value)
+            if params:
+                parsed["params"].update(params)
+                has_signal = True
+            continue
+        if norm_key in {"t", "tag", "tag_need"}:
+            tag_need = _parse_llm_nlu_compact_tag_need(value)
+            if any(tag_need.values()):
+                for k in ("must", "avoid", "prefer"):
+                    parsed["tag_need"][k].extend(tag_need[k])
+                has_signal = True
+            continue
+
+        param_key = _LLM_NLU_PARAM_KEY_ALIASES.get(norm_key)
+        if param_key:
+            cleaned = (value or "").strip()
+            if cleaned:
+                parsed["params"][param_key] = cleaned
+                has_signal = True
+            continue
+
+        tag_key = _LLM_NLU_TAG_KEY_ALIASES.get(norm_key)
+        if tag_key:
+            tokens = _split_compact_tag_tokens(value)
+            if tokens:
+                parsed["tag_need"][tag_key].extend(tokens)
+                has_signal = True
+
+    if not has_signal:
+        return None
+    return parsed
+
+
+def _split_compact_pair(segment: str) -> tuple[str | None, str]:
+    if ":" in segment and "=" in segment:
+        eq_idx = segment.find("=")
+        colon_idx = segment.find(":")
+        if eq_idx < colon_idx:
+            key, value = segment.split("=", 1)
+            return key, value
+        key, value = segment.split(":", 1)
+        return key, value
+    if "=" in segment:
+        key, value = segment.split("=", 1)
+        return key, value
+    if ":" in segment:
+        key, value = segment.split(":", 1)
+        return key, value
+    return None, ""
+
+
+def _parse_llm_nlu_compact_params(raw: str) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    for key, value in re.findall(r"([a-zA-Z_]+)\s*[:=]\s*([^;|]+)", raw or ""):
+        norm_key = _LLM_NLU_PARAM_KEY_ALIASES.get(key.strip().lower())
+        if not norm_key:
+            continue
+        cleaned = value.strip().strip("\"'")
+        if not cleaned or cleaned.lower() in {"none", "null"}:
+            continue
+        params[norm_key] = cleaned
+    return params
+
+
+def _parse_llm_nlu_compact_tag_need(raw: str) -> dict[str, list[str]]:
+    output = {"must": [], "avoid": [], "prefer": []}
+    for key, value in re.findall(r"([a-zA-Z_]+)\s*[:=]\s*([^;|]*)", raw or ""):
+        norm_key = _LLM_NLU_TAG_KEY_ALIASES.get(key.strip().lower())
+        if not norm_key:
+            continue
+        output[norm_key].extend(_split_compact_tag_tokens(value))
+    return output
+
+
+def _split_compact_tag_tokens(raw: str) -> list[str]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for item in re.split(r"[,，、/]+", raw or ""):
+        token = item.strip()
+        if not token or token in seen or token in {"-", "无", "none", "null"}:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tokens
+
+
 async def _analyze_intent_with_llm(
     http_client: httpx.AsyncClient,
     *,
@@ -1867,7 +2016,7 @@ async def _analyze_intent_with_llm(
     text_parse: dict[str, Any] | None = None
     llm_text = _extract_llm_text_content(response_data)
     if llm_text:
-        parsed = _extract_json_object(llm_text)
+        parsed = _parse_llm_nlu_payload(llm_text)
         if isinstance(parsed, dict):
             text_parse = parsed
     if isinstance(text_parse, dict):

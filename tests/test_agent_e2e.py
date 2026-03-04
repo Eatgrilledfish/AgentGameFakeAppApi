@@ -849,6 +849,65 @@ def test_chat_route_merges_llm_content_parse_with_tool_call_plan() -> None:
     assert "月付" in llm_parse["tag_need"]["prefer"]
 
 
+def test_chat_route_parses_compact_string_nlu_payload() -> None:
+    app = create_app()
+    captured: dict = {}
+
+    class StubService:
+        async def handle(self, request):
+            captured["meta"] = request.meta
+            return InvokeResponse(text="ok", candidates=[], debug={"response_kind": "search"})
+
+    class StubResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            assert headers["Session-ID"] == "sess-compact-nlu"
+            return StubResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    "i=search|p=d:朝阳;b:2;min:2600;max:3400|"
+                                    "t=m:近地铁;a:年付;p:月付,房东直租"
+                                )
+                            }
+                        }
+                    ]
+                }
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-compact-nlu", "message": "朝阳两居三千左右，月付直租"},
+        )
+
+    assert resp.status_code == 200
+    llm_parse = captured["meta"]["llm_parse"]
+    assert llm_parse["intent"] == "search"
+    assert llm_parse["params"]["district"] == "朝阳"
+    assert llm_parse["params"]["bedrooms"] == "2"
+    assert llm_parse["params"]["min_price"] == 2600
+    assert llm_parse["params"]["max_price"] == 3400
+    assert "近地铁" in llm_parse["tag_need"]["must"]
+    assert "年付" in llm_parse["tag_need"]["avoid"]
+    assert "月付" in llm_parse["tag_need"]["prefer"]
+    assert "房东直租" in llm_parse["tag_need"]["prefer"]
+
+
 def test_chat_route_uses_single_llm_call_and_applies_chat_reply_from_nlu() -> None:
     app = create_app()
     captured: dict = {}
