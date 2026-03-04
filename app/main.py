@@ -2308,9 +2308,10 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
         "p仅允许键：district,bedrooms,min_price,max_price,decoration,subway_distance,rental_type,min_area,elevator。\n"
         "t里 m=must, a=avoid, p=prefer；没值留空。\n"
         "t 的标签必须从“标签全集”里选择，并保持标签原文，不要改写或造新标签。\n"
+        "若同一桶（m/a/p）命中多个标签，必须全部返回（去重后逗号分隔），不能只返回一个。\n"
         f"标签全集：{tag_catalog_text}\n"
         "规则：用户问“这套可租吗/我可以租吗/能租吗”时 i=rent_check；预算表达“左右/上下/附近/约/大概”时尽量给 min_price 与 max_price 区间；提到近地铁时优先给 subway_distance:800。\n"
-        "示例：i=search|p=district:朝阳;bedrooms:2;max_price:3500;subway_distance:800|t=m:;a:;p:仅线上VR看房\n"
+        "示例：i=search|p=district:朝阳;bedrooms:2;max_price:3500;subway_distance:800|t=m:可养狗,近公园;a:年付,收中介费;p:月付,房东直租\n"
         f"会话摘要：{summary_text}\n"
         f"上下文：\n{context_text}\n"
         f"用户输入：{message}"
@@ -3476,8 +3477,10 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                     if isinstance(latest_ids, list):
                         houses = [hid for hid in latest_ids if isinstance(hid, str) and hid][:5]
                 response_payload: dict[str, Any] = {"message": output_text, "houses": houses}
+                response_text = json.dumps(response_payload, ensure_ascii=False)
             else:
                 response_payload = {"message": output_text}
+                response_text = output_text
 
             timestamp = int(time.time())
             duration_ms = int((time.perf_counter() - started) * 1000)
@@ -3487,11 +3490,11 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                 step=STEP_FINAL_RESPONSE,
                 duration_ms=duration_ms,
                 invoke_output=preview_text(invoke_resp.text, limit=300),
-                response=preview_payload(response_payload, limit=300),
+                response=preview_text(response_text, limit=300),
             )
             return ChatResponse(
                 session_id=req.session_id,
-                response=response_payload,
+                response=response_text,
                 status="success",
                 tool_results=tool_results,
                 timestamp=timestamp,

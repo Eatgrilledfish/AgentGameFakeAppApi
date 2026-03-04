@@ -255,7 +255,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     session_id: str
-    response: dict[str, Any]
+    response: str
     status: str = "success"
     tool_results: list[dict[str, Any]] = Field(default_factory=list)
     timestamp: int

@@ -13,6 +13,14 @@ from app.schemas import CaseType, HouseLite, HouseViewModel, IntentType, InvokeR
 from app.settings import AgentSettings
 
 
+def _response_text(resp) -> str:
+    return resp.json()["response"]
+
+
+def _response_json(resp) -> dict:
+    return json.loads(_response_text(resp))
+
+
 def test_invoke_route_with_stub_service() -> None:
     app = create_app()
 
@@ -61,8 +69,9 @@ def test_chat_route_returns_houses_json_when_candidates_exist() -> None:
         assert resp.status_code == 200
         body = resp.json()
         assert body["session_id"] == "sess-1"
-        assert body["response"]["message"] == "给你筛选好了"
-        assert body["response"]["houses"] == ["HF_2101"]
+        response_payload = json.loads(body["response"])
+        assert response_payload["message"] == "给你筛选好了"
+        assert response_payload["houses"] == ["HF_2101"]
         assert body["status"] == "success"
     assert body["timestamp"] < 10_000_000_000
 
@@ -209,7 +218,7 @@ def test_chat_route_accepts_content_field_as_user_input() -> None:
 
     assert resp.status_code == 200
     assert captured["message"] == "这是content字段"
-    assert resp.json()["response"]["message"] == "ok"
+    assert _response_text(resp) == "ok"
 
 
 def test_chat_route_uses_single_case_type_for_new_session() -> None:
@@ -281,7 +290,7 @@ def test_chat_route_returns_response_object_for_search_without_candidates() -> N
         )
 
         assert resp.status_code == 200
-        payload = resp.json()["response"]
+        payload = _response_json(resp)
         assert payload == {"message": "当前条件无结果", "houses": []}
 
 
@@ -304,7 +313,7 @@ def test_chat_route_house_detail_response_must_include_houses_array() -> None:
         )
 
     assert resp.status_code == 200
-    payload = resp.json()["response"]
+    payload = _response_json(resp)
     assert payload["message"].startswith("HF_4 当前可租")
     assert payload["houses"] == ["HF_4"]
 
@@ -335,7 +344,7 @@ def test_chat_route_simple_greeting_skips_llm_nlu_call() -> None:
 
     assert resp.status_code == 200
     assert captured["llm_calls"] == 0
-    assert resp.json()["response"] == {"message": "你好，我在。"}
+    assert _response_text(resp) == "你好，我在。"
 
 
 def test_chat_route_rent_related_intents_return_houses_array() -> None:
@@ -369,9 +378,9 @@ def test_chat_route_rent_related_intents_return_houses_array() -> None:
         )
 
     assert resp_check.status_code == 200
-    assert resp_check.json()["response"]["houses"] == ["HF_4"]
+    assert _response_json(resp_check)["houses"] == ["HF_4"]
     assert resp_rent.status_code == 200
-    assert resp_rent.json()["response"]["houses"] == ["HF_4"]
+    assert _response_json(resp_rent)["houses"] == ["HF_4"]
 
 
 def test_chat_route_chat_intent_in_housing_context_still_returns_houses() -> None:
@@ -402,7 +411,7 @@ def test_chat_route_chat_intent_in_housing_context_still_returns_houses() -> Non
         )
 
     assert resp.status_code == 200
-    assert resp.json()["response"]["houses"] == ["HF_CTX_1", "HF_CTX_2"]
+    assert _response_json(resp)["houses"] == ["HF_CTX_1", "HF_CTX_2"]
 
 
 def test_chat_route_generic_chat_word_does_not_force_houses_in_context() -> None:
@@ -433,7 +442,7 @@ def test_chat_route_generic_chat_word_does_not_force_houses_in_context() -> None
         )
 
     assert resp.status_code == 200
-    assert resp.json()["response"] == {"message": "我挺好的。"}
+    assert _response_text(resp) == "我挺好的。"
 
 
 def test_chat_route_keeps_natural_text_for_non_search_reply() -> None:
@@ -455,8 +464,7 @@ def test_chat_route_keeps_natural_text_for_non_search_reply() -> None:
         )
 
     assert resp.status_code == 200
-    assert resp.json()["response"]["message"].startswith("HF_4 各平台挂牌")
-    assert "houses" not in resp.json()["response"]
+    assert _response_text(resp).startswith("HF_4 各平台挂牌")
 
 
 def test_chat_route_uses_single_llm_pass_for_detail_reply() -> None:
@@ -512,7 +520,7 @@ def test_chat_route_uses_single_llm_pass_for_detail_reply() -> None:
 
     assert resp.status_code == 200
     assert len(captured["calls"]) == 1
-    assert resp.json()["response"]["message"].startswith("HF_4：朝阳望京")
+    assert _response_text(resp).startswith("HF_4：朝阳望京")
 
 
 def test_chat_route_uses_two_llm_passes_for_detail_when_tool_results_exist() -> None:
@@ -597,7 +605,7 @@ def test_chat_route_uses_two_llm_passes_for_detail_when_tool_results_exist() -> 
 
     assert resp.status_code == 200
     assert len(captured["calls"]) == 2
-    assert resp.json()["response"]["message"] == "已为你确认：HF_4 当前可租，离地铁约 620 米。"
+    assert _response_text(resp) == "已为你确认：HF_4 当前可租，离地铁约 620 米。"
 
 
 def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
@@ -1024,7 +1032,7 @@ def test_chat_route_applies_second_llm_rerank_and_persists_top5_context() -> Non
         )
 
     assert resp.status_code == 200
-    body = resp.json()["response"]
+    body = _response_json(resp)
     assert body["message"] == "我为你二次筛选了更匹配的5套房源。"
     assert body["houses"] == ["HF_7", "HF_2", "HF_9", "HF_1", "HF_3"]
     assert state.last_top5[0].house_id == "HF_7"
@@ -1119,7 +1127,7 @@ def test_chat_route_skips_second_llm_rerank_when_candidate_count_lte_5() -> None
         )
 
     assert resp.status_code == 200
-    body = resp.json()["response"]
+    body = _response_json(resp)
     assert body["message"] == "已找到3套符合要求的房源"
     assert body["houses"] == ["HF_A1", "HF_A2", "HF_A3"]
     assert len(state.house_context_top10) == 3
@@ -1332,7 +1340,7 @@ def test_chat_route_rerank_context_fields_are_configurable_with_landmarks() -> N
         )
 
     assert resp.status_code == 200
-    body = resp.json()["response"]
+    body = _response_json(resp)
     assert body["message"] == "按你的偏好我优先选了2套"
     assert body["houses"][:2] == ["HF_6751", "HF_6752"]
     assert len(body["houses"]) == 5
@@ -1390,7 +1398,7 @@ def test_chat_route_uses_single_llm_call_and_applies_chat_reply_from_nlu() -> No
     assert first_payload["messages"][0]["role"] == "user"
     assert "用户输入：用户原话-用于fallback" in first_payload["messages"][0]["content"]
     assert isinstance(first_payload["tools"], list) and len(first_payload["tools"]) > 0
-    assert resp.json()["response"]["message"] == "规则回复"
+    assert _response_text(resp) == "规则回复"
 
 
 def test_chat_route_nlu_prompt_includes_tag_catalog_and_keeps_tag_tokens(tmp_path, monkeypatch) -> None:
@@ -1451,6 +1459,8 @@ def test_chat_route_nlu_prompt_includes_tag_catalog_and_keeps_tag_tokens(tmp_pat
     assert "标签全集：" in prompt
     assert "可养狗" in prompt
     assert "近公园" in prompt
+    assert "若同一桶（m/a/p）命中多个标签，必须全部返回" in prompt
+    assert "t=m:可养狗,近公园;a:年付,收中介费;p:月付,房东直租" in prompt
     llm_parse = captured["meta"]["llm_parse"]
     assert llm_parse["intent"] == "search"
     assert "可养狗" in llm_parse["tag_need"]["prefer"]

@@ -72,28 +72,47 @@ curl -X POST http://localhost:8191/api/v1/chat \
 ```
 
 ---
-
-## Agent 输入输出约定
+```markdown
+# Agent 输入输出约定
 
 为确保 Agent 能被统一调度，其他实现需遵循以下输入输出规范。
 
-### 输入格式（POST `/api/v1/chat`）
+---
+
+# 1. 输入格式
+
+**接口**
+
+```
+
+POST /api/v1/chat
+
+````
+
+**请求体**
 
 ```json
 {
   "session_id": "会话ID",
   "message": "用户消息"
 }
-```
+````
 
-### 输出格式
+**字段说明**
+
+| 字段         | 类型     | 说明             |
+| ---------- | ------ | -------------- |
+| session_id | string | 会话ID，用于多轮对话上下文 |
+| message    | string | 用户输入消息         |
+
+---
+
+# 2. 输出格式
 
 ```json
 {
   "session_id": "会话ID",
-  "response": {
-    "message": "Agent回复内容"
-  },
+  "response": "Agent回复内容",
   "status": "success",
   "tool_results": [...],
   "timestamp": 1704067200,
@@ -101,27 +120,40 @@ curl -X POST http://localhost:8191/api/v1/chat \
 }
 ```
 
+**字段说明**
+
+| 字段           | 类型     | 说明                 |
+| ------------ | ------ | ------------------ |
+| session_id   | string | 会话ID               |
+| response     | string | Agent 回复内容         |
+| status       | string | 状态，一般为 `success`   |
+| tool_results | array  | Agent 调用工具/API 的结果 |
+| timestamp    | int    | Unix 时间戳           |
+| duration_ms  | int    | 本次请求耗时（毫秒）         |
+
 ---
 
-## response 字段说明
+# 3. response 字段说明
 
 | 场景      | response 内容 | 示例                                                    |
 | ------- | ----------- | ----------------------------------------------------- |
-| 普通对话    | JSON object（仅 message） | `{"message":"您好，请问有什么可以帮您？"}` |
-| 房源查询完成后 | JSON object（message + houses） | `{"message":"...","houses":["HF_2101"]}` |
+| 普通对话    | 自然语言文本      | `"您好，请问有什么可以帮您？"`                                     |
+| 房源查询完成后 | JSON 字符串    | `"{\"message\": \"...\", \"houses\": [\"HF_2101\"]}"` |
 
 ---
 
-## 房源查询返回格式
+# 4. 房源查询返回格式
 
-当完成房源查询后，`response` 字段为 JSON object，包含以下字段：
+当完成房源查询后，`response` 字段 **必须是合法的 JSON 字符串**，包含以下字段：
 
 | 字段      | 类型     | 说明       |
 | ------- | ------ | -------- |
 | message | string | 给用户的回复说明 |
 | houses  | array  | 房源 ID 列表 |
 
-### 示例（对象形态）
+---
+
+# 5. 示例
 
 ```json
 {
@@ -130,15 +162,33 @@ curl -X POST http://localhost:8191/api/v1/chat \
 }
 ```
 
----
-
-## 关键规则
-
-* **普通对话**：`response = {"message":"..."}`（不包含 `houses`）
-* **房源查询完成后**：`response = {"message":"...","houses":[...]}`  
-* **tool_results**：记录本轮所有上游 API 调用结果，`output` 保持 JSON object
+注意：该 JSON 在 `response` 字段中 **需要转义为字符串**。
 
 ---
+
+# 6. 关键规则
+
+1. **普通对话**
+
+   * 直接输出自然语言文本
+
+2. **房源查询完成后**
+
+   * `response` 必须是 **JSON 字符串**
+   * 必须包含：
+
+     * `message`
+     * `houses`
+
+3. **JSON 字符串要求**
+
+   * 必须是合法 JSON
+   * 必须进行转义
+   * **不能包含自然语言前缀**
+
+```
+```
+
 
 ## 模型调用接口
 
