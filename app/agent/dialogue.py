@@ -286,9 +286,8 @@ class DialogueManager:
                 follow_up = self._build_search_follow_up_questions(merged, request.message)
                 if follow_up:
                     state.phase = SessionPhase.slot_filling
-                    assistant_reply = self._extract_llm_assistant_reply(request.meta)
                     resp = InvokeResponse(
-                        text=assistant_reply or self._build_follow_up_text(follow_up),
+                        text=self._build_follow_up_text(follow_up),
                         clarify_questions=follow_up,
                         debug={"response_kind": "clarify"},
                     )
@@ -298,9 +297,8 @@ class DialogueManager:
                 log_event(LOGGER, "dialogue.chat")
                 self._remember_chat_preferences(state, merged, request.message)
                 state.phase = SessionPhase.chatting
-                assistant_reply = self._extract_llm_assistant_reply(request.meta)
                 resp = InvokeResponse(
-                    text=assistant_reply or self._fallback_chat_reply(request.message, merged),
+                    text=self._fallback_chat_reply(request.message, merged),
                     debug={"response_kind": "chat"},
                 )
             else:
@@ -327,7 +325,7 @@ class DialogueManager:
 
     @staticmethod
     def _llm_parse_has_signal(llm_parse: dict[str, Any]) -> bool:
-        for key in ("intent", "tool_plan", "hard", "soft"):
+        for key in ("intent", "params", "tag_need"):
             if key in llm_parse:
                 return True
         return False
@@ -1899,33 +1897,58 @@ class DialogueManager:
         if not isinstance(llm_parse, dict):
             return query
 
-        confidence = _to_float(llm_parse.get("confidence"))
-        if confidence is not None:
-            query.confidence = confidence
-
         parsed_intent = _normalize_intent(llm_parse.get("intent"))
         if parsed_intent is not None:
             query.intent = parsed_intent
 
-        tool_plan = llm_parse.get("tool_plan")
-        if isinstance(tool_plan, dict):
-            op = tool_plan.get("operationId")
-            mapped_intent = _map_tool_operation_to_intent(op)
-            if mapped_intent is not None:
-                query.intent = mapped_intent
-            args = tool_plan.get("arguments")
-            if isinstance(args, dict):
-                normalized_args = self._normalize_tool_arguments(args)
-                self._apply_hard_overrides(query.hard, normalized_args)
-                self._apply_soft_overrides(query.soft, normalized_args)
+        params_raw = llm_parse.get("params")
+        if isinstance(params_raw, dict):
+            overrides: dict[str, Any] = {}
+            district = params_raw.get("district")
+            if isinstance(district, str) and district.strip():
+                overrides["district"] = district.strip()
 
-        hard_raw = llm_parse.get("hard")
-        if isinstance(hard_raw, dict):
-            self._apply_hard_overrides(query.hard, hard_raw)
+            bedrooms = params_raw.get("bedrooms")
+            if isinstance(bedrooms, str) and bedrooms.strip():
+                compact = ",".join([item for item in re.findall(r"[1-9]", bedrooms) if item])
+                if compact:
+                    unique = []
+                    seen = set()
+                    for item in compact.split(","):
+                        if item in seen:
+                            continue
+                        seen.add(item)
+                        unique.append(item)
+                    if unique:
+                        layout = ",".join(unique)
+                        overrides["layout"] = f"{layout}居"
 
-        soft_raw = llm_parse.get("soft")
-        if isinstance(soft_raw, dict):
-            self._apply_soft_overrides(query.soft, soft_raw)
+            min_price = _to_int(params_raw.get("min_price"))
+            if min_price is not None:
+                overrides["budget_min"] = min_price
+            max_price = _to_int(params_raw.get("max_price"))
+            if max_price is not None:
+                overrides["budget_max"] = max_price
+            max_subway_dist = _to_int(params_raw.get("max_subway_dist"))
+            if max_subway_dist is not None:
+                overrides["max_subway_dist"] = max_subway_dist
+            min_area = _to_float(params_raw.get("min_area"))
+            if min_area is not None:
+                overrides["area_min"] = min_area
+
+            rental_type = params_raw.get("rental_type")
+            if isinstance(rental_type, str) and rental_type.strip() in {"整租", "合租"}:
+                overrides["rent_type"] = rental_type.strip()
+            self._apply_hard_overrides(query.hard, overrides)
+
+            soft_overrides: dict[str, Any] = {}
+            decoration = params_raw.get("decoration")
+            if isinstance(decoration, str) and decoration.strip():
+                soft_overrides["decoration"] = decoration.strip()
+            elevator = _to_bool(params_raw.get("elevator"))
+            if elevator is not None:
+                soft_overrides["elevator"] = elevator
+            self._apply_soft_overrides(query.soft, soft_overrides)
 
         tag_need_raw = llm_parse.get("tag_need")
         if isinstance(tag_need_raw, dict):

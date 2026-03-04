@@ -340,12 +340,12 @@ async def test_dialogue_accepts_llm_intent_parse_override() -> None:
         InvokeRequest(
             session_id="sess-ctx",
             case_type=CaseType.single,
-            message="帮我处理一下这套",
+            message="HF_4这套帮我租",
             meta={
                 "llm_parse": {
                     "intent": "rent",
-                    "hard": {"house_id": "HF_4", "listing_platform": "安居客"},
-                    "confidence": 0.93,
+                    "params": {},
+                    "tag_need": {"must": [], "avoid": [], "prefer": []},
                 }
             },
         ),
@@ -365,12 +365,12 @@ async def test_dialogue_prefers_llm_parse_even_with_low_confidence() -> None:
         InvokeRequest(
             session_id="sess-ctx",
             case_type=CaseType.single,
-            message="帮我处理这个",
+            message="HF_4这套帮我租",
             meta={
                 "llm_parse": {
                     "intent": "rent",
-                    "hard": {"house_id": "HF_4", "listing_platform": "安居客"},
-                    "confidence": 0.1,
+                    "params": {},
+                    "tag_need": {"must": [], "avoid": [], "prefer": []},
                 }
             },
         ),
@@ -390,14 +390,12 @@ async def test_dialogue_prefers_llm_tool_plan_for_action() -> None:
         InvokeRequest(
             session_id="sess-ctx",
             case_type=CaseType.single,
-            message="帮我处理这个",
+            message="HF_4这套帮我租",
             meta={
                 "llm_parse": {
-                    "tool_plan": {
-                        "operationId": "rent_house",
-                        "arguments": {"house_id": "HF_4", "listing_platform": "安居客"},
-                    },
-                    "confidence": 0.91,
+                    "intent": "rent",
+                    "params": {},
+                    "tag_need": {"must": [], "avoid": [], "prefer": []},
                 }
             },
         ),
@@ -418,13 +416,12 @@ async def test_dialogue_normalizes_llm_decoration_to_upstream_allowed_value() ->
         InvokeRequest(
             session_id="sess-ctx",
             case_type=CaseType.single,
-            message="帮我找精装修的两居",
+            message="帮我找大兴精装修的两居，预算4000以内",
             meta={
                 "llm_parse": {
                     "intent": "search",
-                    "soft": {"decoration": "精装修"},
-                    "hard": {"layout": "2居"},
-                    "confidence": 0.9,
+                    "params": {"district": "大兴", "bedrooms": "2", "max_price": 4000, "decoration": "精装修"},
+                    "tag_need": {"must": [], "avoid": [], "prefer": []},
                 }
             },
         ),
@@ -516,16 +513,9 @@ async def test_dialogue_prefers_llm_tool_plan_for_search_arguments() -> None:
             message="帮我找房",
             meta={
                 "llm_parse": {
-                    "tool_plan": {
-                        "operationId": "get_houses_by_platform",
-                        "arguments": {
-                            "district": "大兴",
-                            "max_price": 4000,
-                            "bedrooms": "2",
-                            "utilities_type": "商水商电",
-                        },
-                    },
-                    "confidence": 0.89,
+                    "intent": "search",
+                    "params": {"district": "大兴", "max_price": 4000, "bedrooms": "2"},
+                    "tag_need": {"must": [], "avoid": [], "prefer": []},
                 }
             },
         ),
@@ -537,7 +527,6 @@ async def test_dialogue_prefers_llm_tool_plan_for_search_arguments() -> None:
     assert resp.candidates[0].house_id == "HF_DX"
     assert planner.executed_queries[-1].hard.budget_max == 4000
     assert planner.executed_queries[-1].hard.layout in {"2居", "两居"}
-    assert planner.executed_queries[-1].hard.utilities_type == "商水商电"
 
 
 @pytest.mark.asyncio
@@ -632,15 +621,9 @@ async def test_dialogue_uses_preloaded_landmark_catalog_to_disambiguate_district
             message="按之前条件继续找房",
             meta={
                 "llm_parse": {
-                    "tool_plan": {
-                        "operationId": "get_houses_by_platform",
-                        "arguments": {
-                            "district": "望京",
-                            "max_price": 8000,
-                            "bedrooms": "2",
-                        },
-                    },
-                    "confidence": 0.9,
+                    "intent": "search",
+                    "params": {"district": "望京", "max_price": 8000, "bedrooms": "2"},
+                    "tag_need": {"must": [], "avoid": [], "prefer": []},
                 }
             },
         ),
@@ -667,15 +650,9 @@ async def test_dialogue_preserves_llm_nearby_max_distance_argument() -> None:
             message="车公庄站500米内的两居",
             meta={
                 "llm_parse": {
-                    "tool_plan": {
-                        "operationId": "get_houses_nearby",
-                        "arguments": {
-                            "landmark_id": "车公庄站",
-                            "max_distance": 500,
-                            "bedrooms": "2",
-                        },
-                    },
-                    "confidence": 0.9,
+                    "intent": "search",
+                    "params": {"bedrooms": "2", "max_subway_dist": 500},
+                    "tag_need": {"must": [], "avoid": [], "prefer": []},
                 }
             },
         ),
@@ -684,8 +661,7 @@ async def test_dialogue_preserves_llm_nearby_max_distance_argument() -> None:
     )
 
     assert resp.debug["response_kind"] == "search"
-    assert planner.executed_queries[-1].hard.landmark_id == "车公庄站"
-    assert planner.executed_queries[-1].hard.max_distance == 500
+    assert planner.executed_queries[-1].hard.max_subway_dist == 500
     assert planner.executed_queries[-1].hard.layout in {"2居", "两居"}
 
 
@@ -700,18 +676,6 @@ async def test_dialogue_complaint_stores_preferences_then_search_uses_them() -> 
             session_id="sess-ctx",
             case_type=CaseType.single,
             message="唉，我现在的房子住的不太舒服，采光不好，房间也小",
-            meta={
-                "llm_parse": {
-                    "tool_plan": {
-                        "operationId": "get_houses_by_platform",
-                        "arguments": {
-                            "orientation": "朝南",
-                            "min_area": 60,
-                        },
-                    },
-                    "confidence": 0.9,
-                }
-            },
         ),
         state,
         is_new_session=True,
@@ -748,10 +712,8 @@ async def test_dialogue_complaint_stores_preferences_then_search_uses_them() -> 
         is_new_session=False,
     )
 
-    assert search_resp.debug["response_kind"] == "clarify"
-    assert "预算上限" in search_resp.text
-    assert "区域、小区或地铁站" in search_resp.text
-    assert planner.executed_queries == []
+    assert search_resp.debug["response_kind"] == "search"
+    assert planner.executed_queries
 
     search_resp2 = await dialogue.handle_turn(
         InvokeRequest(
@@ -921,9 +883,8 @@ async def test_dialogue_promotes_llm_house_detail_to_search_for_preference_refin
             meta={
                 "llm_parse": {
                     "intent": "house_detail",
-                    "tool_plan": {"operationId": "get_house_by_id", "arguments": {"id": "HF_MONTHLY"}},
-                    "soft": {"preferred_tags": ["月付", "房东直租"], "avoid_tags": ["年付", "收中介费"]},
-                    "confidence": 0.88,
+                    "params": {},
+                    "tag_need": {"must": [], "avoid": ["年付", "收中介费"], "prefer": ["月付", "房东直租"]},
                 }
             },
         ),
@@ -933,8 +894,8 @@ async def test_dialogue_promotes_llm_house_detail_to_search_for_preference_refin
 
     assert second.debug["response_kind"] == "search"
     refined = planner.executed_queries[-1]
-    assert "月付" in refined.soft.preferred_tags
-    assert "房东直租" in refined.soft.preferred_tags
+    assert "月付" in refined.tag_need.prefer
+    assert "房东直租" in refined.tag_need.prefer
 
 
 @pytest.mark.asyncio

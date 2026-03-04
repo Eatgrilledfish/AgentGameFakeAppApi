@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import json
 from fastapi.testclient import TestClient
 
 import httpx
@@ -658,17 +659,7 @@ def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
                         {
                             "message": {
                                 "role": "assistant",
-                                "content": "",
-                                "tool_calls": [
-                                    {
-                                        "id": "call_1",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "rent_house",
-                                            "arguments": '{"house_id":"HF_1001","listing_platform":"安居客"}',
-                                        },
-                                    }
-                                ],
+                                "content": '{"intent":"rent","params":{},"tag_need":{"must":[],"avoid":[],"prefer":[]}}',
                             }
                         }
                     ]
@@ -686,7 +677,7 @@ def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
         assert resp.status_code == 200
         assert captured["meta"]["model_ip"] == "127.0.0.1"
         assert captured["meta"]["llm_parse"]["intent"] == "rent"
-        assert captured["meta"]["llm_parse"]["tool_plan"]["arguments"]["house_id"] == "HF_1001"
+        assert captured["meta"]["llm_parse"]["params"] == {}
 
 
 def test_chat_route_llm_tool_call_keeps_nearby_max_distance_argument() -> None:
@@ -718,19 +709,10 @@ def test_chat_route_llm_tool_call_keeps_nearby_max_distance_argument() -> None:
                         {
                             "message": {
                                 "role": "assistant",
-                                "content": "",
-                                "tool_calls": [
-                                    {
-                                        "id": "call_1",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "get_houses_nearby",
-                                            "arguments": (
-                                                '{"landmark_id":"车公庄站","max_distance":500,"bedrooms":"2"}'
-                                            ),
-                                        },
-                                    }
-                                ],
+                                "content": (
+                                    '{"intent":"search","params":{"max_subway_dist":500,"bedrooms":"2"},'
+                                    '"tag_need":{"must":[],"avoid":[],"prefer":[]}}'
+                                ),
                             }
                         }
                     ]
@@ -751,11 +733,9 @@ def test_chat_route_llm_tool_call_keeps_nearby_max_distance_argument() -> None:
 
     assert resp.status_code == 200
     assert captured["meta"]["llm_parse"]["intent"] == "search"
-    tool_plan = captured["meta"]["llm_parse"]["tool_plan"]
-    assert tool_plan["operationId"] == "get_houses_nearby"
-    assert tool_plan["arguments"]["landmark_id"] == "车公庄站"
-    assert tool_plan["arguments"]["max_distance"] == 500.0
-    assert "bedrooms" not in tool_plan["arguments"]
+    params = captured["meta"]["llm_parse"]["params"]
+    assert params["max_subway_dist"] == 500
+    assert params["bedrooms"] == "2"
 
 
 def test_chat_route_llm_tool_call_maps_id_alias_to_house_id_for_house_detail() -> None:
@@ -787,17 +767,10 @@ def test_chat_route_llm_tool_call_maps_id_alias_to_house_id_for_house_detail() -
                         {
                             "message": {
                                 "role": "assistant",
-                                "content": "",
-                                "tool_calls": [
-                                    {
-                                        "id": "call_1",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "get_house_by_id",
-                                            "arguments": '{"id":"HF_14"}',
-                                        },
-                                    }
-                                ],
+                                "content": (
+                                    '{"intent":"house_detail","params":{"district":"朝阳","house_id":"HF_14"},'
+                                    '"tag_need":{"must":[],"avoid":[],"prefer":[]}}'
+                                ),
                             }
                         }
                     ]
@@ -813,10 +786,10 @@ def test_chat_route_llm_tool_call_maps_id_alias_to_house_id_for_house_detail() -
         )
 
     assert resp.status_code == 200
-    tool_plan = captured["meta"]["llm_parse"]["tool_plan"]
-    assert tool_plan["operationId"] == "get_house_by_id"
-    assert tool_plan["arguments"]["house_id"] == "HF_14"
-    assert "id" not in tool_plan["arguments"]
+    llm_parse = captured["meta"]["llm_parse"]
+    assert llm_parse["intent"] == "house_detail"
+    assert llm_parse["params"]["district"] == "朝阳"
+    assert "house_id" not in llm_parse["params"]
 
 
 def test_chat_route_merges_llm_content_parse_with_tool_call_plan() -> None:
@@ -847,22 +820,11 @@ def test_chat_route_merges_llm_content_parse_with_tool_call_plan() -> None:
                     "choices": [
                         {
                             "message": {
-                                "role": "assistant",
                                 "content": (
-                                    '{"intent":"search","hard":{"budget_min":2600,"budget_max":3400},'
-                                    '"soft":{"preferred_tags":["月付","房东直租"],"avoid_tags":["年付"]},'
-                                    '"confidence":0.86}'
-                                ),
-                                "tool_calls": [
-                                    {
-                                        "id": "call_1",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "get_houses_by_platform",
-                                            "arguments": '{"district":"朝阳","max_price":3500,"bedrooms":"2"}',
-                                        },
-                                    }
-                                ],
+                                    '{"intent":"search","params":{"district":"朝阳","min_price":2600,'
+                                    '"max_price":3400,"bedrooms":"2"},"tag_need":{"must":[],"avoid":["年付"],'
+                                    '"prefer":["月付","房东直租"]}}'
+                                )
                             }
                         }
                     ]
@@ -879,11 +841,10 @@ def test_chat_route_merges_llm_content_parse_with_tool_call_plan() -> None:
 
     assert resp.status_code == 200
     llm_parse = captured["meta"]["llm_parse"]
-    assert llm_parse["hard"]["budget_min"] == 2600
-    assert llm_parse["hard"]["budget_max"] == 3400
-    assert "月付" in llm_parse["soft"]["preferred_tags"]
-    assert llm_parse["tool_plan"]["operationId"] == "get_houses_by_platform"
-    assert llm_parse["tool_plan"]["arguments"]["district"] == "朝阳"
+    assert llm_parse["params"]["min_price"] == 2600
+    assert llm_parse["params"]["max_price"] == 3400
+    assert llm_parse["params"]["district"] == "朝阳"
+    assert "月付" in llm_parse["tag_need"]["prefer"]
 
 
 def test_chat_route_uses_single_llm_call_and_applies_chat_reply_from_nlu() -> None:
@@ -916,10 +877,7 @@ def test_chat_route_uses_single_llm_call_and_applies_chat_reply_from_nlu() -> No
                     "choices": [
                         {
                             "message": {
-                                "content": (
-                                    '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},'
-                                    '"assistant_reply":"收到，我理解你的情况，我来帮你看下更合适的房子。","confidence":0.7}'
-                                )
+                                "content": '{"intent":"chat","params":{},"tag_need":{"must":[],"avoid":[],"prefer":[]}}'
                             }
                         }
                     ]
@@ -940,7 +898,7 @@ def test_chat_route_uses_single_llm_call_and_applies_chat_reply_from_nlu() -> No
     assert first_payload["messages"][0]["role"] == "user"
     assert "用户输入：用户原话-用于fallback" in first_payload["messages"][0]["content"]
     assert isinstance(first_payload["tools"], list) and len(first_payload["tools"]) > 0
-    assert resp.json()["response"]["message"] == "收到，我理解你的情况，我来帮你看下更合适的房子。"
+    assert resp.json()["response"]["message"] == "规则回复"
 
 
 def test_chat_route_sanitizes_unknown_tool_operation_from_llm() -> None:
@@ -997,8 +955,8 @@ def test_chat_route_sanitizes_unknown_tool_operation_from_llm() -> None:
                         {
                             "message": {
                                 "content": (
-                                    '{"intent":"search","tool_plan":{"operationId":"fake_op","arguments":'
-                                    '{"x":"y","house_id":"BAD-ID"}},"confidence":0.91}'
+                                    '{"intent":"search","params":{"district":"大兴","unknown":"x"},'
+                                    '"tag_need":{"must":[],"avoid":[],"prefer":[]},"extra":1}'
                                 )
                             }
                         }
@@ -1015,9 +973,9 @@ def test_chat_route_sanitizes_unknown_tool_operation_from_llm() -> None:
         )
 
         assert resp.status_code == 200
-        tool_plan = captured["meta"]["llm_parse"]["tool_plan"]
-        assert tool_plan["operationId"] == "none"
-        assert tool_plan["arguments"] == {}
+        llm_parse = captured["meta"]["llm_parse"]
+        assert llm_parse["intent"] == "search"
+        assert llm_parse["params"] == {"district": "大兴"}
 
 
 def test_chat_route_llm_nlu_single_attempt_on_read_timeout() -> None:
@@ -1353,3 +1311,33 @@ def test_debug_agent_io_events_support_session_filter(monkeypatch, tmp_path) -> 
     assert body["session_id"] == "sess-a"
     assert body["count"] == 2
     assert all(item["session_id"] == "sess-a" for item in body["items"])
+
+
+def test_debug_agent_io_events_decode_nested_json_strings_for_display(monkeypatch, tmp_path) -> None:
+    log_file = tmp_path / "agent_http_io.log"
+    payload = {
+        "event": "http.agent_io.llm.request",
+        "session_id": "sess-x",
+        "method": "POST",
+        "path": "/api/v1/chat",
+        "request_body": '{"model":"","messages":[{"role":"user","content":"hi"}],"tools":[]}',
+        "response_body": '{"choices":[{"message":{"content":"ok"}}]}',
+    }
+    log_file.write_text(
+        "2026-03-03 10:00:00 " + json.dumps(payload, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_HTTP_IO_LOG_PATH", str(log_file))
+
+    app = create_app()
+    with TestClient(app) as client:
+        resp = client.get("/debug/agent-io/events", params={"session_id": "sess-x", "limit": 20})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 1
+    first = body["items"][0]
+    assert isinstance(first.get("request_body"), dict)
+    assert isinstance(first.get("response_body"), dict)
+    assert first["request_body"]["messages"][0]["role"] == "user"
+    assert first["response_body"]["choices"][0]["message"]["content"] == "ok"

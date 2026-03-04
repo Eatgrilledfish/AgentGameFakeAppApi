@@ -70,6 +70,39 @@ _TOOL_ARGUMENT_KEY_ALIASES: dict[str, dict[str, str]] = {
     "terminate_rental": {"id": "house_id"},
     "take_offline": {"id": "house_id"},
 }
+_SOFT_BOOL_DEFAULT_FALSE_KEYS = {"prefer_spacious", "prioritize_subway_distance", "prioritize_commute", "value_for_money"}
+_LLM_CONTEXT_HARD_KEYS = ("district", "layout", "budget_min", "budget_max", "max_subway_dist", "rent_type", "area")
+_LLM_CONTEXT_SOFT_KEYS = ("decoration", "amenities", "preferred_tags", "avoid_tags")
+_LLM_CONTEXT_TAG_LIMIT = 80
+_LLM_CONTEXT_HOUSE_LIMIT = 5
+_LLM_CONTEXT_TAG_NEED_LIMIT = 10
+_TOOL_OPTIONAL_PARAM_PRIORITY = (
+    "house_id",
+    "listing_platform",
+    "district",
+    "area",
+    "community",
+    "landmark_id",
+    "q",
+    "name",
+    "id",
+    "min_price",
+    "max_price",
+    "bedrooms",
+    "rental_type",
+    "decoration",
+    "max_subway_dist",
+    "min_area",
+    "commute_to_xierqi_max",
+    "subway_station",
+    "utilities_type",
+    "page",
+    "page_size",
+    "max_distance",
+    "max_distance_m",
+    "type",
+)
+_TOOL_OPTIONAL_PARAM_LIMIT = 10
 
 
 def _preview_http_body(raw_body: bytes, content_type: str | None, limit: int = 2000) -> str:
@@ -152,6 +185,42 @@ def _stage_name(entry: dict[str, Any]) -> str:
     if event.endswith(".error"):
         return "调用错误"
     return "其他"
+
+
+def _looks_like_json_container_text(value: str) -> bool:
+    text = value.strip()
+    if not text or text.endswith("...(truncated)"):
+        return False
+    return (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]"))
+
+
+def _normalize_agent_io_value_for_display(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 5:
+        return value
+
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, str):
+                output[key] = _normalize_agent_io_value_for_display(item, depth=depth + 1)
+        return output
+
+    if isinstance(value, list):
+        return [_normalize_agent_io_value_for_display(item, depth=depth + 1) for item in value]
+
+    if isinstance(value, str) and _looks_like_json_container_text(value):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+        return _normalize_agent_io_value_for_display(parsed, depth=depth + 1)
+
+    return value
+
+
+def _normalize_agent_io_entry_for_display(entry: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_agent_io_value_for_display(entry, depth=0)
+    return normalized if isinstance(normalized, dict) else entry
 
 
 def _build_model_base_url(model_ip: str) -> str:
@@ -555,9 +624,43 @@ def _compact_tool_parameters(raw: Any) -> dict[str, Any]:
     properties = raw.get("properties")
     compact_props: dict[str, Any] = {}
     if isinstance(properties, dict):
-        for key, spec in properties.items():
-            if not isinstance(key, str) or not key:
+        required_raw = raw.get("required")
+        required_set = (
+            {item for item in required_raw if isinstance(item, str) and item in properties}
+            if isinstance(required_raw, list)
+            else set()
+        )
+        selected_keys: list[str] = []
+        seen_keys: set[str] = set()
+
+        for key in properties:
+            if not isinstance(key, str) or not key or key not in required_set or key in seen_keys:
                 continue
+            seen_keys.add(key)
+            selected_keys.append(key)
+
+        optional_count = 0
+        for key in _TOOL_OPTIONAL_PARAM_PRIORITY:
+            if key in seen_keys or key not in properties:
+                continue
+            seen_keys.add(key)
+            selected_keys.append(key)
+            optional_count += 1
+            if optional_count >= _TOOL_OPTIONAL_PARAM_LIMIT:
+                break
+
+        if optional_count < _TOOL_OPTIONAL_PARAM_LIMIT:
+            for key in properties:
+                if not isinstance(key, str) or not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                selected_keys.append(key)
+                optional_count += 1
+                if optional_count >= _TOOL_OPTIONAL_PARAM_LIMIT:
+                    break
+
+        for key in selected_keys:
+            spec = properties.get(key)
             if not isinstance(spec, dict):
                 compact_props[key] = {"type": "string"}
                 continue
@@ -568,8 +671,8 @@ def _compact_tool_parameters(raw: Any) -> dict[str, Any]:
             else:
                 entry["type"] = "string"
             enum_values = spec.get("enum")
-            if isinstance(enum_values, list) and enum_values:
-                entry["enum"] = [v for v in enum_values if isinstance(v, (str, int, float, bool))][:8]
+            if isinstance(enum_values, list) and enum_values and (key in required_set or len(enum_values) <= 5):
+                entry["enum"] = [v for v in enum_values if isinstance(v, (str, int, float, bool))][:5]
             compact_props[key] = entry
 
     compact: dict[str, Any] = {
@@ -657,51 +760,324 @@ def _load_tool_required_params() -> dict[str, set[str]]:
     return mapping
 
 
-def _sanitize_llm_parse(parsed: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(parsed)
-    tool_plan = normalized.get("tool_plan")
-    if not isinstance(tool_plan, dict):
-        return normalized
+@lru_cache(maxsize=1)
+def _load_llm_ops_prompt_index() -> list[dict[str, Any]]:
+    payload = _load_compact_tool_schema_payload()
+    operations = payload.get("operations")
+    if not isinstance(operations, list):
+        return []
 
-    operation_id = tool_plan.get("operationId")
-    arguments = tool_plan.get("arguments")
-    if not isinstance(operation_id, str) or not operation_id:
-        return normalized
-
-    known_op_specs = _load_tool_argument_specs()
-    if operation_id != "none" and operation_id not in known_op_specs:
-        normalized["tool_plan"] = {"operationId": "none", "arguments": {}}
-        return normalized
-
-    sanitized_arguments: dict[str, Any] = {}
-    op_specs = known_op_specs.get(operation_id, {})
-    if isinstance(arguments, dict):
-        remapped_arguments = _apply_tool_argument_aliases(operation_id, arguments)
-        if op_specs:
-            for key, value in remapped_arguments.items():
-                if not isinstance(key, str):
-                    continue
-                spec = op_specs.get(key)
-                if spec is None:
-                    continue
-                coerced = _coerce_argument_value(value, spec)
-                if coerced is not None:
-                    sanitized_arguments[key] = coerced
-        else:
-            sanitized_arguments = {k: v for k, v in remapped_arguments.items() if isinstance(k, str)}
-
-    required = _load_tool_required_params().get(operation_id, set())
-    for req_key in required:
-        if req_key not in sanitized_arguments:
+    ops: list[dict[str, Any]] = []
+    for item in operations:
+        if not isinstance(item, dict):
             continue
-        if sanitized_arguments[req_key] is None:
-            sanitized_arguments.pop(req_key, None)
+        operation_id = item.get("operationId")
+        if not isinstance(operation_id, str) or not operation_id:
+            continue
+        param_defs = _collect_param_defs(item)
+        required = [spec["name"] for spec in param_defs if spec.get("required") is True and isinstance(spec.get("name"), str)]
+        all_param_names = [spec["name"] for spec in param_defs if isinstance(spec.get("name"), str)]
 
-    normalized["tool_plan"] = {
-        "operationId": operation_id,
-        "arguments": sanitized_arguments,
-    }
-    return normalized
+        args: list[str] = []
+        seen: set[str] = set()
+        for name in required:
+            if name in seen:
+                continue
+            seen.add(name)
+            args.append(name)
+        for name in _TOOL_OPTIONAL_PARAM_PRIORITY:
+            if name in seen or name not in all_param_names:
+                continue
+            seen.add(name)
+            args.append(name)
+            if len(args) >= 12:
+                break
+        if len(args) < 12:
+            for name in all_param_names:
+                if name in seen:
+                    continue
+                seen.add(name)
+                args.append(name)
+                if len(args) >= 12:
+                    break
+
+        ops.append({"operationId": operation_id, "args": args})
+    return ops
+
+
+def _prune_empty_for_llm(value: Any, *, drop_false_keys: set[str] | None = None, parent_key: str = "") -> Any:
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        for key, raw in value.items():
+            if not isinstance(key, str):
+                continue
+            pruned = _prune_empty_for_llm(raw, drop_false_keys=drop_false_keys, parent_key=key)
+            if pruned is None:
+                continue
+            if isinstance(pruned, bool) and pruned is False and drop_false_keys and key in drop_false_keys:
+                continue
+            if pruned == "":
+                continue
+            if isinstance(pruned, (list, dict)) and not pruned:
+                continue
+            output[key] = pruned
+        return output or None
+
+    if isinstance(value, list):
+        output_list: list[Any] = []
+        for item in value:
+            pruned = _prune_empty_for_llm(item, drop_false_keys=drop_false_keys, parent_key=parent_key)
+            if pruned is None:
+                continue
+            if pruned == "":
+                continue
+            if isinstance(pruned, (list, dict)) and not pruned:
+                continue
+            output_list.append(pruned)
+        return output_list or None
+
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+def _compact_tag_need_payload(value: Any) -> dict[str, list[str]]:
+    payload = value if isinstance(value, dict) else {}
+    result: dict[str, list[str]] = {"must": [], "avoid": [], "prefer": []}
+    for key in ("must", "avoid", "prefer"):
+        raw = payload.get(key)
+        if not isinstance(raw, list):
+            continue
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            token = item.strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            cleaned.append(token)
+            if len(cleaned) >= _LLM_CONTEXT_TAG_NEED_LIMIT:
+                break
+        result[key] = cleaned
+    return result
+
+
+def _build_llm_compact_context_facts(state: Any, *, include_candidate_tags: bool) -> dict[str, Any]:
+    if state is None:
+        return {}
+
+    facts: dict[str, Any] = {}
+    case_type_value = getattr(getattr(state, "case_type", None), "value", None)
+    if isinstance(case_type_value, str) and case_type_value:
+        facts["case_type"] = case_type_value
+
+    focus_house_id = getattr(getattr(state, "candidate_state", None), "focus_house_id", None) or getattr(state, "focus_house_id", None)
+    if isinstance(focus_house_id, str) and focus_house_id:
+        facts["focus_house_id"] = focus_house_id
+
+    focus_platform = getattr(state, "focus_listing_platform", None)
+    if isinstance(focus_platform, str) and focus_platform:
+        facts["focus_listing_platform"] = focus_platform
+    elif hasattr(focus_platform, "value") and isinstance(getattr(focus_platform, "value"), str):
+        facts["focus_listing_platform"] = getattr(focus_platform, "value")
+
+    constraints_source: dict[str, Any] = {}
+    confirmed = getattr(state, "confirmed_constraints", None)
+    if confirmed is not None and hasattr(confirmed, "model_dump"):
+        confirmed_dict = confirmed.model_dump(exclude_none=True)
+        if isinstance(confirmed_dict, dict):
+            constraints_source = confirmed_dict
+    req_hard = getattr(getattr(state, "req", None), "hard", None)
+    if req_hard is not None and hasattr(req_hard, "model_dump"):
+        hard_dict = req_hard.model_dump(exclude_none=True)
+        if isinstance(hard_dict, dict):
+            constraints_source = {**hard_dict, **constraints_source}
+    constraints: dict[str, Any] = {}
+    for key in _LLM_CONTEXT_HARD_KEYS:
+        value = constraints_source.get(key)
+        if value is None:
+            continue
+        if hasattr(value, "value") and isinstance(getattr(value, "value"), str):
+            constraints[key] = getattr(value, "value")
+        else:
+            constraints[key] = value
+    if constraints:
+        facts["constraints_summary"] = constraints
+
+    soft_source: dict[str, Any] = {}
+    soft = getattr(state, "soft_preferences", None)
+    if soft is not None and hasattr(soft, "model_dump"):
+        soft_dict = soft.model_dump(exclude_none=True)
+        if isinstance(soft_dict, dict):
+            soft_source = soft_dict
+    soft_picked: dict[str, Any] = {}
+    for key in _LLM_CONTEXT_SOFT_KEYS:
+        value = soft_source.get(key)
+        if value is None:
+            continue
+        soft_picked[key] = value
+    if soft_picked:
+        facts["soft_summary"] = soft_picked
+
+    req_soft = getattr(getattr(state, "req", None), "soft", None)
+    if req_soft is not None and hasattr(req_soft, "model_dump"):
+        req_soft_dict = req_soft.model_dump(exclude_none=True)
+        if isinstance(req_soft_dict, dict):
+            compact_tag_need = _compact_tag_need_payload(req_soft_dict.get("tag_need_accumulated"))
+            if any(compact_tag_need.values()):
+                facts["tag_need_accumulated"] = compact_tag_need
+
+    candidate_state = getattr(state, "candidate_state", None)
+    candidate_ids: list[str] = []
+    if candidate_state is not None:
+        latest_ids = getattr(candidate_state, "latest_house_ids", None)
+        if isinstance(latest_ids, list):
+            for house_id in latest_ids:
+                if not isinstance(house_id, str) or not house_id:
+                    continue
+                candidate_ids.append(house_id)
+                if len(candidate_ids) >= _LLM_CONTEXT_HOUSE_LIMIT:
+                    break
+    if candidate_ids:
+        facts["latest_house_ids"] = candidate_ids
+
+    if include_candidate_tags:
+        houses_memory = getattr(state, "houses", None)
+        tag_lexicon = getattr(state, "tag_lexicon", None)
+        if isinstance(houses_memory, dict) and isinstance(tag_lexicon, dict) and candidate_ids:
+            house_tag_rows: list[dict[str, Any]] = []
+            tag_freq: dict[str, int] = {}
+            for house_id in candidate_ids:
+                memory = houses_memory.get(house_id)
+                tag_ids = getattr(memory, "tag_ids", None)
+                if not isinstance(tag_ids, list):
+                    continue
+                cleaned_ids: list[str] = []
+                for tag_id in tag_ids[:20]:
+                    if not isinstance(tag_id, str) or tag_id not in tag_lexicon:
+                        continue
+                    cleaned_ids.append(tag_id)
+                    tag_freq[tag_id] = tag_freq.get(tag_id, 0) + 1
+                if cleaned_ids:
+                    house_tag_rows.append({"house_id": house_id, "tag_ids": cleaned_ids})
+            if house_tag_rows and tag_freq:
+                ranked_tag_ids = sorted(tag_freq.keys(), key=lambda tid: (-tag_freq[tid], tid))[:_LLM_CONTEXT_TAG_LIMIT]
+                compact_lexicon = {tid: tag_lexicon[tid] for tid in ranked_tag_ids if isinstance(tag_lexicon.get(tid), str)}
+                if compact_lexicon:
+                    facts["candidate_tags"] = {"houses": house_tag_rows, "tag_lexicon": compact_lexicon}
+
+    pruned = _prune_empty_for_llm(facts, drop_false_keys=_SOFT_BOOL_DEFAULT_FALSE_KEYS)
+    return pruned if isinstance(pruned, dict) else {}
+
+
+def _build_llm_plan_context_facts(state: Any) -> dict[str, Any]:
+    return _build_llm_compact_context_facts(state, include_candidate_tags=True)
+
+
+def _build_llm_respond_context_facts(state: Any) -> dict[str, Any]:
+    return _build_llm_compact_context_facts(state, include_candidate_tags=False)
+
+
+def _sanitize_llm_parse(parsed: dict[str, Any]) -> dict[str, Any]:
+    intent = _sanitize_plan_intent(parsed.get("intent"))
+    if intent is None:
+        return {}
+    params = _sanitize_plan_params(parsed.get("params"))
+    tag_need = _sanitize_plan_tag_need(parsed.get("tag_need"))
+    return {"intent": intent, "params": params, "tag_need": tag_need}
+
+
+def _sanitize_plan_intent(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    intent = value.strip().lower()
+    allowed = {"chat", "search", "compare", "house_detail", "amenities", "listings", "rent_check", "rent", "terminate", "offline"}
+    if intent in allowed:
+        return intent
+    return None
+
+
+def _normalize_bedrooms_param(value: str) -> str | None:
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    normalized = cleaned.translate(str.maketrans({"一": "1", "二": "2", "两": "2", "三": "3", "四": "4", "五": "5"}))
+    numbers = re.findall(r"[1-9]", normalized)
+    if not numbers:
+        return None
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in numbers:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return ",".join(unique) if unique else None
+
+
+def _sanitize_plan_params(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    params: dict[str, Any] = {}
+
+    district = value.get("district")
+    if isinstance(district, str) and district.strip():
+        params["district"] = district.strip()
+
+    bedrooms = value.get("bedrooms")
+    if isinstance(bedrooms, str):
+        normalized_bedrooms = _normalize_bedrooms_param(bedrooms)
+        if normalized_bedrooms:
+            params["bedrooms"] = normalized_bedrooms
+
+    for key in ("min_price", "max_price", "max_subway_dist", "min_area"):
+        parsed = _coerce_int(value.get(key))
+        if parsed is not None:
+            params[key] = parsed
+
+    decoration = value.get("decoration")
+    if isinstance(decoration, str) and decoration.strip():
+        params["decoration"] = decoration.strip()
+
+    rental_type = value.get("rental_type")
+    if isinstance(rental_type, str):
+        cleaned_type = rental_type.strip()
+        if cleaned_type in {"整租", "合租"}:
+            params["rental_type"] = cleaned_type
+
+    elevator = _coerce_bool(value.get("elevator"))
+    if elevator is not None:
+        params["elevator"] = elevator
+
+    return params
+
+
+def _sanitize_plan_tag_need(value: Any) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {"must": [], "avoid": [], "prefer": []}
+    output: dict[str, list[str]] = {"must": [], "avoid": [], "prefer": []}
+    for key in ("must", "avoid", "prefer"):
+        raw = value.get(key)
+        if not isinstance(raw, list):
+            continue
+        seen: set[str] = set()
+        tokens: list[str] = []
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            token = item.strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            tokens.append(token)
+            if len(tokens) >= 12:
+                break
+        output[key] = tokens
+    return output
 
 
 def _apply_tool_argument_aliases(operation_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1175,27 +1551,21 @@ def _is_housing_context_inquiry(message: str, state: Any) -> bool:
 
 
 def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str, Any] | None = None) -> list[dict[str, str]]:
-    summary_text = summary[:500] if summary else ""
+    summary_text = summary[:220] if summary else ""
     context_json = json.dumps(context_facts or {}, ensure_ascii=False)
-    available_tools = ",".join(_load_llm_tool_names())
+    ops_index_json = json.dumps(_load_llm_ops_prompt_index(), ensure_ascii=False)
     content = (
-        "你是租房智能Agent决策器，目标是根据用户问题和tools列表决定如何查询。\n"
-        "只做三件事：识别intent、选择一个operationId、给出arguments。\n"
-        "要求：\n"
-        "1) 只能从tools选择，优先返回tool_calls；每次最多一个function。\n"
-        "2) arguments只允许使用工具定义参数名，不得新增字段。\n"
-        "3) 用户明确给house_id时必须使用；“这套/第一套”等可用focus_house_id/latest_search_house_ids指代。\n"
-        "4) 地点槽位：行政区/县/市/旗填district；商圈/片区/地标名填area。\n"
-        "5) 闲聊/情绪表达且无需工具时禁止tool_calls，返回chat JSON。\n"
-        "6) 有历史候选且用户补充偏好（如养宠/公园/看房方式/费用偏好）时，应视为继续筛选，优先search/compare而非chat。\n"
-        "6.1) 即使返回tool_calls，也必须在content里同时返回JSON对象（intent/tool_plan/hard/soft/tag_need/assistant_reply/confidence）。\n"
-        "6.2) 预算表达出现“左右/上下/附近/约/大概”时，优先输出budget_min+budget_max区间，不只给单边上限。\n"
-        "6.3) 偏好尽量沉淀到soft.preferred_tags/soft.avoid_tags（如月付、房东直租、VR看房、中介费、费用包含）。\n"
-        "6.4) 用户在问“这套可租吗/我可以租吗/能租吗”时，intent应为rent_check，不要直接给rent。\n"
-        "7) rent_house/terminate_rental/take_offline必须包含house_id和listing_platform。\n"
-        "chat返回格式：\n"
-        '{"intent":"chat","tool_plan":{"operationId":"none","arguments":{}},"hard":{},"soft":{},"tag_need":{"must":[],"avoid":[],"prefer":[]},"assistant_reply":"...","confidence":0.6}\n'
-        f"可用operationId：{available_tools}\n"
+        "你是租房智能Agent决策器（Plan模块），只输出严格JSON对象。\n"
+        "契约只允许三个顶层字段：intent、params、tag_need。\n"
+        "intent可选：chat/search/compare/house_detail/amenities/listings/rent_check/rent/terminate/offline。\n"
+        "params仅允许字段：district, bedrooms, min_price, max_price, decoration, max_subway_dist, rental_type, min_area, elevator。\n"
+        "tag_need仅允许字段：must, avoid, prefer（均为字符串数组）。\n"
+        "禁止输出 tool_plan/hard/soft/assistant_reply/confidence/其他字段。\n"
+        "预算表达“左右/上下/附近/约/大概”时，尽量给 min_price 与 max_price 区间。\n"
+        "用户问“这套可租吗/我可以租吗/能租吗”时intent应为rent_check，不要输出rent。\n"
+        "输出示例：\n"
+        '{"intent":"search","params":{"district":"朝阳","bedrooms":"2","max_price":3500},"tag_need":{"must":[],"avoid":[],"prefer":["VR看房"]}}\n'
+        f"可用操作索引(仅供参考)：{ops_index_json}\n"
         f"会话摘要：{summary_text}\n"
         f"上下文事实：{context_json}\n"
         f"用户输入：{message}"
@@ -1328,17 +1698,16 @@ async def _analyze_intent_with_llm(
         step=STEP_LLM_NLU,
         llm_stage="plan",
     )
-    tool_plan = _extract_llm_tool_plan(response_data)
     text_parse: dict[str, Any] | None = None
     llm_text = _extract_llm_text_content(response_data)
     if llm_text:
         parsed = _extract_json_object(llm_text)
         if isinstance(parsed, dict):
             text_parse = parsed
-
-    merged = _merge_llm_parse_candidates(tool_plan, text_parse)
-    if isinstance(merged, dict):
-        return _sanitize_llm_parse(merged)
+    if isinstance(text_parse, dict):
+        sanitized = _sanitize_llm_parse(text_parse)
+        if sanitized:
+            return sanitized
     return None
 
 
@@ -1687,7 +2056,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             state = existing_state
             if state is not None and getattr(state, "conversation_summary", ""):
                 state_summary = state.conversation_summary
-                context_facts = _build_llm_context_facts(state)
+                context_facts = _build_llm_plan_context_facts(state)
 
             prompt_basis = req.message + state_summary + json.dumps(context_facts, ensure_ascii=False)
             nlu_prompt_tokens = (
@@ -1760,7 +2129,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             llm_parse = invoke_meta.get("llm_parse") if isinstance(invoke_meta.get("llm_parse"), dict) else {}
             tool_results = get_tool_results()
             latest_state = service.state_store.get(req.session_id) if hasattr(service, "state_store") else None
-            respond_context_facts = _build_llm_context_facts(latest_state) if latest_state is not None else context_facts
+            respond_context_facts = _build_llm_respond_context_facts(latest_state) if latest_state is not None else context_facts
             intent_value = str(invoke_resp.debug.get("intent", "")).strip().lower()
             if response_kind in {"detail", "action"} and tool_results:
                 respond_prompt_basis = (
@@ -1806,17 +2175,6 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                         step=STEP_LLM_RESPOND,
                         error=str(exc),
                     )
-            elif response_kind == "chat":
-                assistant_reply = llm_parse.get("assistant_reply")
-                if isinstance(assistant_reply, str) and assistant_reply.strip():
-                    output_text = assistant_reply.strip()
-                    log_event(
-                        LOGGER,
-                        "chat.llm_nlu.reply_applied",
-                        step=STEP_LLM_NLU,
-                        llm_output=preview_text(output_text, limit=300),
-                    )
-
             house_intents = {"search", "compare", "house_detail", "amenities", "listings", "rent_check", "rent"}
             context_housing_inquiry = _is_housing_context_inquiry(req.message, latest_state)
             should_attach_houses = (
@@ -1922,7 +2280,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             entries = [item for item in entries if str(item.get("session_id", "")).strip() == session_id]
         entries = entries[-requested_limit:]
 
-        enriched = [{"stage": _stage_name(item), **item} for item in entries]
+        enriched = [_normalize_agent_io_entry_for_display({"stage": _stage_name(item), **item}) for item in entries]
         return {
             "count": len(enriched),
             "items": enriched,
