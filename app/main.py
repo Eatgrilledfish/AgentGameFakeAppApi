@@ -105,16 +105,22 @@ _TOOL_OPTIONAL_PARAM_PRIORITY = (
 _TOOL_OPTIONAL_PARAM_LIMIT = 10
 
 
-def _preview_http_body(raw_body: bytes, content_type: str | None, limit: int = 2000) -> str:
+def _parse_http_body_for_io(raw_body: bytes, content_type: str | None) -> Any:
     if not raw_body:
         return "<empty>"
 
     text = raw_body.decode("utf-8", errors="replace")
     if content_type and "application/json" in content_type.lower():
-        parsed = _extract_json_object(text)
-        if parsed is not None:
-            return preview_payload(parsed, limit=limit)
-    return preview_text(text, limit=limit)
+        parsed_obj = _extract_json_object(text)
+        if parsed_obj is not None:
+            return parsed_obj
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return text
 
 
 def _resolve_http_session_id(request: Request, raw_body: bytes, content_type: str | None) -> str:
@@ -223,6 +229,100 @@ def _normalize_agent_io_entry_for_display(entry: dict[str, Any]) -> dict[str, An
     return normalized if isinstance(normalized, dict) else entry
 
 
+def _format_ops_index_for_prompt(ops: list[dict[str, Any]], *, max_ops: int = 30) -> str:
+    if not ops:
+        return "-"
+    lines: list[str] = []
+    for row in ops[:max_ops]:
+        if not isinstance(row, dict):
+            continue
+        op_id = row.get("operationId")
+        args = row.get("args")
+        if not isinstance(op_id, str) or not op_id:
+            continue
+        if isinstance(args, list):
+            arg_names = [str(item).strip() for item in args if isinstance(item, str) and item.strip()]
+        else:
+            arg_names = []
+        lines.append(f"- {op_id}({','.join(arg_names)})")
+    return "\n".join(lines) if lines else "-"
+
+
+def _flatten_prompt_context_lines(value: Any, *, prefix: str = "", lines: list[str], max_lines: int = 80) -> None:
+    if len(lines) >= max_lines:
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if len(lines) >= max_lines:
+                return
+            if not isinstance(key, str):
+                continue
+            next_prefix = f"{prefix}.{key}" if prefix else key
+            _flatten_prompt_context_lines(item, prefix=next_prefix, lines=lines, max_lines=max_lines)
+        return
+    if isinstance(value, list):
+        if not value:
+            return
+        scalar_items = [item for item in value if isinstance(item, (str, int, float, bool))]
+        if scalar_items and len(scalar_items) == len(value):
+            joined = ",".join(str(item) for item in scalar_items[:12])
+            lines.append(f"{prefix}={joined}")
+            return
+        lines.append(f"{prefix}=[{len(value)} items]")
+        return
+    if value is None:
+        return
+    lines.append(f"{prefix}={value}")
+
+
+def _format_context_facts_for_prompt(context_facts: dict[str, Any] | None) -> str:
+    if not isinstance(context_facts, dict) or not context_facts:
+        return "-"
+    lines: list[str] = []
+    _flatten_prompt_context_lines(context_facts, lines=lines, max_lines=80)
+    return "\n".join(lines) if lines else "-"
+
+
+def _format_tool_results_for_prompt(
+    tool_results: list[dict[str, Any]] | None,
+    *,
+    max_tools: int = 8,
+    max_lines: int = 120,
+) -> str:
+    if not isinstance(tool_results, list) or not tool_results:
+        return "-"
+
+    lines: list[str] = []
+    for idx, row in enumerate(tool_results[:max_tools], start=1):
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name")
+        success = row.get("success")
+        method = row.get("method")
+        status_code = row.get("status_code")
+        url = row.get("url")
+        lines.append(
+            (
+                f"[{idx}] name={name if isinstance(name, str) and name else '-'} "
+                f"success={success} method={method if isinstance(method, str) and method else '-'} "
+                f"status={status_code if status_code is not None else '-'} "
+                f"url={url if isinstance(url, str) and url else '-'}"
+            )
+        )
+
+        output_lines: list[str] = []
+        _flatten_prompt_context_lines(row.get("output"), prefix=f"[{idx}].output", lines=output_lines, max_lines=24)
+        if output_lines:
+            lines.extend(output_lines)
+
+        if len(lines) >= max_lines:
+            lines = lines[:max_lines]
+            lines.append("...(more tool result lines omitted)")
+            break
+
+    return "\n".join(lines) if lines else "-"
+
+
 def _build_model_base_url(model_ip: str) -> str:
     if model_ip.startswith(("http://", "https://")):
         return model_ip
@@ -293,7 +393,7 @@ async def _forward_chat_completion(
             "session_id": session_id or "-",
             "headers": headers,
             "request_content_type": "application/json",
-            "request_body": preview_payload(payload, limit=8000),
+            "request_body": payload,
         },
     )
 
@@ -317,7 +417,7 @@ async def _forward_chat_completion(
                 "session_id": session_id or "-",
                 "status_code": resp.status_code,
                 "response_content_type": getattr(resp, "headers", {}).get("content-type", "application/json"),
-                "response_body": preview_payload(response_body, limit=8000),
+                "response_body": response_body,
                 "duration_ms": int((time.perf_counter() - started) * 1000),
             },
         )
@@ -1552,8 +1652,8 @@ def _is_housing_context_inquiry(message: str, state: Any) -> bool:
 
 def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str, Any] | None = None) -> list[dict[str, str]]:
     summary_text = summary[:220] if summary else ""
-    context_json = json.dumps(context_facts or {}, ensure_ascii=False)
-    ops_index_json = json.dumps(_load_llm_ops_prompt_index(), ensure_ascii=False)
+    context_text = _format_context_facts_for_prompt(context_facts)
+    ops_index_text = _format_ops_index_for_prompt(_load_llm_ops_prompt_index())
     content = (
         "你是租房智能Agent决策器（Plan模块），只输出严格JSON对象。\n"
         "契约只允许三个顶层字段：intent、params、tag_need。\n"
@@ -1565,9 +1665,9 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
         "用户问“这套可租吗/我可以租吗/能租吗”时intent应为rent_check，不要输出rent。\n"
         "输出示例：\n"
         '{"intent":"search","params":{"district":"朝阳","bedrooms":"2","max_price":3500},"tag_need":{"must":[],"avoid":[],"prefer":["VR看房"]}}\n'
-        f"可用操作索引(仅供参考)：{ops_index_json}\n"
+        f"可用操作索引(仅供参考)：\n{ops_index_text}\n"
         f"会话摘要：{summary_text}\n"
-        f"上下文事实：{context_json}\n"
+        f"上下文事实：\n{context_text}\n"
         f"用户输入：{message}"
     )
     return [{"role": "user", "content": content}]
@@ -1739,6 +1839,8 @@ def _build_llm_detail_reply_messages(
     context_facts: dict[str, Any] | None = None,
     tool_results: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
+    context_text = _format_context_facts_for_prompt(context_facts)
+    tool_results_text = _format_tool_results_for_prompt(tool_results)
     content = (
         "你是租房智能Agent的回复生成器。必须严格基于工具结果作答，禁止臆测。\n"
         "任务：根据“用户原话 + 工具结果 + Agent草稿”生成最终回复。\n"
@@ -1746,12 +1848,12 @@ def _build_llm_detail_reply_messages(
         "1) 不得编造房源事实（状态、价格、距离、朝向等）。若工具结果缺失，明确说明“当前工具结果未提供该信息”。\n"
         "2) 若是操作类结果（租房/退租/下架），要明确说明是否成功及关键对象（house_id、平台、状态）。\n"
         "3) 语气专业、友善、简洁。\n"
-        "4) 若上下文提供latest_top_houses中的amenity_summary/key_tags，可作为已知事实引用（这些来自上游工具结果的会话压缩）。\n"
+        "4) 若上下文中有候选房源摘要或标签，可作为已知事实引用（这些来自上游工具结果的会话压缩）。\n"
         "5) 仅输出JSON object，格式必须为：{\"assistant_reply\":\"...\"}，不要输出其他字段。\n"
         f"用户原话：{user_message}\n"
         f"Agent草稿：{draft_reply}\n"
-        f"会话上下文(JSON)：{json.dumps(context_facts or {}, ensure_ascii=False)}\n"
-        f"工具结果(JSON)：{json.dumps(tool_results or [], ensure_ascii=False)}"
+        f"会话上下文：\n{context_text}\n"
+        f"工具结果摘要：\n{tool_results_text}"
     )
     return [{"role": "user", "content": content}]
 
@@ -1932,7 +2034,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                     "path": request.url.path,
                     "query": str(request.query_params),
                     "request_content_type": req_content_type or "<unknown>",
-                    "request_body": _preview_http_body(raw_body, req_content_type),
+                    "request_body": _parse_http_body_for_io(raw_body, req_content_type),
                 },
             )
 
@@ -1972,7 +2074,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
                     "query": str(request.query_params),
                     "status_code": replay_response.status_code,
                     "response_content_type": resp_content_type or "<unknown>",
-                    "response_body": _preview_http_body(response_body, resp_content_type),
+                    "response_body": _parse_http_body_for_io(response_body, resp_content_type),
                     "duration_ms": duration_ms,
                 },
             )
@@ -2313,6 +2415,28 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
     const query = new URLSearchParams(window.location.search);
     const sessionId = query.get('session_id');
 
+    function formatValue(value, indent = 0) {
+      const pad = '  '.repeat(indent);
+      if (value === null) return 'null';
+      if (Array.isArray(value)) {
+        if (value.length === 0) return '[]';
+        const rows = value.map((item) => `${pad}  - ${formatValue(item, indent + 1)}`);
+        return `[\n${rows.join('\n')}\n${pad}]`;
+      }
+      if (typeof value === 'object') {
+        const entries = Object.entries(value);
+        if (entries.length === 0) return '{}';
+        const rows = entries.map(([k, v]) => `${pad}  ${k}: ${formatValue(v, indent + 1)}`);
+        return `{\n${rows.join('\n')}\n${pad}}`;
+      }
+      if (typeof value === 'string') {
+        if (!value.includes('\n')) return value;
+        const textRows = value.split('\n').map((line) => `${pad}  ${line}`);
+        return `|\n${textRows.join('\n')}`;
+      }
+      return String(value);
+    }
+
     async function load() {
       const params = new URLSearchParams({ limit: '200' });
       if (sessionId) params.set('session_id', sessionId);
@@ -2327,7 +2451,7 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         stage.className = 'stage';
         stage.textContent = item.stage || '其他';
         const pre = document.createElement('pre');
-        pre.textContent = JSON.stringify(item, null, 2);
+        pre.textContent = formatValue(item);
         div.appendChild(stage);
         div.appendChild(pre);
         list.appendChild(div);

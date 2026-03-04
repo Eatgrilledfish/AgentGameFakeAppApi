@@ -573,7 +573,8 @@ def test_chat_route_uses_two_llm_passes_for_detail_when_tool_results_exist() -> 
             assert json["tools"] == []
             second_content = json["messages"][0]["content"]
             assert "你是租房智能Agent的回复生成器" in second_content
-            assert "工具结果(JSON)" in second_content
+            assert "工具结果摘要：" in second_content
+            assert "会话上下文：" in second_content
             return StubResponse(
                 {
                     "choices": [
@@ -1341,3 +1342,37 @@ def test_debug_agent_io_events_decode_nested_json_strings_for_display(monkeypatc
     assert isinstance(first.get("response_body"), dict)
     assert first["request_body"]["messages"][0]["role"] == "user"
     assert first["response_body"]["choices"][0]["message"]["content"] == "ok"
+
+
+def test_debug_agent_io_events_keep_large_body_without_truncation(monkeypatch, tmp_path) -> None:
+    log_file = tmp_path / "agent_http_io.log"
+    large_prompt = "x" * 12000
+    payload = {
+        "event": "http.agent_io.llm.request",
+        "session_id": "sess-big",
+        "method": "POST",
+        "path": "/api/v1/chat",
+        "request_body": {
+            "model": "",
+            "messages": [{"role": "user", "content": large_prompt}],
+            "tools": [],
+            "stream": False,
+        },
+    }
+    log_file.write_text(
+        "2026-03-03 10:00:00 " + json.dumps(payload, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_HTTP_IO_LOG_PATH", str(log_file))
+
+    app = create_app()
+    with TestClient(app) as client:
+        resp = client.get("/debug/agent-io/events", params={"session_id": "sess-big", "limit": 20})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 1
+    first = body["items"][0]
+    content = first["request_body"]["messages"][0]["content"]
+    assert content == large_prompt
+    assert "...(truncated)" not in content

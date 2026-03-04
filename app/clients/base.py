@@ -131,7 +131,7 @@ class BaseClient:
                     "method": "GET",
                     "url": url,
                     "status_code": response.status_code,
-                    "body": preview_payload(payload, limit=8000),
+                    "body": payload,
                 },
             )
             record_tool_result(
@@ -232,7 +232,7 @@ class BaseClient:
                     "method": "POST",
                     "url": url,
                     "status_code": response.status_code,
-                    "body": preview_payload(payload, limit=8000),
+                    "body": payload,
                 },
             )
             record_tool_result(
