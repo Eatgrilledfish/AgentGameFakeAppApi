@@ -2697,71 +2697,115 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
   <div class="hint">顺序关注：用户输入 → LLM输入 → LLM输出 → API调用 → API输出 → 最终回复。可在 URL 上附加 ?session_id=xxx 只看单会话。</div>
   <div id="list"></div>
   <script>
-    const query = new URLSearchParams(window.location.search);
-    const sessionId = query.get('session_id');
+    var query = new URLSearchParams(window.location.search);
+    var sessionId = query.get('session_id');
 
-    function formatValue(value, indent = 0) {
-      const pad = '  '.repeat(indent);
+    function repeatPad(indent) {
+      var pad = '';
+      var i;
+      for (i = 0; i < indent; i++) pad += '  ';
+      return pad;
+    }
+
+    function formatValue(value, indent) {
+      var i;
+      var pad = repeatPad(indent || 0);
       if (value === null) return 'null';
-      if (Array.isArray(value)) {
+      if (Object.prototype.toString.call(value) === '[object Array]') {
         if (value.length === 0) return '[]';
-        const rows = value.map((item) => `${pad}  - ${formatValue(item, indent + 1)}`);
-        return `[\n${rows.join('\n')}\n${pad}]`;
+        var rows = [];
+        for (i = 0; i < value.length; i++) {
+          rows.push(pad + '  - ' + formatValue(value[i], (indent || 0) + 1));
+        }
+        return '[\\n' + rows.join('\\n') + '\\n' + pad + ']';
       }
       if (typeof value === 'object') {
-        const entries = Object.entries(value);
-        if (entries.length === 0) return '{}';
-        const rows = entries.map(([k, v]) => `${pad}  ${k}: ${formatValue(v, indent + 1)}`);
-        return `{\n${rows.join('\n')}\n${pad}}`;
+        var keys = Object.keys(value || {});
+        if (keys.length === 0) return '{}';
+        var objRows = [];
+        for (i = 0; i < keys.length; i++) {
+          var k = keys[i];
+          objRows.push(pad + '  ' + k + ': ' + formatValue(value[k], (indent || 0) + 1));
+        }
+        return '{\\n' + objRows.join('\\n') + '\\n' + pad + '}';
       }
       if (typeof value === 'string') {
-        if (!value.includes('\n')) return value;
-        const textRows = value.split('\n').map((line) => `${pad}  ${line}`);
-        return `|\n${textRows.join('\n')}`;
+        if (value.indexOf('\\n') === -1) return value;
+        var lines = value.split('\\n');
+        var textRows = [];
+        for (i = 0; i < lines.length; i++) {
+          textRows.push(pad + '  ' + lines[i]);
+        }
+        return '|\\n' + textRows.join('\\n');
       }
       return String(value);
     }
 
-    async function load() {
-      const list = document.getElementById('list');
-      try {
-        const params = new URLSearchParams({ limit: '80', compact: '1' });
-        if (sessionId) params.set('session_id', sessionId);
-        const res = await fetch('/debug/agent-io/events?' + params.toString());
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-        list.innerHTML = '';
-        const meta = document.createElement('div');
-        meta.className = 'card';
-        meta.textContent = `count=${data.count || 0} | log_path=${data.log_path || '-'} | log_exists=${data.log_exists ? 'yes' : 'no'}`;
-        list.appendChild(meta);
-        if (!Array.isArray(data.items) || data.items.length === 0) {
-          const tip = document.createElement('div');
-          tip.className = 'card';
-          tip.textContent = '暂无日志。可先发一条 /api/v1/chat 请求，或检查 session_id 过滤、日志路径。';
-          list.appendChild(tip);
+    function renderError(message) {
+      var list = document.getElementById('list');
+      list.innerHTML = '';
+      var tip = document.createElement('div');
+      tip.className = 'card';
+      tip.textContent = message;
+      list.appendChild(tip);
+    }
+
+    function load() {
+      var params = new URLSearchParams({ limit: '80', compact: '1' });
+      if (sessionId) params.set('session_id', sessionId);
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/debug/agent-io/events?' + params.toString(), true);
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState !== 4) return;
+        if (xhr.status < 200 || xhr.status >= 300) {
+          renderError('日志加载失败：HTTP ' + xhr.status);
           return;
         }
-        for (const item of data.items) {
-          const div = document.createElement('div');
+        var data;
+        try {
+          data = JSON.parse(xhr.responseText || '{}');
+        } catch (e) {
+          renderError('日志加载失败：JSON解析错误');
+          return;
+        }
+
+        var list = document.getElementById('list');
+        list.innerHTML = '';
+
+        var meta = document.createElement('div');
+        meta.className = 'card';
+        meta.textContent =
+          'count=' + (data.count || 0) +
+          ' | log_path=' + (data.log_path || '-') +
+          ' | log_exists=' + (data.log_exists ? 'yes' : 'no');
+        list.appendChild(meta);
+
+        if (!data.items || !data.items.length) {
+          var emptyTip = document.createElement('div');
+          emptyTip.className = 'card';
+          emptyTip.textContent = '暂无日志。可先发一条 /api/v1/chat 请求，或检查 session_id 过滤、日志路径。';
+          list.appendChild(emptyTip);
+          return;
+        }
+
+        var j;
+        for (j = 0; j < data.items.length; j++) {
+          var item = data.items[j];
+          var div = document.createElement('div');
           div.className = 'card';
-          const stage = document.createElement('div');
+          var stage = document.createElement('div');
           stage.className = 'stage';
           stage.textContent = item.stage || '其他';
-          const pre = document.createElement('pre');
-          pre.textContent = formatValue(item);
+          var pre = document.createElement('pre');
+          pre.textContent = formatValue(item, 0);
           div.appendChild(stage);
           div.appendChild(pre);
           list.appendChild(div);
         }
-      } catch (err) {
-        list.innerHTML = '';
-        const tip = document.createElement('div');
-        tip.className = 'card';
-        tip.textContent = '日志加载失败：' + String(err);
-        list.appendChild(tip);
-      }
+      };
+      xhr.send(null);
     }
+
     load();
     setInterval(load, 4000);
   </script>
