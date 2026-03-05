@@ -1294,6 +1294,103 @@ async def test_dialogue_rejected_hard_conflict_can_drop_non_top2() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dialogue_must_tags_are_hard_constraints_for_candidate_output() -> None:
+    class MustPlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            self.executed_queries.append(query.model_copy(deep=True))
+            _ = plan
+            _ = case_type
+            return [
+                HouseLite(
+                    house_id="HF_MUST_OK",
+                    rent=3600,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    subway_distance=500,
+                    commute_to_xierqi_min=40,
+                    status="可租",
+                    tags=["可养狗", "月付"],
+                ),
+                HouseLite(
+                    house_id="HF_MUST_FAIL",
+                    rent=3200,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    subway_distance=450,
+                    commute_to_xierqi_min=35,
+                    status="可租",
+                    tags=["月付"],
+                ),
+            ]
+
+    dialogue, state, _, _ = _build_dialogue(planner=MustPlanner(), houses_client=DummyHousesClient())
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-must-hard",
+            case_type=CaseType.single,
+            message="帮我找朝阳两居",
+            meta={"llm_parse": {"intent": "search", "params": {"district": "朝阳"}, "tag_need": {"must": ["可养狗"], "avoid": [], "prefer": []}}},
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    assert [item.house_id for item in resp.candidates] == ["HF_MUST_OK"]
+    decisions = resp.debug["semantic_fusion"]["decisions"]
+    assert decisions["HF_MUST_FAIL"]["action"] == "rejected_drop"
+    assert "未命中刚需标签" in decisions["HF_MUST_FAIL"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_dialogue_prefer_tags_prioritized_without_must_and_not_hard_filtered() -> None:
+    class PreferPlanner(DummyPlanner):
+        async def execute_plan(self, plan: _Plan, query: StructuredQuery, case_type: CaseType) -> list[HouseLite]:
+            self.executed_queries.append(query.model_copy(deep=True))
+            _ = plan
+            _ = case_type
+            return [
+                HouseLite(
+                    house_id="HF_PLAIN",
+                    rent=3200,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    subway_distance=450,
+                    commute_to_xierqi_min=35,
+                    status="可租",
+                    tags=["房东直租"],
+                ),
+                HouseLite(
+                    house_id="HF_PREFER",
+                    rent=3600,
+                    layout="2居1厅1卫",
+                    district="朝阳",
+                    subway_distance=650,
+                    commute_to_xierqi_min=55,
+                    status="可租",
+                    tags=["月付", "房东直租"],
+                ),
+            ]
+
+    dialogue, state, _, _ = _build_dialogue(planner=PreferPlanner(), houses_client=DummyHousesClient())
+    resp = await dialogue.handle_turn(
+        InvokeRequest(
+            session_id="sess-prefer-priority",
+            case_type=CaseType.single,
+            message="帮我找朝阳两居",
+            meta={"llm_parse": {"intent": "search", "params": {"district": "朝阳"}, "tag_need": {"must": [], "avoid": [], "prefer": ["月付"]}}},
+        ),
+        state,
+        is_new_session=True,
+    )
+
+    # prefer 在无 must 时优先，但未命中 prefer 的房源仍保留在候选中（可要可不要）
+    assert [item.house_id for item in resp.candidates][:2] == ["HF_PREFER", "HF_PLAIN"]
+    selected = resp.debug["semantic_filter"]["selected"]
+    assert set(selected) == {"HF_PREFER", "HF_PLAIN"}
+    assert resp.debug["semantic_filter"]["prefer_selected"] == ["HF_PREFER"]
+
+
+@pytest.mark.asyncio
 async def test_dialogue_candidate_filter_uses_tagfocus_relevant_subset_and_limit() -> None:
     many_tags = [f"宽带标签{i}" for i in range(1, 71)] + ["完全无关标签"]
 

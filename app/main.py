@@ -2503,12 +2503,17 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
         "格式：i=<intent>|p=k:v;k:v|t=m:x,y;a:u,v;p:q,r\n"
         "intent可选：chat/search/compare/house_detail/amenities/listings/rent_check/rent/terminate/offline。\n"
         "p仅允许键：district,bedrooms,min_price,max_price,decoration,subway_distance,rental_type,min_area,elevator,noise_preference。\n"
-        "t里 m=must, a=avoid, p=prefer；没值留空。\n"
-        "t 的标签必须从“标签全集”里选择，并保持标签原文，不要改写或造新标签。\n"
+        "noise_preference只返回true/false：用户明确要安静->true，否则false(true=只匹配hidden_noise_level=安静)。\n"
+        "核心优先级：先填p，后填t；凡能映射到p(地区/户型/预算/装修/地铁距离/整租合租/面积/电梯/噪音)必须写p。\n"
+        "t里m=must,a=avoid,p=prefer；t标签输出必须来自【标签全集】原文，但允许语义匹配：用户表述不必与标签字面一致。\n"
         "若同一桶（m/a/p）命中多个标签，必须全部返回（去重后逗号分隔），不能只返回一个。\n"
-        "桶判定：默认把“最好/优先/尽量”视作 must；只有出现“没有也行/不强求/可有可无/无所谓/不介意/都行”等弱化表达时，才降为 prefer。\n"
+        "你需在【标签全集】中选择语义最贴近且不扩大含义的标签(最近邻)；若无法确定唯一标签则该桶留空；禁止编造/改写标签。\n"
+        "桶判定仅对已命中全集的标签生效：默认“最好/优先/尽量”视作must；只有出现“没有也行/不强求/可有可无/无所谓/不介意/都行”等弱化表达才降为prefer。\n"
+        "强映射：单间/主卧/次卧/找一个房间/合租->rental_type=合租，不能据此填bedrooms=1；一居/1居/一室/一室一厅->bedrooms=1(若同时出现单间/合租则优先合租)。\n"
+        "冲突消解：当已判定rental_type=合租时，除非用户明确“X居合租”，否则不要输出bedrooms。\n"
+        "规则：用户问“这套可租吗/我可以租吗/能租吗”->i=rent_check；预算含“左右/上下/附近/约/大概”->尽量给min_price与max_price区间；提到近地铁->subway_distance=800。\n"
+        "示例：离健身房近/附近有健身房->近健身房；离公园近->近公园。\n"
         f"标签全集：{tag_catalog_text}\n"
-        "规则：用户问“这套可租吗/我可以租吗/能租吗”时 i=rent_check；预算表达“左右/上下/附近/约/大概”时尽量给 min_price 与 max_price 区间；提到近地铁时优先给 subway_distance:800；noise_preference 只返回 true/false：用户明确要安静时 true，否则 false。true 表示后续只匹配 hidden_noise_level=安静。\n"
         "示例：i=search|p=district:朝阳;bedrooms:2;max_price:3500;subway_distance:800;noise_preference:true|t=m:可养狗,近公园;a:年付,收中介费;p:月付,房东直租\n"
     )
     user_content = (
@@ -3153,6 +3158,81 @@ def _apply_search_rerank_to_state(
             setattr(state, "conversation_summary", summary_builder(state))
 
 
+def _item_house_id(item: Any) -> str | None:
+    if isinstance(item, dict):
+        value = item.get("house_id")
+        return value if isinstance(value, str) and value else None
+    value = getattr(item, "house_id", None)
+    return value if isinstance(value, str) and value else None
+
+
+def _extract_semantic_must_selected_house_ids(debug: dict[str, Any]) -> tuple[set[str], bool]:
+    if not isinstance(debug, dict):
+        return set(), False
+    semantic = debug.get("semantic_filter")
+    if not isinstance(semantic, dict):
+        return set(), False
+
+    merged_need = semantic.get("merged_tag_need")
+    must_tags: list[str] = []
+    if isinstance(merged_need, dict):
+        raw_must = merged_need.get("must")
+        if isinstance(raw_must, list):
+            must_tags = [item.strip() for item in raw_must if isinstance(item, str) and item.strip()]
+    has_must = bool(must_tags)
+
+    selected: set[str] = set()
+    raw_selected = semantic.get("selected")
+    if isinstance(raw_selected, list):
+        for item in raw_selected:
+            if isinstance(item, str) and item:
+                selected.add(item)
+    return selected, has_must
+
+
+def _enforce_state_context_with_must_selected_ids(state: Any, selected_house_ids: set[str]) -> bool:
+    if state is None:
+        return False
+
+    changed = False
+
+    def _filter_items(items: Any) -> list[Any]:
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if (house_id := _item_house_id(item)) is not None and house_id in selected_house_ids]
+
+    house_context_top10 = _filter_items(getattr(state, "house_context_top10", None))
+    if getattr(state, "house_context_top10", None) != house_context_top10:
+        setattr(state, "house_context_top10", house_context_top10)
+        changed = True
+
+    last_candidates = _filter_items(getattr(state, "last_candidates", None))
+    if getattr(state, "last_candidates", None) != last_candidates:
+        setattr(state, "last_candidates", last_candidates)
+        changed = True
+
+    candidate_state = getattr(state, "candidate_state", None)
+    if candidate_state is not None:
+        latest_ids = getattr(candidate_state, "latest_house_ids", None)
+        filtered_ids = [item for item in latest_ids if isinstance(item, str) and item in selected_house_ids] if isinstance(latest_ids, list) else []
+        if latest_ids != filtered_ids:
+            setattr(candidate_state, "latest_house_ids", filtered_ids)
+            changed = True
+        focus_house_id = getattr(candidate_state, "focus_house_id", None)
+        if isinstance(focus_house_id, str) and focus_house_id and focus_house_id not in selected_house_ids:
+            setattr(candidate_state, "focus_house_id", filtered_ids[0] if filtered_ids else None)
+            changed = True
+
+    focus_house_id = getattr(state, "focus_house_id", None)
+    if isinstance(focus_house_id, str) and focus_house_id and focus_house_id not in selected_house_ids:
+        candidate_focus = getattr(getattr(state, "candidate_state", None), "focus_house_id", None)
+        replacement = candidate_focus if isinstance(candidate_focus, str) and candidate_focus else None
+        setattr(state, "focus_house_id", replacement)
+        changed = True
+
+    return changed
+
+
 async def _rerank_search_results_with_llm(
     http_client: httpx.AsyncClient,
     *,
@@ -3587,21 +3667,42 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             intent_value = str(invoke_resp.debug.get("intent", "")).strip().lower()
             if response_kind == "search" and latest_state is not None:
                 state_dirty = False
-                if invoke_resp.candidates:
-                    _apply_search_rerank_to_state(
-                        latest_state,
-                        reranked_views=invoke_resp.candidates,
-                        assistant_text=output_text,
-                        dialogue_manager=getattr(service, "dialogue", None),
-                    )
-                    state_dirty = True
+                semantic_selected_ids, has_must_tag_need = _extract_semantic_must_selected_house_ids(invoke_resp.debug)
+                has_semantic_filter = isinstance(invoke_resp.debug.get("semantic_filter"), dict)
+                if has_must_tag_need:
+                    if _enforce_state_context_with_must_selected_ids(latest_state, semantic_selected_ids):
+                        state_dirty = True
+                    invoke_resp.debug["context_must_guard"] = {
+                        "applied": True,
+                        "selected_count": len(semantic_selected_ids),
+                    }
+
+                # In real agent flow, dialogue layer has already produced strict context.
+                # Avoid rehydrating context from unfiltered top5 here.
+                fallback_candidates_for_context: list[Any] = []
+                if not has_semantic_filter:
+                    if invoke_resp.candidates:
+                        _apply_search_rerank_to_state(
+                            latest_state,
+                            reranked_views=invoke_resp.candidates,
+                            assistant_text=output_text,
+                            dialogue_manager=getattr(service, "dialogue", None),
+                        )
+                        state_dirty = True
+                    fallback_candidates_for_context = invoke_resp.candidates
+
                 house_context_top10 = _build_search_rerank_house_context_top10(
                     latest_state,
-                    invoke_resp.candidates,
+                    fallback_candidates_for_context,
                     tool_results=tool_results,
                     limit=_SEARCH_RERANK_HOUSE_CONTEXT_LIMIT,
                 )
-                if house_context_top10:
+                if has_must_tag_need:
+                    strict_top10 = [row for row in house_context_top10 if isinstance(row.get("house_id"), str) and row["house_id"] in semantic_selected_ids]
+                    _set_state_house_context_top10(latest_state, strict_top10, limit=_SEARCH_RERANK_HOUSE_CONTEXT_LIMIT)
+                    house_context_top10 = strict_top10
+                    state_dirty = True
+                elif house_context_top10:
                     state_dirty = True
                 invoke_resp.debug["llm_search_rerank"] = {
                     "applied": False,

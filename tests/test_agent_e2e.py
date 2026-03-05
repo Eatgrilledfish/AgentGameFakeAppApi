@@ -1362,6 +1362,97 @@ def test_chat_route_search_context_config_still_works_in_single_llm_mode() -> No
     assert captured["llm_calls"] == 1
 
 
+def test_chat_route_must_tag_guard_keeps_only_must_matched_houses_in_context() -> None:
+    app = create_app()
+
+    state = SessionState(session_id="sess-must-guard", user_id="u-1", case_type=CaseType.multi)
+    state.house_context_top10 = [
+        HouseLite(house_id="HF_M1", rent=3200, district="朝阳", layout="2居"),
+        HouseLite(house_id="HF_N1", rent=3300, district="朝阳", layout="2居"),
+    ]
+    state.last_candidates = [
+        HouseLite(house_id="HF_M1", rent=3200, district="朝阳", layout="2居"),
+        HouseLite(house_id="HF_N1", rent=3300, district="朝阳", layout="2居"),
+    ]
+    state.candidate_state.latest_house_ids = ["HF_M1", "HF_N1"]
+    state.candidate_state.focus_house_id = "HF_N1"
+    state.focus_house_id = "HF_N1"
+
+    class StubStateStore:
+        def __init__(self):
+            self.state = state
+
+        def get(self, session_id):
+            assert session_id == "sess-must-guard"
+            return self.state
+
+        def upsert(self, value):
+            self.state = value
+
+    class StubService:
+        state_store = StubStateStore()
+
+        async def handle(self, request):
+            return InvokeResponse(
+                text="已找到候选房源",
+                candidates=[
+                    HouseViewModel(house_id="HF_N1", rent=3300),
+                    HouseViewModel(house_id="HF_M1", rent=3200),
+                ],
+                debug={
+                    "response_kind": "search",
+                    "intent": "search",
+                    "semantic_filter": {
+                        "merged_tag_need": {"must": ["可养狗"], "avoid": [], "prefer": []},
+                        "selected": ["HF_M1"],
+                        "must_confirm": [{"house_id": "HF_N1", "reason": "刚需标签未明确标注"}],
+                        "rejected": [],
+                    },
+                },
+            )
+
+    class StubResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "i=search|p=district:朝阳|t=m:可养狗;a:;p:",
+                        }
+                    }
+                ]
+            }
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            _ = url
+            _ = json
+            assert headers["Session-ID"] == "sess-must-guard"
+            return StubResponse()
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-must-guard", "message": "我要可养狗的两居"},
+        )
+
+    assert resp.status_code == 200
+    payload = _response_json(resp)
+    assert payload["houses"] == ["HF_N1", "HF_M1"]
+    assert [item.house_id for item in state.house_context_top10] == ["HF_M1"]
+    assert [item.house_id for item in state.last_candidates] == ["HF_M1"]
+    assert state.candidate_state.latest_house_ids == ["HF_M1"]
+    assert state.candidate_state.focus_house_id == "HF_M1"
+    assert state.focus_house_id == "HF_M1"
+
+
 def test_chat_route_uses_single_llm_call_and_applies_chat_reply_from_nlu() -> None:
     app = create_app()
     captured: dict = {}

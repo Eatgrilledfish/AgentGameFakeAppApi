@@ -1046,6 +1046,7 @@ class DialogueManager:
                 "merged_tag_need": merged_need.model_dump(),
                 "relevant_tag_ids": [],
                 "selected": [house.house_id for house in candidates if house.house_id in allowlist],
+                "prefer_selected": [],
                 "must_confirm": [],
                 "rejected": [],
             }
@@ -1066,21 +1067,27 @@ class DialogueManager:
                 "merged_tag_need": merged_need.model_dump(),
                 "relevant_tag_ids": [],
                 "selected": fallback["selected"],
+                "prefer_selected": fallback["prefer_selected"],
                 "must_confirm": fallback["must_confirm"],
                 "rejected": fallback["rejected"],
             }
 
         selected: list[str] = []
+        prefer_selected: list[str] = []
         must_confirm: list[dict[str, str]] = []
         rejected: list[dict[str, str]] = []
         relevant_tag_id_set = set(relevant_lexicon.keys())
+        must_reason = f"未命中刚需标签：{','.join(merged_need.must[:3])}" if merged_need.must else ""
 
         for house in candidates:
             if house.house_id not in allowlist:
                 continue
             memory = state.houses.get(house.house_id)
             if memory is None:
-                must_confirm.append({"house_id": house.house_id, "reason": "标签信息缺失，无法匹配"})
+                if merged_need.must:
+                    rejected.append({"house_id": house.house_id, "reason": must_reason or "未命中刚需标签"})
+                else:
+                    must_confirm.append({"house_id": house.house_id, "reason": "标签信息缺失，无法匹配"})
                 continue
             house_tag_ids = [tid for tid in memory.tag_ids if tid in relevant_tag_id_set][:20]
             tag_texts = [relevant_lexicon.get(tid, "") for tid in house_tag_ids if relevant_lexicon.get(tid)]
@@ -1092,19 +1099,18 @@ class DialogueManager:
 
             must_hit = self._match_any_need(merged_need.must, tag_texts)
             if merged_need.must and must_hit is None:
-                must_confirm.append({"house_id": house.house_id, "reason": "刚需标签未明确标注"})
+                rejected.append({"house_id": house.house_id, "reason": must_reason or "未命中刚需标签"})
                 continue
 
             prefer_hit = self._match_any_need(merged_need.prefer, tag_texts)
-            if not merged_need.must and merged_need.prefer and prefer_hit is None:
-                rejected.append({"house_id": house.house_id, "reason": "偏好标签未命中"})
-                continue
-
             selected.append(house.house_id)
+            if prefer_hit is not None:
+                prefer_selected.append(house.house_id)
 
         sanitized = self._sanitize_candidate_filter_output(
             allowlist=allowlist,
             selected=selected,
+            prefer_selected=prefer_selected,
             must_confirm=must_confirm,
             rejected=rejected,
         )
@@ -1114,6 +1120,7 @@ class DialogueManager:
             "merged_tag_need": merged_need.model_dump(),
             "relevant_tag_ids": list(relevant_lexicon.keys()),
             "selected": sanitized["selected"],
+            "prefer_selected": sanitized["prefer_selected"],
             "must_confirm": sanitized["must_confirm"],
             "rejected": sanitized["rejected"],
         }
@@ -1126,15 +1133,20 @@ class DialogueManager:
         merged_need: TagNeed,
     ) -> dict[str, Any]:
         selected: list[str] = []
+        prefer_selected: list[str] = []
         must_confirm: list[dict[str, str]] = []
         rejected: list[dict[str, str]] = []
+        must_reason = f"未命中刚需标签：{','.join(merged_need.must[:3])}" if merged_need.must else ""
 
         for house in candidates:
             if house.house_id not in allowlist:
                 continue
             raw_tags = [tag.strip() for tag in house.tags if isinstance(tag, str) and tag.strip()]
             if not raw_tags:
-                must_confirm.append({"house_id": house.house_id, "reason": "标签信息缺失，无法匹配"})
+                if merged_need.must:
+                    rejected.append({"house_id": house.house_id, "reason": must_reason or "未命中刚需标签"})
+                else:
+                    must_confirm.append({"house_id": house.house_id, "reason": "标签信息缺失，无法匹配"})
                 continue
 
             avoid_hit = self._match_any_need(merged_need.avoid, raw_tags)
@@ -1144,19 +1156,18 @@ class DialogueManager:
 
             must_hit = self._match_any_need(merged_need.must, raw_tags)
             if merged_need.must and must_hit is None:
-                must_confirm.append({"house_id": house.house_id, "reason": "刚需标签未明确标注"})
+                rejected.append({"house_id": house.house_id, "reason": must_reason or "未命中刚需标签"})
                 continue
 
             prefer_hit = self._match_any_need(merged_need.prefer, raw_tags)
-            if not merged_need.must and merged_need.prefer and prefer_hit is None:
-                rejected.append({"house_id": house.house_id, "reason": "偏好标签未命中"})
-                continue
-
             selected.append(house.house_id)
+            if prefer_hit is not None:
+                prefer_selected.append(house.house_id)
 
         return self._sanitize_candidate_filter_output(
             allowlist=allowlist,
             selected=selected,
+            prefer_selected=prefer_selected,
             must_confirm=must_confirm,
             rejected=rejected,
         )
@@ -1198,10 +1209,12 @@ class DialogueManager:
         *,
         allowlist: set[str],
         selected: list[str],
+        prefer_selected: list[str],
         must_confirm: list[dict[str, str]],
         rejected: list[dict[str, str]],
     ) -> dict[str, Any]:
         selected_clean = [house_id for house_id in selected if house_id in allowlist]
+        prefer_selected_clean = [house_id for house_id in prefer_selected if house_id in allowlist]
         must_confirm_clean = [
             item
             for item in must_confirm
@@ -1212,7 +1225,12 @@ class DialogueManager:
             for item in rejected
             if isinstance(item, dict) and isinstance(item.get("house_id"), str) and item["house_id"] in allowlist
         ]
-        return {"selected": selected_clean, "must_confirm": must_confirm_clean, "rejected": rejected_clean}
+        return {
+            "selected": selected_clean,
+            "prefer_selected": prefer_selected_clean,
+            "must_confirm": must_confirm_clean,
+            "rejected": rejected_clean,
+        }
 
     def _apply_semantic_decisions(
         self,
@@ -1226,7 +1244,10 @@ class DialogueManager:
             return ranked_views, {"applied": False}
 
         merged_need = TagNeed.model_validate(semantic.get("merged_tag_need") or {"must": [], "avoid": [], "prefer": []})
+        has_must_need = bool(merged_need.must)
+        has_prefer_need = bool(merged_need.prefer)
         selected_ids = set(str(item) for item in semantic.get("selected", []))
+        prefer_selected_ids = set(str(item) for item in semantic.get("prefer_selected", []))
         must_confirm_map: dict[str, str] = {}
         for row in semantic.get("must_confirm", []):
             if isinstance(row, dict):
@@ -1254,23 +1275,27 @@ class DialogueManager:
             reason = ""
             hard_drop = False
 
-            if house_id in selected_ids:
+            if has_must_need and house_id in selected_ids:
                 adjusted += 15.0
                 action = "selected_boost"
+            if has_prefer_need and house_id in prefer_selected_ids:
+                adjusted += 12.0 if has_must_need else 20.0
+                if action == "neutral":
+                    action = "prefer_boost"
             if house_id in must_confirm_map:
-                adjusted += 3.0
-                action = "must_confirm_boost"
+                action = "must_confirm"
                 reason = must_confirm_map[house_id]
 
             if house_id in rejected_map:
                 reject_reason = rejected_map[house_id]
-                is_hard = self._is_hard_conflict(reject_reason, merged_need)
+                is_must_violation = "未命中刚需标签" in reject_reason
+                is_hard = is_must_violation or self._is_hard_conflict(reject_reason, merged_need)
                 protected_top2 = (
                     house_id in top2_ids
                     and house_id in candidate_map
                     and self._matches_hard_constraints(candidate_map[house_id], query)
                 )
-                if is_hard and not protected_top2:
+                if is_hard and (is_must_violation or not protected_top2):
                     hard_drop = True
                     action = "rejected_drop"
                     reason = reject_reason
