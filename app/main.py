@@ -49,7 +49,7 @@ STEP_HTTP = "STEP-00-HTTP"
 STARTUP_LANDMARK_PRELOAD_SESSION_ID = "startup_landmarks_preload"
 
 LLM_TIMEOUT = httpx.Timeout(90.0)
-_LLM_TIMEOUT_RETRY_ATTEMPTS = 2
+_LLM_RETRY_ATTEMPTS = 3
 _CN_DIGITS = {
     "零": 0,
     "〇": 0,
@@ -912,7 +912,7 @@ async def _forward_chat_completion(
     response_body: Any = {}
     resp: httpx.Response | None = None
     try:
-        for attempt in range(1, _LLM_TIMEOUT_RETRY_ATTEMPTS + 1):
+        for attempt in range(1, _LLM_RETRY_ATTEMPTS + 1):
             try:
                 resp = await _llm_post(
                     http_client,
@@ -946,8 +946,8 @@ async def _forward_chat_completion(
                         raise ValueError("LLM response body is not a valid JSON object")
                     data = parsed
                 break
-            except httpx.TimeoutException as exc:
-                if attempt >= _LLM_TIMEOUT_RETRY_ATTEMPTS:
+            except Exception as exc:
+                if attempt >= _LLM_RETRY_ATTEMPTS:
                     raise
                 log_event(
                     LOGGER,
@@ -3798,14 +3798,44 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
         headers: dict[str, str] = {}
         if session_id:
             headers["Session-ID"] = session_id
+        target_url = f"{_build_model_base_url(resolved_model_ip)}/v1/chat/completions"
 
-        response = await http_client.post(
-            f"{_build_model_base_url(resolved_model_ip)}/v1/chat/completions",
-            json=payload,
-            headers=headers,
-        )
-        response.raise_for_status()
-        return response.json()
+        for attempt in range(1, _LLM_RETRY_ATTEMPTS + 1):
+            try:
+                response = await _llm_post(
+                    http_client,
+                    url=target_url,
+                    payload=payload,
+                    headers=headers,
+                )
+                response.raise_for_status()
+                return _parse_llm_http_body(response)
+            except Exception as exc:
+                if attempt >= _LLM_RETRY_ATTEMPTS:
+                    raise
+                log_event(
+                    LOGGER,
+                    "chat.llm.forward.retry",
+                    step=STEP_HTTP,
+                    llm_stage="proxy_v1",
+                    attempt=attempt,
+                    next_attempt=attempt + 1,
+                    reason=type(exc).__name__,
+                )
+                log_json_event(
+                    HTTP_IO_LOGGER,
+                    {
+                        **get_log_context(),
+                        "event": "http.agent_io.llm.retry",
+                        "llm_stage": "proxy_v1",
+                        "method": "POST",
+                        "url": target_url,
+                        "session_id": session_id or "-",
+                        "attempt": attempt,
+                        "next_attempt": attempt + 1,
+                        **_normalize_error_payload(exc),
+                    },
+                )
 
     @app.get("/debug/agent-io/events")
     async def debug_agent_io_events(
@@ -4161,13 +4191,43 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Model-IP header is required for /v2/chat/completions")
 
         http_client: httpx.AsyncClient = app.state.http_client
-        response = await http_client.post(
-            f"{_build_model_base_url(model_ip)}/v1/chat/completions",
-            json=payload,
-            headers={},
-        )
-        response.raise_for_status()
-        return response.json()
+        target_url = f"{_build_model_base_url(model_ip)}/v1/chat/completions"
+        for attempt in range(1, _LLM_RETRY_ATTEMPTS + 1):
+            try:
+                response = await _llm_post(
+                    http_client,
+                    url=target_url,
+                    payload=payload,
+                    headers={},
+                )
+                response.raise_for_status()
+                return _parse_llm_http_body(response)
+            except Exception as exc:
+                if attempt >= _LLM_RETRY_ATTEMPTS:
+                    raise
+                log_event(
+                    LOGGER,
+                    "chat.llm.forward.retry",
+                    step=STEP_HTTP,
+                    llm_stage="proxy_v2",
+                    attempt=attempt,
+                    next_attempt=attempt + 1,
+                    reason=type(exc).__name__,
+                )
+                log_json_event(
+                    HTTP_IO_LOGGER,
+                    {
+                        **get_log_context(),
+                        "event": "http.agent_io.llm.retry",
+                        "llm_stage": "proxy_v2",
+                        "method": "POST",
+                        "url": target_url,
+                        "session_id": "-",
+                        "attempt": attempt,
+                        "next_attempt": attempt + 1,
+                        **_normalize_error_payload(exc),
+                    },
+                )
 
     return app
 

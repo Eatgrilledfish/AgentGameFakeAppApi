@@ -1703,6 +1703,58 @@ def test_chat_route_llm_nlu_retries_once_on_read_timeout() -> None:
         assert captured["meta"]["llm_parse"]["intent"] == "search"
 
 
+def test_chat_route_llm_nlu_retries_on_model_error_until_third_attempt() -> None:
+    app = create_app()
+    captured: dict[str, int | dict] = {"calls": 0}
+
+    class StubService:
+        def rough_token_estimate(self, text: str) -> int:
+            return 10
+
+        async def handle(self, request):
+            captured["meta"] = request.meta
+            return InvokeResponse(text="ok", candidates=[], debug={"response_kind": "action"})
+
+    class StubResponse:
+        def __init__(self, status_code: int, payload: dict, url: str):
+            self.status_code = status_code
+            self._payload = payload
+            self._url = url
+
+        def raise_for_status(self):
+            if self.status_code < 400:
+                return None
+            request = httpx.Request("POST", self._url)
+            response = httpx.Response(self.status_code, request=request, json=self._payload)
+            raise httpx.HTTPStatusError("upstream error", request=request, response=response)
+
+        def json(self):
+            return self._payload
+
+    class StubHttpClient:
+        async def post(self, url, json, headers):
+            captured["calls"] += 1
+            if captured["calls"] <= 2:
+                return StubResponse(500, {"error": "temporary"}, url)
+            return StubResponse(
+                200,
+                {"choices": [{"message": {"content": "i=search|p=district:朝阳|t=m:;a:;p:"}}]},
+                url,
+            )
+
+    with TestClient(app) as client:
+        app.state.agent_service = StubService()
+        app.state.http_client = StubHttpClient()
+        resp = client.post(
+            "/api/v1/chat",
+            json={"model_ip": "127.0.0.1", "session_id": "sess-retry-3", "message": "帮我查朝阳区"},
+        )
+
+        assert resp.status_code == 200
+        assert captured["calls"] == 3
+        assert captured["meta"]["llm_parse"]["intent"] == "search"
+
+
 def test_chat_route_always_calls_llm_nlu_even_when_service_policy_disallows() -> None:
     app = create_app()
     captured: dict = {"http_called": False}
@@ -1757,23 +1809,33 @@ def test_chat_route_always_calls_llm_nlu_even_when_service_policy_disallows() ->
 
 def test_proxy_chat_completions_route() -> None:
     app = create_app()
+    captured = {"calls": 0}
 
     class StubResponse:
-        def __init__(self, payload):
+        def __init__(self, payload, status_code=200, url: str = "http://127.0.0.1:8888/v1/chat/completions"):
             self._payload = payload
+            self.status_code = status_code
+            self._url = url
 
         def raise_for_status(self):
-            return None
+            if self.status_code < 400:
+                return None
+            request = httpx.Request("POST", self._url)
+            response = httpx.Response(self.status_code, request=request, json=self._payload)
+            raise httpx.HTTPStatusError("upstream error", request=request, response=response)
 
         def json(self):
             return self._payload
 
     class StubHttpClient:
         async def post(self, url, json, headers):
+            captured["calls"] += 1
             assert url == "http://127.0.0.1:8888/v1/chat/completions"
             assert json["messages"][0]["content"] == "你好"
             assert headers["Session-ID"] == "sess-1"
-            return StubResponse({"choices": [{"message": {"content": "hi"}}]})
+            if captured["calls"] <= 2:
+                return StubResponse({"error": "temporary"}, status_code=500, url=url)
+            return StubResponse({"choices": [{"message": {"content": "hi"}}]}, status_code=200, url=url)
 
     with TestClient(app) as client:
         app.state.http_client = StubHttpClient()
@@ -1784,6 +1846,7 @@ def test_proxy_chat_completions_route() -> None:
         )
 
         assert resp.status_code == 200
+        assert captured["calls"] == 3
         assert resp.json()["choices"][0]["message"]["content"] == "hi"
 
 
