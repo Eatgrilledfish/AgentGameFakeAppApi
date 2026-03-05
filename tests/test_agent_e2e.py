@@ -523,7 +523,7 @@ def test_chat_route_uses_single_llm_pass_for_detail_reply() -> None:
     assert _response_text(resp).startswith("HF_4：朝阳望京")
 
 
-def test_chat_route_uses_two_llm_passes_for_detail_when_tool_results_exist() -> None:
+def test_chat_route_keeps_detail_reply_when_tool_results_exist_with_single_llm_pass() -> None:
     app = create_app()
     captured: dict = {"calls": []}
 
@@ -560,36 +560,18 @@ def test_chat_route_uses_two_llm_passes_for_detail_when_tool_results_exist() -> 
             captured["calls"].append(json)
             assert url == "http://127.0.0.1:8888/v1/chat/completions"
             assert headers["Session-ID"] == "sess-two-llm-detail"
-            if len(captured["calls"]) == 1:
-                assert isinstance(json["tools"], list) and len(json["tools"]) > 0
-                assert "你是租房智能Agent决策器" in json["messages"][0]["content"]
-                return StubResponse(
-                    {
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": (
-                                        '{"intent":"house_detail","tool_plan":{"operationId":"get_house_by_id","arguments":'
-                                        '{"house_id":"HF_4"}},"confidence":0.8}'
-                                    )
-                                }
-                            }
-                        ]
-                    }
-                )
-
-            assert json["tools"] == []
-            assert json["messages"][0]["role"] == "system"
-            assert "你是租房智能Agent的回复生成器" in json["messages"][0]["content"]
-            second_content = next(item["content"] for item in json["messages"] if item["role"] == "user")
-            assert "工具结果摘要：" in second_content
-            assert "会话上下文：" in second_content
+            assert len(captured["calls"]) == 1
+            assert isinstance(json["tools"], list) and len(json["tools"]) > 0
+            assert "你是租房智能Agent决策器" in json["messages"][0]["content"]
             return StubResponse(
                 {
                     "choices": [
                         {
                             "message": {
-                                "content": '{"assistant_reply":"已为你确认：HF_4 当前可租，离地铁约 620 米。"}'
+                                "content": (
+                                    '{"intent":"house_detail","tool_plan":{"operationId":"get_house_by_id","arguments":'
+                                    '{"house_id":"HF_4"}},"confidence":0.8}'
+                                )
                             }
                         }
                     ]
@@ -605,8 +587,8 @@ def test_chat_route_uses_two_llm_passes_for_detail_when_tool_results_exist() -> 
         )
 
     assert resp.status_code == 200
-    assert len(captured["calls"]) == 2
-    assert _response_text(resp) == "已为你确认：HF_4 当前可租，离地铁约 620 米。"
+    assert len(captured["calls"]) == 1
+    assert _response_text(resp) == "HF_4：朝阳望京，2居1厅1卫，3800 元/月。离最近地铁约 620 米。当前状态：可租。"
 
 
 def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
@@ -993,7 +975,7 @@ def test_chat_route_parses_compact_string_nlu_payload() -> None:
     assert "房东直租" in llm_parse["tag_need"]["prefer"]
 
 
-def test_chat_route_applies_second_llm_rerank_and_persists_top5_context() -> None:
+def test_chat_route_uses_single_llm_pass_and_persists_top5_context() -> None:
     app = create_app()
     captured: dict = {"llm_calls": 0}
 
@@ -1075,39 +1057,19 @@ def test_chat_route_applies_second_llm_rerank_and_persists_top5_context() -> Non
         async def post(self, url, json, headers):
             captured["llm_calls"] += 1
             assert headers["Session-ID"] == "sess-rerank-top5"
-            if captured["llm_calls"] == 1:
-                return StubResponse(
-                    {
-                        "choices": [
-                            {
-                                "message": {
-                                    "role": "assistant",
-                                    "content": "i=search|p=d:朝阳;b:2;max:3500|t=m:;a:;p:月付",
-                                }
+            assert captured["llm_calls"] == 1
+            return StubResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "i=search|p=d:朝阳;b:2;max:3500|t=m:;a:;p:月付",
                             }
-                        ]
-                    }
-                )
-            if captured["llm_calls"] == 2:
-                assert json["messages"][0]["role"] == "system"
-                second_content = next(item["content"] for item in json["messages"] if item["role"] == "user")
-                assert "房源上下文top10(JSON)" in second_content
-                assert "HF_10" in second_content
-                assert '"hidden_noise_level":"吵闹"' in second_content
-                assert "1. HF_1" not in second_content
-                return StubResponse(
-                    {
-                        "choices": [
-                            {
-                                "message": {
-                                    "role": "assistant",
-                                    "content": '{"message":"我为你二次筛选了更匹配的5套房源。","houses":["HF_7","HF_2","HF_9","HF_1","HF_3"]}',
-                                }
-                            }
-                        ]
-                    }
-                )
-            raise AssertionError("unexpected llm call")
+                        }
+                    ]
+                }
+            )
 
     with TestClient(app) as client:
         app.state.agent_service = StubService()
@@ -1119,15 +1081,15 @@ def test_chat_route_applies_second_llm_rerank_and_persists_top5_context() -> Non
 
     assert resp.status_code == 200
     body = _response_json(resp)
-    assert body["message"] == "我为你二次筛选了更匹配的5套房源。"
-    assert body["houses"] == ["HF_7", "HF_2", "HF_9", "HF_1", "HF_3"]
-    assert state.last_top5[0].house_id == "HF_7"
-    assert [item.house_id for item in state.last_top5] == ["HF_7", "HF_2", "HF_9", "HF_1", "HF_3"]
-    assert state.candidate_state.latest_house_ids == ["HF_7", "HF_2", "HF_9", "HF_1", "HF_3"]
+    assert body["message"] == "查找到以下符合您要求的房源"
+    assert body["houses"] == ["HF_1", "HF_2", "HF_3", "HF_4", "HF_5"]
+    assert state.last_top5[0].house_id == "HF_1"
+    assert [item.house_id for item in state.last_top5] == ["HF_1", "HF_2", "HF_3", "HF_4", "HF_5"]
+    assert state.candidate_state.latest_house_ids == ["HF_1", "HF_2", "HF_3", "HF_4", "HF_5"]
     assert len(state.house_context_top10) == 10
-    assert [item.house_id for item in state.house_context_top10[:5]] == ["HF_7", "HF_2", "HF_9", "HF_1", "HF_3"]
-    assert state.search_history[-1].house_ids == ["HF_7", "HF_2", "HF_9", "HF_1", "HF_3"]
-    assert captured["llm_calls"] == 2
+    assert [item.house_id for item in state.house_context_top10[:5]] == ["HF_1", "HF_2", "HF_3", "HF_4", "HF_5"]
+    assert state.search_history[-1].house_ids == ["HF_1", "HF_2", "HF_3", "HF_4", "HF_5"]
+    assert captured["llm_calls"] == 1
 
 
 def test_chat_route_skips_second_llm_rerank_when_candidate_count_lte_5() -> None:
@@ -1220,7 +1182,7 @@ def test_chat_route_skips_second_llm_rerank_when_candidate_count_lte_5() -> None
     assert captured["llm_calls"] == 1
 
 
-def test_chat_route_rerank_context_fields_are_configurable_with_landmarks() -> None:
+def test_chat_route_search_context_config_still_works_in_single_llm_mode() -> None:
     app = create_app(
         settings=AgentSettings(
             rerank_house_context_fields="house_id,community,price,subway_distance,status,nearby_landmarks",
@@ -1369,54 +1331,19 @@ def test_chat_route_rerank_context_fields_are_configurable_with_landmarks() -> N
             _ = url
             captured["llm_calls"] += 1
             assert headers["Session-ID"] == "sess-rerank-config"
-            if captured["llm_calls"] == 1:
-                return StubResponse(
-                    {
-                        "choices": [
-                            {
-                                "message": {
-                                    "role": "assistant",
-                                    "content": "i=search|p=d:朝阳;b:2;max:3500|t=m:;a:;p:月付",
-                                }
+            assert captured["llm_calls"] == 1
+            return StubResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "i=search|p=d:朝阳;b:2;max:3500|t=m:;a:;p:月付",
                             }
-                        ]
-                    }
-                )
-            if captured["llm_calls"] == 2:
-                assert json["messages"][0]["role"] == "system"
-                second_content = next(item["content"] for item in json["messages"] if item["role"] == "user")
-                marker = "房源上下文top10(JSON)："
-                assert marker in second_content
-                house_context_json = second_content.split(marker, 1)[1]
-                house_context_rows = __import__("json").loads(house_context_json)
-                assert isinstance(house_context_rows, list) and house_context_rows
-                first = house_context_rows[0]
-                assert set(first.keys()) <= {
-                    "house_id",
-                    "community",
-                    "price",
-                    "subway_distance",
-                    "status",
-                    "nearby_landmarks",
+                        }
+                    ]
                 }
-                assert first["price"] == 3200
-                assert "district" not in first
-                assert isinstance(first.get("nearby_landmarks"), list) and len(first["nearby_landmarks"]) == 1
-                assert set(first["nearby_landmarks"][0].keys()) <= {"name", "distance", "type"}
-                assert first["nearby_landmarks"][0]["name"] == "王府井步行街"
-                return StubResponse(
-                    {
-                        "choices": [
-                            {
-                                "message": {
-                                    "role": "assistant",
-                                    "content": "m=按你的偏好我优先选了2套|h=HF_6751,HF_6752",
-                                }
-                            }
-                        ]
-                    }
-                )
-            raise AssertionError("unexpected llm call")
+            )
 
     with TestClient(app) as client:
         app.state.agent_service = StubService()
@@ -1428,10 +1355,11 @@ def test_chat_route_rerank_context_fields_are_configurable_with_landmarks() -> N
 
     assert resp.status_code == 200
     body = _response_json(resp)
-    assert body["message"] == "按你的偏好我优先选了2套"
+    assert body["message"] == "已找到候选房源"
     assert body["houses"][:2] == ["HF_6751", "HF_6752"]
-    assert len(body["houses"]) == 5
-    assert captured["llm_calls"] == 2
+    assert len(body["houses"]) == 6
+    assert len(state.house_context_top10) >= 6
+    assert captured["llm_calls"] == 1
 
 
 def test_chat_route_uses_single_llm_call_and_applies_chat_reply_from_nlu() -> None:

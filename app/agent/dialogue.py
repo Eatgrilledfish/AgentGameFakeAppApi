@@ -99,6 +99,8 @@ _DIRECT_REQUIREMENT_SIGNALS = (
 _STICKY_SOFT_BOOL_FIELDS = {"prefer_spacious", "prioritize_subway_distance", "prioritize_commute"}
 _NEGATION_TOKENS = ("不", "不要", "不想", "不用", "别", "避免", "拒绝", "不希望", "不能")
 _MUST_TOKENS = ("必须", "一定", "务必", "刚需", "只能", "只要", "得", "得要", "必要", "必须要", "一定要")
+_SOFT_MUST_TOKENS = ("最好", "优先", "尽量")
+_PREFER_DOWNGRADE_TOKENS = ("没有也行", "不强求", "可有可无", "无所谓", "不介意", "都行")
 _TAG_TEXT_STOPWORDS = ("仅", "可", "需", "看房", "房", "租", "费用", "费", "押", "付", "支持")
 _POSITIVE_TOKENS = ("要", "想", "希望", "能", "可以", "必须", "优先", "倾向")
 _TOOL_OPERATION_TO_INTENT = {
@@ -1946,6 +1948,8 @@ class DialogueManager:
             return False
 
         signals = matched_signals or [sig for sig in DialogueManager._extract_tag_signals(tag) if len(sig) >= 2]
+        has_soft_must = any(token in text for token in _SOFT_MUST_TOKENS)
+        has_downgrade = any(token in text for token in _PREFER_DOWNGRADE_TOKENS)
         for signal in signals:
             if signal not in text:
                 continue
@@ -1955,8 +1959,19 @@ class DialogueManager:
                 right = text[start + len(signal) : start + len(signal) + 8]
                 if any(token in left or token in right for token in _MUST_TOKENS):
                     return True
+                if any(token in left or token in right for token in _SOFT_MUST_TOKENS) and not any(
+                    token in left or token in right for token in _PREFER_DOWNGRADE_TOKENS
+                ):
+                    return True
             if any(f"{token}{signal}" in text or f"{signal}{token}" in text for token in _MUST_TOKENS):
                 return True
+            if any(f"{token}{signal}" in text or f"{signal}{token}" in text for token in _SOFT_MUST_TOKENS):
+                has_soft_must = True
+            if any(f"{token}{signal}" in text or f"{signal}{token}" in text for token in _PREFER_DOWNGRADE_TOKENS):
+                has_downgrade = True
+
+        if has_soft_must and not has_downgrade and signals:
+            return True
 
         return False
 

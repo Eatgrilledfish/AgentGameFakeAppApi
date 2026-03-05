@@ -2499,14 +2499,14 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
     tag_catalog = _load_nlu_tag_catalog()
     tag_catalog_text = "、".join(tag_catalog[:_LLM_NLU_TAG_CATALOG_LIMIT]) if tag_catalog else "-"
     system_content = (
-        "你是租房智能Agent决策器（Plan模块）。\n"
-        "只输出1行字符串，不要解释。\n"
+        "你是租房智能Agent决策器（Plan模块）。只输出1行字符串，不要解释。\n"
         "格式：i=<intent>|p=k:v;k:v|t=m:x,y;a:u,v;p:q,r\n"
         "intent可选：chat/search/compare/house_detail/amenities/listings/rent_check/rent/terminate/offline。\n"
         "p仅允许键：district,bedrooms,min_price,max_price,decoration,subway_distance,rental_type,min_area,elevator,noise_preference。\n"
         "t里 m=must, a=avoid, p=prefer；没值留空。\n"
         "t 的标签必须从“标签全集”里选择，并保持标签原文，不要改写或造新标签。\n"
         "若同一桶（m/a/p）命中多个标签，必须全部返回（去重后逗号分隔），不能只返回一个。\n"
+        "桶判定：默认把“最好/优先/尽量”视作 must；只有出现“没有也行/不强求/可有可无/无所谓/不介意/都行”等弱化表达时，才降为 prefer。\n"
         f"标签全集：{tag_catalog_text}\n"
         "规则：用户问“这套可租吗/我可以租吗/能租吗”时 i=rent_check；预算表达“左右/上下/附近/约/大概”时尽量给 min_price 与 max_price 区间；提到近地铁时优先给 subway_distance:800；noise_preference 只返回 true/false：用户明确要安静时 true，否则 false。true 表示后续只匹配 hidden_noise_level=安静。\n"
         "示例：i=search|p=district:朝阳;bedrooms:2;max_price:3500;subway_distance:800;noise_preference:true|t=m:可养狗,近公园;a:年付,收中介费;p:月付,房东直租\n"
@@ -3582,145 +3582,39 @@ def create_app(settings: AgentSettings | None = None) -> FastAPI:
 
             output_text = invoke_resp.text
             response_kind = str(invoke_resp.debug.get("response_kind", "chat"))
-            llm_parse = invoke_meta.get("llm_parse") if isinstance(invoke_meta.get("llm_parse"), dict) else {}
             tool_results = get_tool_results()
             latest_state = service.state_store.get(req.session_id) if hasattr(service, "state_store") else None
-            respond_context_facts = _build_llm_respond_context_facts(latest_state) if latest_state is not None else context_facts
             intent_value = str(invoke_resp.debug.get("intent", "")).strip().lower()
-            if response_kind in {"detail", "action"} and tool_results:
-                respond_prompt_basis = (
-                    req.message
-                    + invoke_resp.text
-                    + json.dumps(respond_context_facts or {}, ensure_ascii=False)
-                    + json.dumps(tool_results, ensure_ascii=False)
-                )
-                respond_prompt_tokens = (
-                    service.rough_token_estimate(respond_prompt_basis)
-                    if hasattr(service, "rough_token_estimate")
-                    else max(1, int(len(respond_prompt_basis) / 2))
-                )
-                try:
-                    polished_reply = await _polish_detail_reply_with_llm(
-                        app.state.http_client,
-                        model_ip=req.model_ip,
-                        session_id=req.session_id,
-                        user_message=req.message,
-                        draft_reply=invoke_resp.text,
-                        context_facts=respond_context_facts,
-                        tool_results=tool_results,
-                    )
-                    if isinstance(polished_reply, str) and polished_reply.strip():
-                        output_text = polished_reply.strip()
-                        log_event(
-                            LOGGER,
-                            "chat.llm_respond.applied",
-                            step=STEP_LLM_RESPOND,
-                            llm_output=preview_text(output_text, limit=300),
-                        )
-                        if hasattr(service, "record_llm_fallback_usage"):
-                            completion_tokens = (
-                                service.rough_token_estimate(output_text)
-                                if hasattr(service, "rough_token_estimate")
-                                else max(1, int(len(output_text) / 2))
-                            )
-                            service.record_llm_fallback_usage(req.session_id, respond_prompt_tokens + completion_tokens)
-                except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
-                    log_event(
-                        LOGGER,
-                        "chat.llm_respond.failed",
-                        step=STEP_LLM_RESPOND,
-                        error=str(exc),
-                    )
             if response_kind == "search" and latest_state is not None:
+                state_dirty = False
+                if invoke_resp.candidates:
+                    _apply_search_rerank_to_state(
+                        latest_state,
+                        reranked_views=invoke_resp.candidates,
+                        assistant_text=output_text,
+                        dialogue_manager=getattr(service, "dialogue", None),
+                    )
+                    state_dirty = True
                 house_context_top10 = _build_search_rerank_house_context_top10(
                     latest_state,
                     invoke_resp.candidates,
                     tool_results=tool_results,
                     limit=_SEARCH_RERANK_HOUSE_CONTEXT_LIMIT,
                 )
-                state_dirty = bool(house_context_top10)
-                if 0 < len(house_context_top10) <= 5:
-                    invoke_resp.debug["llm_search_rerank"] = {
-                        "applied": False,
-                        "reason": "candidate_count_lte_5",
-                        "candidate_count": len(house_context_top10),
-                    }
-                    log_event(
-                        LOGGER,
-                        "chat.llm_search_rerank.skipped",
-                        step=STEP_LLM_SEARCH_RERANK,
-                        reason="candidate_count_lte_5",
-                        candidate_count=len(house_context_top10),
-                    )
-                elif len(house_context_top10) >= 2:
-                    rerank_prompt_basis = (
-                        req.message
-                        + invoke_resp.text
-                        + json.dumps(respond_context_facts or {}, ensure_ascii=False)
-                        + json.dumps(house_context_top10, ensure_ascii=False)
-                    )
-                    rerank_prompt_tokens = (
-                        service.rough_token_estimate(rerank_prompt_basis)
-                        if hasattr(service, "rough_token_estimate")
-                        else max(1, int(len(rerank_prompt_basis) / 2))
-                    )
-                    try:
-                        rerank_message, rerank_house_ids = await _rerank_search_results_with_llm(
-                            app.state.http_client,
-                            model_ip=req.model_ip,
-                            session_id=req.session_id,
-                            user_message=req.message,
-                            draft_reply=invoke_resp.text,
-                            context_facts=respond_context_facts,
-                            house_context_top10=house_context_top10,
-                        )
-                        reranked_views = _build_reranked_house_views(
-                            selected_house_ids=rerank_house_ids,
-                            state=latest_state,
-                            fallback_views=invoke_resp.candidates,
-                            limit=5,
-                        )
-                        if reranked_views:
-                            invoke_resp.candidates = reranked_views
-                            reranked_ids = [item.house_id for item in reranked_views]
-                            _merge_referenced_house_ids(invoke_resp.debug, reranked_ids)
-                            invoke_resp.debug["llm_search_rerank"] = {
-                                "applied": True,
-                                "selected_house_ids": reranked_ids,
-                                "candidate_count": len(house_context_top10),
-                            }
-                            if isinstance(rerank_message, str) and rerank_message.strip():
-                                output_text = rerank_message.strip()
-
-                            _apply_search_rerank_to_state(
-                                latest_state,
-                                reranked_views=reranked_views,
-                                assistant_text=output_text,
-                                dialogue_manager=getattr(service, "dialogue", None),
-                            )
-                            state_dirty = True
-                            log_event(
-                                LOGGER,
-                                "chat.llm_search_rerank.applied",
-                                step=STEP_LLM_SEARCH_RERANK,
-                                selected_house_ids=reranked_ids,
-                                message_preview=preview_text(output_text, limit=220),
-                            )
-                            if hasattr(service, "record_llm_fallback_usage"):
-                                completion_basis = (rerank_message or "") + ",".join(reranked_ids)
-                                completion_tokens = (
-                                    service.rough_token_estimate(completion_basis)
-                                    if hasattr(service, "rough_token_estimate")
-                                    else max(1, int(len(completion_basis) / 2))
-                                )
-                                service.record_llm_fallback_usage(req.session_id, rerank_prompt_tokens + completion_tokens)
-                    except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
-                        log_event(
-                            LOGGER,
-                            "chat.llm_search_rerank.failed",
-                            step=STEP_LLM_SEARCH_RERANK,
-                            error=str(exc),
-                        )
+                if house_context_top10:
+                    state_dirty = True
+                invoke_resp.debug["llm_search_rerank"] = {
+                    "applied": False,
+                    "reason": "disabled_single_llm_mode",
+                    "candidate_count": len(house_context_top10),
+                }
+                log_event(
+                    LOGGER,
+                    "chat.llm_search_rerank.skipped",
+                    step=STEP_LLM_SEARCH_RERANK,
+                    reason="disabled_single_llm_mode",
+                    candidate_count=len(house_context_top10),
+                )
                 if state_dirty and hasattr(service, "state_store"):
                     service.state_store.upsert(latest_state)
             house_intents = {"search", "compare", "house_detail", "amenities", "listings", "rent_check", "rent"}

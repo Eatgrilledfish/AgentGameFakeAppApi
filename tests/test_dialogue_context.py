@@ -1593,3 +1593,19 @@ async def test_dialogue_followup_tag_refinement_filters_context_by_must_tags() -
     assert "HF_DOG_PARK" in context_ids
     assert "HF_DOG_OTHER" in context_ids
     assert "HF_CAT" not in context_ids
+
+
+def test_dialogue_soft_must_tokens_default_to_must_bucket() -> None:
+    normalized_text = DialogueManager._normalize_tag_text("最好近公园")
+    tag = "近公园"
+    matched_signals = [signal for signal in DialogueManager._extract_tag_signals(tag) if signal in normalized_text]
+
+    assert DialogueManager._is_must_intent_for_tag(normalized_text, tag, matched_signals) is True
+
+
+def test_dialogue_soft_must_tokens_downgrade_to_prefer_when_weakened() -> None:
+    normalized_text = DialogueManager._normalize_tag_text("最好近公园，没有也行")
+    tag = "近公园"
+    matched_signals = [signal for signal in DialogueManager._extract_tag_signals(tag) if signal in normalized_text]
+
+    assert DialogueManager._is_must_intent_for_tag(normalized_text, tag, matched_signals) is False
