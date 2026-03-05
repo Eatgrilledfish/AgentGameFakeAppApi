@@ -579,8 +579,9 @@ def test_chat_route_uses_two_llm_passes_for_detail_when_tool_results_exist() -> 
                 )
 
             assert json["tools"] == []
-            second_content = json["messages"][0]["content"]
-            assert "你是租房智能Agent的回复生成器" in second_content
+            assert json["messages"][0]["role"] == "system"
+            assert "你是租房智能Agent的回复生成器" in json["messages"][0]["content"]
+            second_content = next(item["content"] for item in json["messages"] if item["role"] == "user")
             assert "工具结果摘要：" in second_content
             assert "会话上下文：" in second_content
             return StubResponse(
@@ -651,11 +652,12 @@ def test_chat_route_llm_nlu_result_is_passed_to_agent_request_meta() -> None:
         async def post(self, url, json, headers):
             assert url == "http://127.0.0.1:8888/v1/chat/completions"
             assert headers["Session-ID"] == "sess-llm-nlu"
-            assert json["messages"][0]["role"] == "user"
-            content = json["messages"][0]["content"]
-            assert "你是租房智能Agent决策器" in content
-            assert "用户输入：帮我把第一套租掉" in content
-            assert "上轮推荐 HF_1001" in content
+            assert json["messages"][0]["role"] == "system"
+            assert "你是租房智能Agent决策器" in json["messages"][0]["content"]
+            assert json["messages"][-1]["role"] == "user"
+            user_content = json["messages"][-1]["content"]
+            assert "用户输入：帮我把第一套租掉" in user_content
+            assert "上轮推荐 HF_1001" in user_content
             assert isinstance(json["tools"], list) and len(json["tools"]) > 0
             tool_names = {item["function"]["name"] for item in json["tools"]}
             assert tool_names == {"landmark", "house_query", "house_action"}
@@ -1087,7 +1089,8 @@ def test_chat_route_applies_second_llm_rerank_and_persists_top5_context() -> Non
                     }
                 )
             if captured["llm_calls"] == 2:
-                second_content = json["messages"][0]["content"]
+                assert json["messages"][0]["role"] == "system"
+                second_content = next(item["content"] for item in json["messages"] if item["role"] == "user")
                 assert "房源上下文top10(JSON)" in second_content
                 assert "HF_10" in second_content
                 assert '"hidden_noise_level":"吵闹"' in second_content
@@ -1380,7 +1383,8 @@ def test_chat_route_rerank_context_fields_are_configurable_with_landmarks() -> N
                     }
                 )
             if captured["llm_calls"] == 2:
-                second_content = json["messages"][0]["content"]
+                assert json["messages"][0]["role"] == "system"
+                second_content = next(item["content"] for item in json["messages"] if item["role"] == "user")
                 marker = "房源上下文top10(JSON)："
                 assert marker in second_content
                 house_context_json = second_content.split(marker, 1)[1]
@@ -1478,8 +1482,9 @@ def test_chat_route_uses_single_llm_call_and_applies_chat_reply_from_nlu() -> No
     assert resp.status_code == 200
     assert len(captured["calls"]) == 1
     first_payload = captured["calls"][0]
-    assert first_payload["messages"][0]["role"] == "user"
-    assert "用户输入：用户原话-用于fallback" in first_payload["messages"][0]["content"]
+    assert first_payload["messages"][0]["role"] == "system"
+    user_prompt = next(item["content"] for item in first_payload["messages"] if item["role"] == "user")
+    assert "用户输入：用户原话-用于fallback" in user_prompt
     assert isinstance(first_payload["tools"], list) and len(first_payload["tools"]) > 0
     assert _response_text(resp) == "规则回复"
 

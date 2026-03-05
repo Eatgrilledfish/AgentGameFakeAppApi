@@ -2498,7 +2498,7 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
     context_text = _format_context_facts_for_prompt(context_facts)
     tag_catalog = _load_nlu_tag_catalog()
     tag_catalog_text = "、".join(tag_catalog[:_LLM_NLU_TAG_CATALOG_LIMIT]) if tag_catalog else "-"
-    content = (
+    system_content = (
         "你是租房智能Agent决策器（Plan模块）。\n"
         "只输出1行字符串，不要解释。\n"
         "格式：i=<intent>|p=k:v;k:v|t=m:x,y;a:u,v;p:q,r\n"
@@ -2510,11 +2510,16 @@ def _build_llm_nlu_messages(message: str, summary: str, context_facts: dict[str,
         f"标签全集：{tag_catalog_text}\n"
         "规则：用户问“这套可租吗/我可以租吗/能租吗”时 i=rent_check；预算表达“左右/上下/附近/约/大概”时尽量给 min_price 与 max_price 区间；提到近地铁时优先给 subway_distance:800；noise_preference 只返回 true/false：用户明确要安静时 true，否则 false。true 表示后续只匹配 hidden_noise_level=安静。\n"
         "示例：i=search|p=district:朝阳;bedrooms:2;max_price:3500;subway_distance:800;noise_preference:true|t=m:可养狗,近公园;a:年付,收中介费;p:月付,房东直租\n"
+    )
+    user_content = (
         f"会话摘要：{summary_text}\n"
         f"上下文：\n{context_text}\n"
         f"用户输入：{message}"
     )
-    return [{"role": "user", "content": content}]
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
 
 
 @lru_cache(maxsize=1)
@@ -2535,17 +2540,29 @@ def _normalize_messages_for_eval(messages: list[dict[str, str]]) -> list[dict[st
     if not messages:
         return [{"role": "user", "content": ""}]
 
-    for item in reversed(messages):
+    system_messages: list[dict[str, str]] = []
+    latest_user: dict[str, str] | None = None
+    for item in messages:
         role = str(item.get("role", "")).strip().lower()
         content = item.get("content")
-        if role == "user" and isinstance(content, str):
-            return [{"role": "user", "content": content}]
+        if not isinstance(content, str):
+            continue
+        if role == "system":
+            system_messages.append({"role": "system", "content": content})
+            continue
+        if role == "user":
+            latest_user = {"role": "user", "content": content}
+
+    if latest_user is not None:
+        return [*system_messages, latest_user]
 
     for item in reversed(messages):
         content = item.get("content")
         if isinstance(content, str):
-            return [{"role": "user", "content": content}]
+            return [*system_messages, {"role": "user", "content": content}]
 
+    if system_messages:
+        return [*system_messages, {"role": "user", "content": ""}]
     return [{"role": "user", "content": ""}]
 
 
@@ -2885,7 +2902,7 @@ def _build_llm_search_rerank_messages(
         if house_context_top10
         else "[]"
     )
-    content = (
+    system_content = (
         "你是租房结果重排器。\n"
         "输入包含房源上下文（最多10套）。请根据用户输入和上下文筛出最相关5套。\n"
         "只输出1行字符串：m=<中文结论>|h=<house_id1,house_id2,house_id3,house_id4,house_id5>\n"
@@ -2894,12 +2911,17 @@ def _build_llm_search_rerank_messages(
         "2) h 最多5个，按推荐优先级排序。\n"
         "3) m 直接对用户说结论，中文，简洁。\n"
         "4) 只输出一行，不要JSON、不要多余解释。\n"
+    )
+    user_content = (
         f"用户输入：{user_message}\n"
         f"当前草稿回复：{draft_reply}\n"
         f"上下文：\n{context_text}\n"
         f"房源上下文top10(JSON)：{house_context_json}"
     )
-    return [{"role": "user", "content": content}]
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
 
 
 def _extract_house_ids_from_any(value: Any, *, max_count: int = 5) -> list[str]:
@@ -3167,7 +3189,7 @@ def _build_llm_detail_reply_messages(
 ) -> list[dict[str, str]]:
     context_text = _format_context_facts_for_prompt(context_facts)
     tool_results_text = _format_tool_results_for_prompt(tool_results)
-    content = (
+    system_content = (
         "你是租房智能Agent的回复生成器。必须严格基于工具结果作答，禁止臆测。\n"
         "任务：根据“用户原话 + 工具结果 + Agent草稿”生成最终回复。\n"
         "硬性要求：\n"
@@ -3176,12 +3198,17 @@ def _build_llm_detail_reply_messages(
         "3) 语气专业、友善、简洁。\n"
         "4) 若上下文中有候选房源摘要或标签，可作为已知事实引用（这些来自上游工具结果的会话压缩）。\n"
         "5) 仅输出JSON object，格式必须为：{\"assistant_reply\":\"...\"}，不要输出其他字段。\n"
+    )
+    user_content = (
         f"用户原话：{user_message}\n"
         f"Agent草稿：{draft_reply}\n"
         f"会话上下文：\n{context_text}\n"
         f"工具结果摘要：\n{tool_results_text}"
     )
-    return [{"role": "user", "content": content}]
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
 
 
 def _extract_llm_assistant_reply(data: dict[str, Any]) -> str | None:
